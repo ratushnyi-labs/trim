@@ -1,0 +1,55 @@
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0 AS xx
+
+FROM --platform=$BUILDPLATFORM rust:1.93-alpine3.23 AS builder
+COPY --from=xx / /
+
+COPY Cargo.tom[l] zscaler.cr[t] /tmp/
+RUN if [ -f /tmp/zscaler.crt ]; then \
+        cat /tmp/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi \
+    && apk add --no-cache clang lld file
+
+ARG TARGETPLATFORM
+RUN xx-apk add --no-cache musl-dev
+
+ARG XSTRIP_VERSION
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY LICENSE ./
+COPY src src
+
+RUN TRIPLE="$(xx-info march)-unknown-linux-musl" \
+    && if [ -n "$XSTRIP_VERSION" ]; then export XSTRIP_VERSION; fi \
+    && xx-cargo build --release \
+    && xx-verify "target/${TRIPLE}/release/xstrip" \
+    && cp "target/${TRIPLE}/release/xstrip" /xstrip
+
+FROM alpine:3.23
+
+COPY Cargo.tom[l] zscaler.cr[t] /tmp/
+RUN if [ -f /tmp/zscaler.crt ]; then \
+        cat /tmp/zscaler.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi \
+    && apk add --no-cache \
+        gcc \
+        musl-dev \
+        clang19 \
+        lld19 \
+        llvm19 \
+        mingw-w64-gcc \
+        file \
+    && ln -s /usr/lib/llvm19/bin/wasm-ld /usr/local/bin/wasm-ld \
+    && rm -rf /var/cache/apk/*
+
+COPY --from=builder /xstrip /usr/local/bin/xstrip
+
+RUN adduser -D -u 10000 xstrip \
+    && mkdir /work && chown xstrip:xstrip /work
+
+COPY tests/ /tests/
+RUN chmod +x /tests/test.sh
+
+USER xstrip
+WORKDIR /work
+ENTRYPOINT ["/tests/test.sh"]

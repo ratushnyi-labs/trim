@@ -1,0 +1,12 @@
+services:
+  strip:
+    build: .
+    volumes:
+      - ./work:/work
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ./.dev-temp/test-results:/results

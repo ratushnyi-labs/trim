@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Multi-arch distribution binaries
+/dist/
+
+# Dev artifacts (rules.md §8.2)
+/.dev-data/
+/.dev-temp/
+
+# Test artifacts
+/test-binary
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

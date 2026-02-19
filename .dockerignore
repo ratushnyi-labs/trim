@@ -1,0 +1,11 @@
+.git
+.dev-data
+.dev-temp
+docs
+*.md
+!LICENSE
+.gitignore
+.github
+target
+dist
+.cargo
