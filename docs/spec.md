@@ -4,11 +4,13 @@
 
 ## 1. What the System Does
 
-xstrip is a dead code analyzer and remover for ELF binaries. It finds
-unreachable functions using address-based call graph analysis, patches
-them with INT3 (`0xCC`) fills, and physically shrinks the binary by
-removing dead code regions and updating ELF metadata. It works directly
-on compiled binaries — no source code or recompilation needed.
+xstrip is a dead code analyzer and remover for compiled binaries. It
+supports ELF, PE/COFF, Mach-O, and .NET managed assemblies. It finds
+unreachable functions using address-based call graph analysis (or IL
+call graph for .NET), patches dead code with zero-fills, and for x86
+ELF binaries physically shrinks the binary by removing dead code
+regions and updating metadata. It works directly on compiled binaries
+— no source code or recompilation needed.
 
 xstrip is a static musl binary (Rust) with zero runtime dependencies,
 distributed as a scratch-based Docker image or standalone binary for
@@ -18,12 +20,16 @@ x86_64 and aarch64 Linux.
 
 - **Dead code removal:** Finds and removes unreachable functions from
   compiled binaries, reducing attack surface and binary size.
-- **No source needed:** Works on any ELF binary — no recompilation,
+- **Multi-format:** Supports ELF (Linux), PE/COFF (Windows), Mach-O
+  (macOS), and .NET managed assemblies.
+- **Multi-architecture:** Analyzes x86-64, x86-32, AArch64, and ARM32
+  instruction sets across all supported formats.
+- **No source needed:** Works on any supported binary — no recompilation,
   no build system integration required.
 - **No host dependencies:** Available as a static binary or scratch Docker
   image (~2 MiB). No LLVM, Python, or shared libraries needed at runtime.
 - **CI/CD integration:** Can be used as a build step in any pipeline.
-- **Multi-arch:** Runs on x86_64 and aarch64 Linux.
+- **Multi-arch host:** Runs on x86_64 and aarch64 Linux.
 
 ## 3. How the System Does It (Architecture)
 
@@ -55,16 +61,16 @@ x86_64 and aarch64 Linux.
             |
             v
 +----------------------------+
-| Analyze: parse ELF, build  |
+| Analyze: detect format,    |
+| decode instructions, build |
 | call graph, BFS from roots |
-| to find dead functions     |
 +----------------------------+
             |
             v
 +----------------------------+
-| Patch: INT3-fill dead code |
-| Shrink: remove dead bytes, |
-| update ELF headers         |
+| Patch: zero-fill dead code |
+| (x86 ELF: also compact    |
+|  and update headers)       |
 +----------------------------+
             |
             v
@@ -240,13 +246,16 @@ an output file or stdout. In-place modification requires the explicit
 
 ### BR-002: Format Auto-Detection
 
-xstrip auto-detects the binary format from ELF headers. No format flag
-is needed from the user.
+xstrip auto-detects the binary format from magic bytes. No format flag
+is needed from the user. Detection order: ELF (`\x7fELF`), .NET (MZ +
+CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/cffa_edfe).
 
 ### BR-003: Supported Formats
 
-The tool currently supports ELF (Linux) for dead code analysis and
-patching. PE/COFF (Windows) and Mach-O (macOS) support is planned.
+The tool supports ELF (Linux), PE/COFF (Windows), Mach-O (macOS), and
+.NET managed assemblies. Architecture support includes x86-64, x86-32,
+AArch64, and ARM32 across all native formats. .NET uses IL-level
+analysis independent of CPU architecture.
 
 ### BR-004: Independent File Processing
 
@@ -262,6 +271,24 @@ all modes: stream, pipe, and in-place.
 ### BR-006: Non-Root Execution
 
 The container MUST run as a non-root user (uid 10000, user `xstrip`).
+
+### BR-007: Dead Branch Detection (Planned — SDD-011)
+
+In addition to whole dead functions, xstrip detects dead branches within
+live functions. Three levels of analysis are planned:
+
+1. **CFG-based** (Phase A): unreachable basic blocks — code after
+   unconditional jumps with no incoming edges, code after calls to
+   noreturn functions (`exit`, `abort`, `__stack_chk_fail`).
+2. **Intra-function compaction** (Phase B): physically remove dead blocks
+   within functions, shift live blocks, patch branch offsets, reclaim
+   freed tail bytes.
+3. **Data-flow provable** (Phase C): SSA construction + Sparse Conditional
+   Constant Propagation (Wegman-Zadeck) proves branches that can never be
+   taken based on constant/range analysis of register values.
+
+Dead branches are reported alongside dead functions in analysis output.
+Patching zero-fills or compacts dead blocks depending on the active phase.
 
 ---
 
@@ -280,13 +307,14 @@ The container MUST run as a non-root user (uid 10000, user `xstrip`).
    - Two positional args → stream mode: write to output file (UC-001)
 5. Read input data (file or stdin)
 6. Analyze:
-   a. Parse ELF headers and symbol tables
-   b. Disassemble .text section (x86-64 decoder)
-   c. Build address-based call graph from branch/call targets
-   d. BFS reachability from roots (entry, globals, data refs)
-   e. Report dead functions found (to stderr)
+   a. Detect format (ELF/PE/Mach-O/.NET) from magic bytes
+   b. Parse headers and symbol tables
+   c. Decode instructions (x86/ARM) or IL (.NET)
+   d. Build call graph from branch/call targets or IL opcodes
+   e. BFS reachability from roots (entry, globals, data refs)
+   f. Report dead functions found (to stderr)
 7. If `--dry-run`: exit 0 (no binary output)
-8. Patch dead code with INT3, shrink binary
+8. Patch dead code (zero-fill; x86 ELF also compacts)
 9. Write output:
    - In-place mode: overwrite each file
    - Stream mode: write to output file or stdout

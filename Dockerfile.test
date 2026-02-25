@@ -38,6 +38,7 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
         lld19 \
         llvm19 \
         mingw-w64-gcc \
+        python3 \
         file \
     && ln -s /usr/lib/llvm19/bin/wasm-ld /usr/local/bin/wasm-ld \
     && rm -rf /var/cache/apk/*

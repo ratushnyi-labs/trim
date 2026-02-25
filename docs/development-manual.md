@@ -14,8 +14,16 @@ Cargo.toml          Rust project manifest (dependencies, release profile)
 Cargo.lock          Dependency lock file (reproducible builds)
 src/                Rust source code
   main.rs           CLI entry point
-  lib.rs            Core analysis and patching logic
-  patch/            ELF patching modules
+  lib.rs            Core analysis and patching logic (format dispatch)
+  arch/             Architecture-specific decoders (x86, AArch64, ARM32)
+  format/           Format-specific modules
+    elf/            ELF analysis, sections, symbols, patching
+    pe/             PE/COFF analysis, sections, symbols
+    macho/          Mach-O analysis, sections, symbols
+    dotnet/         .NET IL metadata parsing, call graph, patching
+  analysis/         Format-agnostic reachability analysis
+  decode/           Instruction decoding, call graph, function inference
+  patch/            Shared patching utilities (zero-fill, compact, relocs)
 Dockerfile          Multi-arch production image (xx + scratch)
 Dockerfile.test     Multi-arch test image (xx + Alpine runtime)
 docker-compose.yml  Services: strip (production), test (testing)
@@ -27,11 +35,13 @@ xstrip.sh           Host-side wrapper (builds image, runs container)
 .env                Environment configuration (minimal for CLI tool)
 zscaler.crt         Corporate TLS proxy CA certificate
 tests/
-  test.sh           Integration test suite (70 tests, shell-based)
+  test.sh           Integration test suite (110 tests, shell-based)
   hello.c           Test program with dead functions
   lib.c             Shared library test with dead internals
+  arm-hello.c       ARM nostdlib test program (AArch64/ARM32)
   tail-dead.c       Test for tail-position dead code removal
   big-dead.c        Test for large dead code physical shrinking
+  gen_dotnet.py     Generator for minimal .NET test assembly
 docs/
   spec.md           Business specification
   rules.md          Development rules
@@ -106,18 +116,20 @@ docker compose run --build --rm test
 
 This executes the integration tests that:
 
-1. Compile test executables with dead code (dynamic, static, shared library)
-2. Cross-compile PE (Windows) and Wasm test binaries
-3. Cross-compile Mach-O object files
-4. Verify dead code detection (no false positives on live functions)
-5. Verify in-place patched binaries execute correctly with expected output
-6. Verify physical file size reduction for large dead code
-7. Verify already-stripped binaries are handled correctly
-8. Test error handling (missing files, non-writable, no args)
-9. Test security scenarios (path traversal, symlinks, corrupted files)
-10. Verify stream mode (input → output file, input → stdout)
-11. Verify pipe mode (stdin → stdout)
-12. Verify dry-run over pipe (stdin analysis)
+1. Compile test executables with dead code (ELF dynamic, static, shared library)
+2. Cross-compile PE (Windows) EXE and DLL test binaries
+3. Cross-compile Mach-O object files (arm64-apple-macosx)
+4. Cross-compile AArch64 and ARM32 ELF binaries
+5. Generate .NET managed assembly test fixture
+6. Verify dead code detection across all formats (no false positives)
+7. Verify in-place patched binaries execute correctly with expected output
+8. Verify physical file size reduction for large dead code (x86 ELF)
+9. Verify already-stripped binaries are handled correctly
+10. Test error handling (missing files, non-writable, no args)
+11. Test security scenarios (path traversal, symlinks, corrupted files)
+12. Verify stream mode (input → output file, input → stdout)
+13. Verify pipe mode (stdin → stdout)
+14. Verify dry-run over pipe (stdin analysis)
 
 ### Test program design
 
@@ -126,9 +138,13 @@ Test C files contain intentional dead code patterns:
 - `hello.c` — dead functions with computation, string returns, table
   lookups, buffer fills; live functions called from `main`
 - `lib.c` — shared library with dead internal functions; exported
-  functions must be preserved
+  functions must be preserved (also used for PE DLL and Mach-O object)
+- `arm-hello.c` — minimal nostdlib program with dead functions; uses
+  inline asm for syscall exit (AArch64/ARM32/x86-64)
 - `tail-dead.c` — dead functions at end of .text section
 - `big-dead.c` — 30 large dead functions (>7KB) to test physical shrinking
+- `gen_dotnet.py` — generates minimal .NET PE assembly with Main,
+  LiveHelper (live), DeadMethod1, DeadMethod2 (dead)
 
 ## Quick manual test
 

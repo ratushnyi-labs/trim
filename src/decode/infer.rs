@@ -1,60 +1,63 @@
-use crate::elf::symbols::get_dynamic_symbols;
-use crate::types::{DecodedInstr, FuncInfo, FuncMap, Section};
-use goblin::elf::Elf;
+use crate::types::{
+    DecodedInstr, Endian, FuncInfo, FuncMap, Section,
+};
 use std::collections::BTreeMap;
 
 /// Infer function boundaries for stripped binaries.
 pub fn infer_functions(
-    elf: &Elf,
+    entry: u64,
+    dynsyms: &FuncMap,
     data: &[u8],
     sections: &[Section],
     instrs: &[DecodedInstr],
     text_start: u64,
     text_end: u64,
+    is64: bool,
 ) -> FuncMap {
-    let dynsyms = get_dynamic_symbols(elf);
-    let entry = elf.entry;
-    let data_refs =
-        scan_data_code_refs(data, sections, text_start, text_end);
+    let data_refs = scan_data_code_refs(
+        data, sections, text_start, text_end, is64,
+    );
     let call_targets = collect_call_targets(instrs);
     let ref_targets = collect_ref_targets(instrs);
     let mut starts: BTreeMap<u64, (String, bool)> =
         BTreeMap::new();
-    // Dynamic symbols
-    for (name, fi) in &dynsyms {
+    for (name, fi) in dynsyms {
         if text_start <= fi.addr && fi.addr < text_end {
             starts.insert(fi.addr, (name.clone(), fi.is_global));
         }
     }
-    // Entry point
     if text_start <= entry && entry < text_end {
         starts
             .entry(entry)
             .or_insert(("_start".to_string(), true));
     }
-    // Call targets
-    for tgt in &call_targets {
-        if text_start <= *tgt && *tgt < text_end {
-            starts
-                .entry(*tgt)
-                .or_insert((format!("sub_{:x}", tgt), false));
-        }
-    }
-    // Reference targets (RIP-relative LEA etc.)
-    for tgt in &ref_targets {
-        if text_start <= *tgt && *tgt < text_end {
-            starts
-                .entry(*tgt)
-                .or_insert((format!("sub_{:x}", tgt), false));
-        }
-    }
-    // Data section references
+    insert_targets(
+        &mut starts, &call_targets, text_start, text_end,
+    );
+    insert_targets(
+        &mut starts, &ref_targets, text_start, text_end,
+    );
     for addr in &data_refs {
         starts
             .entry(*addr)
             .or_insert((format!("sub_{:x}", addr), true));
     }
     build_func_map(&starts, text_end)
+}
+
+fn insert_targets(
+    starts: &mut BTreeMap<u64, (String, bool)>,
+    targets: &[u64],
+    text_start: u64,
+    text_end: u64,
+) {
+    for tgt in targets {
+        if text_start <= *tgt && *tgt < text_end {
+            starts
+                .entry(*tgt)
+                .or_insert((format!("sub_{:x}", tgt), false));
+        }
+    }
 }
 
 fn collect_call_targets(
@@ -72,7 +75,7 @@ fn collect_ref_targets(
 ) -> Vec<u64> {
     instrs
         .iter()
-        .filter_map(|i| i.rip_target)
+        .filter_map(|i| i.pc_rel_target)
         .collect()
 }
 
@@ -81,6 +84,7 @@ fn scan_data_code_refs(
     sections: &[Section],
     text_start: u64,
     text_end: u64,
+    is64: bool,
 ) -> Vec<u64> {
     let scan_names: &[&str] = &[
         ".data",
@@ -91,27 +95,21 @@ fn scan_data_code_refs(
         ".fini_array",
         ".ctors",
         ".dtors",
+        ".rdata",
     ];
-    let is64 = data.len() > 4 && data[4] == 2;
     let ptr_size: usize = if is64 { 8 } else { 4 };
+    let endian = Endian::Little;
     let mut refs = Vec::new();
     for sec in sections {
         if !scan_names.contains(&sec.name.as_str()) {
             continue;
         }
-        let end =
-            (sec.offset as usize + sec.size as usize).min(data.len());
+        let end = (sec.offset as usize + sec.size as usize)
+            .min(data.len());
         let mut i = sec.offset as usize;
         while i + ptr_size <= end {
-            let val = if is64 {
-                u64::from_le_bytes(
-                    data[i..i + 8].try_into().unwrap_or([0; 8]),
-                )
-            } else {
-                u32::from_le_bytes(
-                    data[i..i + 4].try_into().unwrap_or([0; 4]),
-                ) as u64
-            };
+            let val =
+                crate::types::read_ptr(data, i, is64, endian);
             if text_start <= val && val < text_end {
                 refs.push(val);
             }

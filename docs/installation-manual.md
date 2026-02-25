@@ -95,13 +95,12 @@ docker compose run --rm strip -i /work/myapp
 
 ## Supported Formats
 
-Dead code analysis and patching is supported for ELF binaries:
-
-| Format    | Analyze | Patch | Notes                            |
-|-----------|---------|-------|----------------------------------|
-| ELF       | Yes     | Yes   | Dynamic, static, shared (.so)    |
-| PE/COFF   | No      | No    | Not yet supported                |
-| Mach-O    | No      | No    | Not yet supported                |
+| Format    | Analyze | Patch  | Architectures       | Notes                          |
+|-----------|---------|--------|----------------------|--------------------------------|
+| ELF       | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32 | Compact+shrink for x86, zero-fill for ARM |
+| PE/COFF   | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32 | Zero-fill patching             |
+| Mach-O    | Yes     | Yes    | x86-64, AArch64, ARM32 | Zero-fill patching             |
+| .NET      | Yes     | Yes    | IL (arch-independent) | IL-level dead method detection |
 
 ## Output
 
@@ -141,8 +140,8 @@ Patch mode removes dead code and reports freed bytes:
   match the container user uid with `--user $(id -u):$(id -g)`.
 - **"not found":** The file path does not exist or is not a regular file.
 - **"not writable":** The file is read-only; `chmod u+w` to fix.
-- **"skipped":** The file is not a recognized ELF binary or has no
-  functions to analyze.
+- **"skipped":** The file is not a recognized binary format (ELF, PE,
+  Mach-O, .NET) or has no functions to analyze.
 
 ## Reverse Proxy Support
 

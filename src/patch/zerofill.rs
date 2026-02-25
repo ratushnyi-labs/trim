@@ -1,5 +1,4 @@
-use crate::elf::sections::vaddr_to_offset;
-use crate::types::Section;
+use crate::types::{vaddr_to_offset, Section};
 use std::collections::HashMap;
 
 /// Zero-fill dead function bytes for compressibility.

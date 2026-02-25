@@ -186,7 +186,7 @@ fn eprint_usage() {
          Usage: xstrip [OPTIONS] <INPUT> [OUTPUT]\n\
          \n\
          Find and remove dead code from executables.\n\
-         Supports: ELF\n\
+         Supports: ELF, PE/COFF, Mach-O, .NET\n\
          \n\
          Modes:\n\
          \x20 xstrip INPUT OUTPUT       Write patched binary to OUTPUT\n\

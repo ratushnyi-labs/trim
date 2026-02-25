@@ -42,6 +42,19 @@ pub static RUNTIME_KEEP: LazyLock<HashSet<&'static str>> =
             "wmainCRTStartup",
             "__main",
             "__security_init_cookie",
+            // ARM runtime symbols
+            "__aeabi_unwind_cpp_pr0",
+            "__aeabi_unwind_cpp_pr1",
+            "__aeabi_unwind_cpp_pr2",
+            "__aeabi_memcpy",
+            "__aeabi_memset",
+            "__aeabi_memclr",
+            "__arm_personality_routine",
+            "__gnu_unwind_frame",
+            // PE additional symbols
+            "_CRT_INIT",
+            "__security_check_cookie",
+            "_guard_check_icall",
         ]
         .into_iter()
         .collect()

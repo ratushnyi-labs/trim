@@ -1,11 +1,4 @@
 pub mod compact;
 pub mod data_ptrs;
-pub mod dynamic;
-pub mod entry;
-pub mod headers;
-pub mod jump_tables;
-pub mod rela_dyn;
 pub mod relocs;
-pub mod riprel;
-pub mod symbols;
 pub mod zerofill;

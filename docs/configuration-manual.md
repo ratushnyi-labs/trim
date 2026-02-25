@@ -113,12 +113,13 @@ To use a different CA certificate, replace `zscaler.crt` before building.
 The test image (`Dockerfile.test`) uses the same `xx`-based builder as
 production. The test runtime stage is Alpine 3.23 with additional packages:
 
-| Package         | Purpose                              |
-|-----------------|--------------------------------------|
-| gcc             | Compile ELF test binaries            |
-| musl-dev        | C library headers for gcc            |
-| clang19         | Cross-compile PE, Wasm, Mach-O tests |
-| lld19           | LLVM linker for clang19              |
-| llvm19          | llvm-strip for pre-stripped tests    |
-| mingw-w64-gcc   | Cross-compile Windows PE binaries    |
-| file            | Detect binary format in tests        |
+| Package         | Purpose                                    |
+|-----------------|--------------------------------------------|
+| gcc             | Compile ELF test binaries                  |
+| musl-dev        | C library headers for gcc                  |
+| clang19         | Cross-compile PE, Wasm, Mach-O, ARM tests  |
+| lld19           | LLVM linker for clang19                    |
+| llvm19          | llvm-strip for pre-stripped tests           |
+| mingw-w64-gcc   | Cross-compile Windows PE binaries          |
+| python3         | Generate .NET test assembly fixture        |
+| file            | Detect binary format in tests              |

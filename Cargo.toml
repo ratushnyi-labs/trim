@@ -6,7 +6,7 @@ authors = ["Pavlo Ratushnyi"]
 license = "MIT"
 
 [dependencies]
-goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
+goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "pe64", "pe32", "mach64", "mach32", "endian_fd"] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 memmap2 = "0.9"
 anyhow = "1"

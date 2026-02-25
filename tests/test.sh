@@ -54,6 +54,22 @@ clang-19 -c --target=arm64-apple-macosx -g -O0 -fno-inline \
 printf 'Built: lib-macho.o (%d bytes, Mach-O)\n' \
     "$(stat -c%s /work/lib-macho.o)"
 
+python3 /tests/gen_dotnet.py > /work/hello-dotnet.exe
+printf 'Built: hello-dotnet.exe (%d bytes, .NET)\n' \
+    "$(stat -c%s /work/hello-dotnet.exe)"
+
+clang-19 --target=aarch64-linux-gnu -nostdlib -static -g -O0 \
+    -fno-inline -fuse-ld=lld -o /work/hello-aarch64 \
+    /tests/arm-hello.c 2>/dev/null
+printf 'Built: hello-aarch64 (%d bytes, ELF AArch64)\n' \
+    "$(stat -c%s /work/hello-aarch64)"
+
+clang-19 --target=armv7-linux-gnueabihf -nostdlib -static -g -O0 \
+    -fno-inline -fuse-ld=lld -o /work/hello-arm32 \
+    /tests/arm-hello.c 2>/dev/null
+printf 'Built: hello-arm32 (%d bytes, ELF ARM32)\n' \
+    "$(stat -c%s /work/hello-arm32)"
+
 # =============================================
 # Dead code detection: ELF dynamic
 # =============================================
@@ -582,6 +598,267 @@ echo "$output" | grep -q 'Author:' && \
 echo "$output" | grep -q 'DISCLAIMER' && \
     pass "--help: shows disclaimer" || \
     fail "--help: disclaimer" "not found"
+
+# =============================================
+# Dead code detection: PE executable
+# =============================================
+printf '\n--- Dead code detection: PE executable ---\n'
+cp /work/hello.exe /work/test-pe
+output=$(xstrip --dry-run /work/test-pe 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass "PE exe: analysis completed" || \
+    fail "PE exe: analysis" "not completed"
+
+echo "$output" | grep -q 'functions' && \
+    pass "PE exe: functions discovered" || \
+    fail "PE exe: functions" "none found"
+
+echo "$output" | grep -q '  main' && \
+    fail "PE exe: false positive" "main flagged as dead" || \
+    pass "PE exe: main correctly kept"
+
+# =============================================
+# Patching: PE executable (zero-fill)
+# =============================================
+printf '\n--- Patching: PE executable ---\n'
+cp /work/hello.exe /work/test-pe-patch
+orig_sz_pe=$(stat -c%s /work/test-pe-patch)
+xstrip --in-place /work/test-pe-patch
+new_sz_pe=$(stat -c%s /work/test-pe-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_pe" "$new_sz_pe"
+
+[ "$new_sz_pe" -le "$orig_sz_pe" ] && \
+    pass "PE exe: patched file valid" || \
+    fail "PE exe: patched file" "size grew"
+
+file_info=$(file /work/test-pe-patch)
+echo "$file_info" | grep -q 'PE32' && \
+    pass "PE exe: patched file still PE" || \
+    fail "PE exe: patched type" "got: $file_info"
+
+# =============================================
+# Dead code detection: PE DLL (exports)
+# =============================================
+printf '\n--- Dead code detection: PE DLL ---\n'
+clang-19 --target=x86_64-w64-mingw32 -g -O0 -fno-inline -shared \
+    -fuse-ld=lld -o /work/lib.dll /tests/lib.c 2>/dev/null
+printf 'Built: lib.dll (%d bytes, PE DLL)\n' \
+    "$(stat -c%s /work/lib.dll)"
+
+output=$(xstrip --dry-run /work/lib.dll 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass "PE DLL: analysis completed" || \
+    fail "PE DLL: analysis" "not completed"
+
+echo "$output" | grep -q 'functions' && \
+    pass "PE DLL: functions discovered" || \
+    fail "PE DLL: functions" "none found"
+
+echo "$output" | grep -q '  add' && \
+    fail "PE DLL: false positive" "exported add flagged" || \
+    pass "PE DLL: exported add correctly kept"
+
+echo "$output" | grep -q '  multiply' && \
+    fail "PE DLL: false positive" "exported multiply flagged" || \
+    pass "PE DLL: exported multiply correctly kept"
+
+# =============================================
+# Dead code detection: Mach-O object
+# =============================================
+printf '\n--- Dead code detection: Mach-O object ---\n'
+output=$(xstrip --dry-run /work/lib-macho.o 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass "Mach-O: analysis completed" || \
+    fail "Mach-O: analysis" "not completed"
+
+echo "$output" | grep -q 'functions' && \
+    pass "Mach-O: functions discovered" || \
+    fail "Mach-O: functions" "none found"
+
+echo "$output" | grep -q '    add:' && \
+    fail "Mach-O: false positive" "exported add flagged" || \
+    pass "Mach-O: exported add correctly kept"
+
+echo "$output" | grep -q '    multiply:' && \
+    fail "Mach-O: false positive" "exported multiply flagged" || \
+    pass "Mach-O: exported multiply correctly kept"
+
+echo "$output" | grep -q '    compute:' && \
+    fail "Mach-O: false positive" "exported compute flagged" || \
+    pass "Mach-O: exported compute correctly kept"
+
+# =============================================
+# Patching: Mach-O object
+# =============================================
+printf '\n--- Patching: Mach-O object ---\n'
+cp /work/lib-macho.o /work/test-macho-patch
+output=$(xstrip /work/test-macho-patch 2>&1)
+echo "$output"
+macho_sz_before=$(stat -c%s /work/lib-macho.o)
+macho_sz_after=$(stat -c%s /work/test-macho-patch)
+printf 'Size: %d -> %d bytes\n' "$macho_sz_before" "$macho_sz_after"
+[ "$macho_sz_after" -le "$macho_sz_before" ] && \
+    pass "Mach-O: patched file valid" || \
+    fail "Mach-O: patched file" "grew in size"
+file /work/test-macho-patch | grep -qi 'mach-o' && \
+    pass "Mach-O: patched file still Mach-O" || \
+    fail "Mach-O: patched file" "not Mach-O"
+
+# =============================================
+# Dead code detection: .NET managed assembly
+# =============================================
+printf '\n--- Dead code detection: .NET managed ---\n'
+output=$(xstrip --dry-run /work/hello-dotnet.exe 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass ".NET: analysis completed" || \
+    fail ".NET: analysis" "not completed"
+
+echo "$output" | grep -q 'functions' && \
+    pass ".NET: functions discovered" || \
+    fail ".NET: functions" "none found"
+
+echo "$output" | grep -q 'DeadMethod1' && \
+    pass ".NET: detected DeadMethod1" || \
+    fail ".NET: DeadMethod1" "not found"
+
+echo "$output" | grep -q 'DeadMethod2' && \
+    pass ".NET: detected DeadMethod2" || \
+    fail ".NET: DeadMethod2" "not found"
+
+echo "$output" | grep -q '    Main:' && \
+    fail ".NET: false positive" "Main flagged" || \
+    pass ".NET: Main correctly kept"
+
+echo "$output" | grep -q '    LiveHelper:' && \
+    fail ".NET: false positive" "LiveHelper flagged" || \
+    pass ".NET: LiveHelper correctly kept"
+
+# =============================================
+# Patching: .NET managed assembly
+# =============================================
+printf '\n--- Patching: .NET managed ---\n'
+cp /work/hello-dotnet.exe /work/test-dotnet-patch
+output=$(xstrip /work/test-dotnet-patch 2>&1)
+echo "$output"
+dn_sz_before=$(stat -c%s /work/hello-dotnet.exe)
+dn_sz_after=$(stat -c%s /work/test-dotnet-patch)
+printf 'Size: %d -> %d bytes\n' "$dn_sz_before" "$dn_sz_after"
+[ "$dn_sz_after" -le "$dn_sz_before" ] && \
+    pass ".NET: patched file valid" || \
+    fail ".NET: patched file" "grew in size"
+file /work/test-dotnet-patch | grep -qi 'pe' && \
+    pass ".NET: patched file still PE" || \
+    fail ".NET: patched file" "not PE"
+
+# =============================================
+# Dead code detection: AArch64
+# =============================================
+printf '\n--- Dead code detection: AArch64 ---\n'
+output=$(xstrip --dry-run /work/hello-aarch64 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "AArch64: detected dead_compute" || \
+    fail "AArch64: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "AArch64: detected dead_factorial" || \
+    fail "AArch64: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "AArch64: false positive" "_start flagged as dead" || \
+    pass "AArch64: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "AArch64: false positive" "live_add flagged as dead" || \
+    pass "AArch64: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "AArch64: false positive" "live_multiply flagged" || \
+    pass "AArch64: live_multiply correctly kept"
+
+file_info=$(file /work/hello-aarch64)
+echo "$file_info" | grep -q 'ELF.*ARM aarch64' && \
+    pass "AArch64: correct ELF type" || \
+    fail "AArch64: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: AArch64 (zero-fill only)
+# =============================================
+printf '\n--- Patching: AArch64 ---\n'
+cp /work/hello-aarch64 /work/test-aarch64-patch
+orig_sz_a64=$(stat -c%s /work/test-aarch64-patch)
+xstrip --in-place /work/test-aarch64-patch
+new_sz_a64=$(stat -c%s /work/test-aarch64-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_a64" "$new_sz_a64"
+
+[ "$new_sz_a64" -le "$orig_sz_a64" ] && \
+    pass "AArch64: patched file valid" || \
+    fail "AArch64: patched file" "size grew"
+
+file_info=$(file /work/test-aarch64-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "AArch64: patched file still ELF" || \
+    fail "AArch64: patched type" "got: $file_info"
+
+# =============================================
+# Dead code detection: ARM32
+# =============================================
+printf '\n--- Dead code detection: ARM32 ---\n'
+output=$(xstrip --dry-run /work/hello-arm32 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "ARM32: detected dead_compute" || \
+    fail "ARM32: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "ARM32: detected dead_factorial" || \
+    fail "ARM32: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "ARM32: false positive" "_start flagged as dead" || \
+    pass "ARM32: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "ARM32: false positive" "live_add flagged as dead" || \
+    pass "ARM32: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "ARM32: false positive" "live_multiply flagged" || \
+    pass "ARM32: live_multiply correctly kept"
+
+file_info=$(file /work/hello-arm32)
+echo "$file_info" | grep -q 'ELF.*ARM' && \
+    pass "ARM32: correct ELF type" || \
+    fail "ARM32: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: ARM32 (zero-fill only)
+# =============================================
+printf '\n--- Patching: ARM32 ---\n'
+cp /work/hello-arm32 /work/test-arm32-patch
+orig_sz_arm32=$(stat -c%s /work/test-arm32-patch)
+xstrip --in-place /work/test-arm32-patch
+new_sz_arm32=$(stat -c%s /work/test-arm32-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_arm32" "$new_sz_arm32"
+
+[ "$new_sz_arm32" -le "$orig_sz_arm32" ] && \
+    pass "ARM32: patched file valid" || \
+    fail "ARM32: patched file" "size grew"
+
+file_info=$(file /work/test-arm32-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "ARM32: patched file still ELF" || \
+    fail "ARM32: patched type" "got: $file_info"
 
 # =============================================
 # Cleanup

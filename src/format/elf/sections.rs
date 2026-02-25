@@ -19,28 +19,18 @@ pub fn get_sections(elf: &Elf) -> Vec<Section> {
                 size: sh.sh_size,
                 vaddr: sh.sh_addr,
                 offset: sh.sh_offset,
+                align: sh.sh_addralign,
             })
         })
         .collect()
 }
 
 /// Return (start_vaddr, end_vaddr) of the .text section.
-pub fn text_bounds(sections: &[Section]) -> Option<(u64, u64)> {
+pub fn text_bounds(
+    sections: &[Section],
+) -> Option<(u64, u64)> {
     sections
         .iter()
         .find(|s| s.name == ".text")
         .map(|s| (s.vaddr, s.vaddr + s.size))
-}
-
-/// Convert a virtual address to a file offset.
-pub fn vaddr_to_offset(
-    vaddr: u64,
-    sections: &[Section],
-) -> Option<u64> {
-    for s in sections {
-        if s.vaddr <= vaddr && vaddr < s.vaddr + s.size {
-            return Some(s.offset + (vaddr - s.vaddr));
-        }
-    }
-    None
 }
