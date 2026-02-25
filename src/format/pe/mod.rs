@@ -5,7 +5,8 @@ use crate::analysis::reachability::{compute_live_set, find_dead};
 use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
-use crate::patch::zerofill::zero_fill;
+use crate::analysis::cfg::DeadBlock;
+use crate::patch::zerofill::{zero_fill, zero_fill_blocks};
 use crate::types::{
     Arch, DecodedInstr, Endian, FuncMap, Section,
 };
@@ -104,11 +105,40 @@ fn empty_result()
     (FuncMap::new(), HashMap::new(), Vec::new())
 }
 
-/// Reassemble PE: zero-fill dead code (no compaction yet).
+/// Reassemble PE: zero-fill dead code.
 pub fn reassemble_pe(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
     sections: &[Section],
-) -> (usize, u64) {
-    zero_fill(data, dead, sections)
+) -> (usize, u64, usize, u64) {
+    let arch = detect_arch_pe_raw(data);
+    let (fc, fs) = zero_fill(data, dead, sections);
+    let (bc, bs) =
+        zero_fill_blocks(data, dead_blocks, sections, arch);
+    (fc, fs, bc, bs)
+}
+
+fn detect_arch_pe_raw(data: &[u8]) -> Arch {
+    if data.len() < 0x40 {
+        return Arch::X86_64;
+    }
+    let pe_off = u32::from_le_bytes(
+        data[0x3C..0x40].try_into().unwrap_or([0; 4]),
+    ) as usize;
+    if pe_off + 6 > data.len() {
+        return Arch::X86_64;
+    }
+    let m = u16::from_le_bytes(
+        data[pe_off + 4..pe_off + 6]
+            .try_into()
+            .unwrap_or([0; 2]),
+    );
+    match m {
+        0x8664 => Arch::X86_64,
+        0x014C => Arch::X86_32,
+        0xAA64 => Arch::Aarch64,
+        0x01C0 => Arch::Arm32,
+        _ => Arch::X86_64,
+    }
 }

@@ -24,6 +24,19 @@ pub struct FuncInfo {
     pub is_global: bool,
 }
 
+/// Instruction flow control type for CFG construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowType {
+    Normal,
+    Call,
+    UnconditionalBranch,
+    ConditionalBranch,
+    Return,
+    Halt,
+    IndirectBranch,
+    IndirectCall,
+}
+
 /// A decoded instruction with metadata.
 #[derive(Debug, Clone)]
 pub struct DecodedInstr {
@@ -33,6 +46,7 @@ pub struct DecodedInstr {
     pub targets: Vec<u64>,
     pub pc_rel_target: Option<u64>,
     pub is_call: bool,
+    pub flow: FlowType,
 }
 
 /// A binary section descriptor.

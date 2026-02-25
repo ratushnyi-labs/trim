@@ -1,4 +1,4 @@
-use crate::types::DecodedInstr;
+use crate::types::{DecodedInstr, FlowType};
 
 /// Decode AArch64 instructions (fixed 32-bit, little-endian).
 /// Only extracts branch targets and PC-relative references.
@@ -18,96 +18,115 @@ pub fn decode_text_aarch64(
         let word = u32::from_le_bytes(
             raw[..4].try_into().unwrap_or([0; 4]),
         );
-        let (targets, pc_rel, is_call) =
-            decode_a64_word(addr, word);
+        let d = decode_a64_word(addr, word);
         instrs.push(DecodedInstr {
             addr,
             raw,
             len: 4,
-            targets,
-            pc_rel_target: pc_rel,
-            is_call,
+            targets: d.targets,
+            pc_rel_target: d.pc_rel,
+            is_call: matches!(d.flow, FlowType::Call),
+            flow: d.flow,
         });
         offset += 4;
     }
     instrs
 }
 
-fn decode_a64_word(
-    addr: u64,
-    w: u32,
-) -> (Vec<u64>, Option<u64>, bool) {
-    let mut targets = Vec::new();
-    let mut pc_rel = None;
-    let mut is_call = false;
+struct A64Decoded {
+    targets: Vec<u64>,
+    pc_rel: Option<u64>,
+    flow: FlowType,
+}
+
+fn decode_a64_word(addr: u64, w: u32) -> A64Decoded {
+    let mut d = A64Decoded {
+        targets: Vec::new(),
+        pc_rel: None,
+        flow: FlowType::Normal,
+    };
     let op = w >> 26;
     match op {
         0b000101 => {
-            // B imm26
-            let t = branch26_target(addr, w);
-            targets.push(t);
+            d.targets.push(branch26_target(addr, w));
+            d.flow = FlowType::UnconditionalBranch;
         }
         0b100101 => {
-            // BL imm26
-            let t = branch26_target(addr, w);
-            targets.push(t);
-            is_call = true;
+            d.targets.push(branch26_target(addr, w));
+            d.flow = FlowType::Call;
         }
         _ => {
-            decode_a64_other(
-                addr,
-                w,
-                &mut targets,
-                &mut pc_rel,
-            );
+            decode_a64_other(addr, w, &mut d);
         }
     }
-    if let Some(t) = pc_rel {
-        if !targets.contains(&t) {
-            targets.push(t);
+    if let Some(t) = d.pc_rel {
+        if !d.targets.contains(&t) {
+            d.targets.push(t);
         }
     }
-    (targets, pc_rel, is_call)
+    d
 }
 
-fn decode_a64_other(
-    addr: u64,
-    w: u32,
-    targets: &mut Vec<u64>,
-    pc_rel: &mut Option<u64>,
-) {
+fn decode_a64_other(addr: u64, w: u32, d: &mut A64Decoded) {
+    // RET: 1101_0110_0101_1111_0000_00 Rn 00000
+    if (w & 0xFFFF_FC1F) == 0xD65F_0000 {
+        d.flow = FlowType::Return;
+        return;
+    }
+    // BR Xn (indirect branch): 1101_0110_0001_1111_0000_00 Rn 00000
+    if (w & 0xFFFF_FC1F) == 0xD61F_0000 {
+        d.flow = FlowType::IndirectBranch;
+        return;
+    }
+    // BLR Xn (indirect call): 1101_0110_0011_1111_0000_00 Rn 00000
+    if (w & 0xFFFF_FC1F) == 0xD63F_0000 {
+        d.flow = FlowType::IndirectCall;
+        return;
+    }
+    // BRK #imm16: HLT/trap
+    if (w & 0xFFE0_0000) == 0xD420_0000 {
+        d.flow = FlowType::Halt;
+        return;
+    }
+    decode_a64_branches(addr, w, d);
+}
+
+fn decode_a64_branches(addr: u64, w: u32, d: &mut A64Decoded) {
     // B.cond: 0101_0100 imm19[23:5] 0 cond[3:0]
     if (w & 0xFF00_0010) == 0x5400_0000 {
-        let t = branch19_target(addr, w);
-        targets.push(t);
+        d.targets.push(branch19_target(addr, w));
+        d.flow = FlowType::ConditionalBranch;
         return;
     }
     // CBZ/CBNZ: sf 011010 op imm19 Rt
     if (w & 0x7E00_0000) == 0x3400_0000 {
-        let t = branch19_target(addr, w);
-        targets.push(t);
+        d.targets.push(branch19_target(addr, w));
+        d.flow = FlowType::ConditionalBranch;
         return;
     }
     // TBZ/TBNZ: b5 011011 op b40 imm14 Rt
     if (w & 0x7E00_0000) == 0x3600_0000 {
-        let t = branch14_target(addr, w);
-        targets.push(t);
+        d.targets.push(branch14_target(addr, w));
+        d.flow = FlowType::ConditionalBranch;
         return;
     }
-    // ADRP: 1 immlo[30:29] 10000 immhi[23:5] Rd[4:0]
+    decode_a64_pcrel(addr, w, d);
+}
+
+fn decode_a64_pcrel(addr: u64, w: u32, d: &mut A64Decoded) {
+    // ADRP
     if (w & 0x9F00_0000) == 0x9000_0000 {
-        *pc_rel = Some(adrp_target(addr, w));
+        d.pc_rel = Some(adrp_target(addr, w));
         return;
     }
-    // ADR: 0 immlo[30:29] 10000 immhi[23:5] Rd[4:0]
+    // ADR
     if (w & 0x9F00_0000) == 0x1000_0000 {
-        *pc_rel = Some(adr_target(addr, w));
+        d.pc_rel = Some(adr_target(addr, w));
         return;
     }
-    // LDR literal: opc[31:30] 011 V[26] 00 imm19[23:5] Rt
+    // LDR literal
     if (w & 0x3B00_0000) == 0x1800_0000 {
-        let t = branch19_target(addr, w);
-        *pc_rel = Some(t);
+        d.pc_rel = Some(branch19_target(addr, w));
     }
 }
 

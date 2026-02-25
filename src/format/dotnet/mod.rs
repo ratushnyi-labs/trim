@@ -3,6 +3,7 @@ pub mod metadata;
 pub mod patch;
 pub mod tables;
 
+use crate::analysis::cfg::DeadBlock;
 use crate::types::{FuncInfo, FuncMap, Section};
 use std::collections::{HashMap, HashSet};
 
@@ -56,7 +57,7 @@ fn build_func_map(
     data: &[u8],
 ) -> FuncMap {
     let mut funcs = FuncMap::new();
-    for (i, m) in methods.iter().enumerate() {
+    for (_i, m) in methods.iter().enumerate() {
         if m.rva == 0 {
             continue;
         }
@@ -124,8 +125,8 @@ fn mark_public_type_methods(
     roots: &mut HashSet<usize>,
     types: &[tables::TypeDef],
     methods: &[tables::MethodDef],
-    data: &[u8],
-    root: &metadata::MetadataRoot,
+    _data: &[u8],
+    _root: &metadata::MetadataRoot,
 ) {
     let total = methods.len() as u32;
     for (i, td) in types.iter().enumerate() {
@@ -186,7 +187,7 @@ fn token_to_method_idx(
 }
 
 fn find_dead_methods(
-    funcs: &FuncMap,
+    _funcs: &FuncMap,
     methods: &[tables::MethodDef],
     live: &HashSet<usize>,
     data: &[u8],
@@ -267,8 +268,9 @@ fn pe_rva_to_offset(
 pub fn reassemble_dotnet(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
+    _dead_blocks: &[DeadBlock],
     _sections: &[Section],
-) -> (usize, u64) {
+) -> (usize, u64, usize, u64) {
     let dead_rvas: Vec<(u32, String)> = dead
         .iter()
         .map(|(n, &(a, _))| (a as u32, n.clone()))
@@ -277,7 +279,9 @@ pub fn reassemble_dotnet(
     let rva_fn = |rva: u32| -> Option<usize> {
         pe_rva_to_offset(&orig, rva)
     };
-    patch::zero_dead_methods(data, &dead_rvas, &rva_fn)
+    let (fc, fs) =
+        patch::zero_dead_methods(data, &dead_rvas, &rva_fn);
+    (fc, fs, 0, 0)
 }
 
 fn empty()

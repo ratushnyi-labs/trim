@@ -1,4 +1,4 @@
-use crate::types::DecodedInstr;
+use crate::types::{DecodedInstr, FlowType};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 /// Decode all x86-64 instructions in a code section.
@@ -49,16 +49,15 @@ fn decode_one(
             targets.push(t);
         }
     }
+    let flow = classify_flow(instr);
     DecodedInstr {
         addr,
         raw,
         len,
         targets,
         pc_rel_target: pc_rel,
-        is_call: matches!(
-            instr.flow_control(),
-            FlowControl::Call
-        ),
+        is_call: matches!(flow, FlowType::Call | FlowType::IndirectCall),
+        flow,
     }
 }
 
@@ -80,4 +79,46 @@ fn extract_pc_rel(
         return Some(instr.ip_rel_memory_address());
     }
     None
+}
+
+fn classify_flow(instr: &iced_x86::Instruction) -> FlowType {
+    match instr.flow_control() {
+        FlowControl::Next => FlowType::Normal,
+        FlowControl::Call => {
+            if near_branch_target(instr).is_some() {
+                FlowType::Call
+            } else {
+                FlowType::IndirectCall
+            }
+        }
+        FlowControl::UnconditionalBranch => {
+            if near_branch_target(instr).is_some() {
+                FlowType::UnconditionalBranch
+            } else {
+                FlowType::IndirectBranch
+            }
+        }
+        FlowControl::ConditionalBranch => {
+            FlowType::ConditionalBranch
+        }
+        FlowControl::Return => FlowType::Return,
+        FlowControl::IndirectBranch => FlowType::IndirectBranch,
+        FlowControl::IndirectCall => FlowType::IndirectCall,
+        FlowControl::Interrupt => {
+            if is_halt_instr(instr) {
+                FlowType::Halt
+            } else {
+                FlowType::Normal
+            }
+        }
+        _ => FlowType::Normal,
+    }
+}
+
+fn is_halt_instr(instr: &iced_x86::Instruction) -> bool {
+    let code = instr.code();
+    matches!(
+        code,
+        iced_x86::Code::Hlt | iced_x86::Code::Ud2
+    )
 }

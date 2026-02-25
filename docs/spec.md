@@ -272,23 +272,26 @@ all modes: stream, pipe, and in-place.
 
 The container MUST run as a non-root user (uid 10000, user `xstrip`).
 
-### BR-007: Dead Branch Detection (Planned — SDD-011)
+### BR-007: Dead Branch Detection (SDD-011)
 
 In addition to whole dead functions, xstrip detects dead branches within
-live functions. Three levels of analysis are planned:
+live functions. Three levels of analysis:
 
-1. **CFG-based** (Phase A): unreachable basic blocks — code after
-   unconditional jumps with no incoming edges, code after calls to
-   noreturn functions (`exit`, `abort`, `__stack_chk_fail`).
-2. **Intra-function compaction** (Phase B): physically remove dead blocks
-   within functions, shift live blocks, patch branch offsets, reclaim
-   freed tail bytes.
-3. **Data-flow provable** (Phase C): SSA construction + Sparse Conditional
-   Constant Propagation (Wegman-Zadeck) proves branches that can never be
-   taken based on constant/range analysis of register values.
+1. **CFG-based** (Phase A — implemented): unreachable basic blocks — code
+   after calls to noreturn functions (`exit`, `abort`, `__stack_chk_fail`)
+   resolved via both symbol table and PLT/IAT import names.
+2. **Intra-function compaction** (Phase B — implemented): dead blocks
+   within functions are fed into the compaction pipeline alongside dead
+   functions. Live code is shifted, all branch offsets and references are
+   patched, freed tail bytes are reclaimed.
+3. **Data-flow provable** (Phase C — implemented): SSA construction +
+   register-based constant propagation proves branches that can never be
+   taken based on constant analysis of register values. Conservative:
+   memory treated as unknown at all times, caller-saved registers
+   clobbered at call sites, indirect branches assume all targets live.
 
 Dead branches are reported alongside dead functions in analysis output.
-Patching zero-fills or compacts dead blocks depending on the active phase.
+Dead blocks are compacted through the same pipeline as dead functions.
 
 ---
 

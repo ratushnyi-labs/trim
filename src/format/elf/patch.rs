@@ -384,7 +384,7 @@ fn patch_one_phdr(
     ts: u64,
     te: u64,
     ps: u64,
-    text_sec: &Section,
+    _text_sec: &Section,
     text_file_end: u64,
 ) {
     let p_offset = read_u64(data, base + 8);

@@ -759,6 +759,117 @@ file /work/test-dotnet-patch | grep -qi 'pe' && \
     fail ".NET: patched file" "not PE"
 
 # =============================================
+# Dead branch detection: noreturn calls
+# =============================================
+printf '\n--- Dead branch detection: noreturn calls ---\n'
+gcc -g -O0 -fno-inline -fno-builtin -o /work/test-dead-branch \
+    /tests/dead-branch.c
+printf 'Built: test-dead-branch (%d bytes)\n' \
+    "$(stat -c%s /work/test-dead-branch)"
+
+output=$(xstrip --dry-run /work/test-dead-branch 2>&1)
+echo "$output"
+
+# Must detect dead branch after exit() in noreturn_dead
+echo "$output" | grep -q 'dead branch' && \
+    pass "DeadBranch: detected dead branch" || \
+    fail "DeadBranch: detection" "no dead branch found"
+
+# noreturn_dead should NOT be flagged as dead function
+echo "$output" | grep -q '    noreturn_dead:' && \
+    fail "DeadBranch: false positive" "noreturn_dead flagged dead" || \
+    pass "DeadBranch: noreturn_dead correctly kept"
+
+# live_caller must be kept
+echo "$output" | grep -q '    live_caller:' && \
+    fail "DeadBranch: false positive" "live_caller flagged dead" || \
+    pass "DeadBranch: live_caller correctly kept"
+
+# main must be kept
+echo "$output" | grep -q '    main:' && \
+    fail "DeadBranch: false positive" "main flagged dead" || \
+    pass "DeadBranch: main correctly kept"
+
+# Patch and verify execution + compaction
+cp /work/test-dead-branch /work/test-dead-branch-patch
+patch_out=$(xstrip --in-place /work/test-dead-branch-patch 2>&1)
+echo "$patch_out"
+/work/test-dead-branch-patch 5 > /dev/null 2>&1 && \
+    pass "DeadBranch: patched binary executes" || \
+    fail "DeadBranch: execution" "crashed"
+
+output=$(/work/test-dead-branch-patch 5 2>&1)
+echo "$output" | grep -q 'result:' && \
+    pass "DeadBranch: patched output correct" || \
+    fail "DeadBranch: output" "got: $output"
+
+# Verify compaction: reassemble reports dead branches removed
+echo "$patch_out" | grep -q 'dead branches removed' && \
+    pass "DeadBranch: compaction applied" || \
+    fail "DeadBranch: compaction" "not reported"
+
+# =============================================
+# Combined dead functions + dead branches
+# =============================================
+printf '\n--- Combined dead functions + dead branches ---\n'
+gcc -g -O0 -fno-inline -fno-builtin -o /work/test-combined \
+    /tests/combined-dead.c
+printf 'Built: test-combined (%d bytes)\n' \
+    "$(stat -c%s /work/test-combined)"
+
+output=$(xstrip --dry-run /work/test-combined 2>&1)
+echo "$output"
+
+# Must detect dead functions
+echo "$output" | grep -q 'dead_compute' && \
+    pass "Combined: detected dead_compute" || \
+    fail "Combined: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "Combined: detected dead_factorial" || \
+    fail "Combined: dead_factorial" "not found"
+
+# Must detect dead branches
+echo "$output" | grep -q 'dead branch' && \
+    pass "Combined: detected dead branches" || \
+    fail "Combined: dead branches" "not found"
+
+# Live functions must be kept
+echo "$output" | grep -q '    process:' && \
+    fail "Combined: false positive" "process flagged dead" || \
+    pass "Combined: process correctly kept"
+
+echo "$output" | grep -q '    validate:' && \
+    fail "Combined: false positive" "validate flagged dead" || \
+    pass "Combined: validate correctly kept"
+
+echo "$output" | grep -q '    main:' && \
+    fail "Combined: false positive" "main flagged dead" || \
+    pass "Combined: main correctly kept"
+
+# Patch and verify execution + compaction
+cp /work/test-combined /work/test-combined-patch
+patch_out=$(xstrip --in-place /work/test-combined-patch 2>&1)
+echo "$patch_out"
+/work/test-combined-patch 5 > /dev/null 2>&1 && \
+    pass "Combined: patched binary executes" || \
+    fail "Combined: execution" "crashed"
+
+output=$(/work/test-combined-patch 5 2>&1)
+echo "$output" | grep -q 'result:' && \
+    pass "Combined: patched output correct" || \
+    fail "Combined: output" "got: $output"
+
+# Verify both dead functions and branches were compacted
+echo "$patch_out" | grep -q 'dead functions removed' && \
+    pass "Combined: dead functions compacted" || \
+    fail "Combined: func compaction" "not reported"
+
+echo "$patch_out" | grep -q 'dead branches removed' && \
+    pass "Combined: dead branches compacted" || \
+    fail "Combined: branch compaction" "not reported"
+
+# =============================================
 # Dead code detection: AArch64
 # =============================================
 printf '\n--- Dead code detection: AArch64 ---\n'

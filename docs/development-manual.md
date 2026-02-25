@@ -35,12 +35,14 @@ xstrip.sh           Host-side wrapper (builds image, runs container)
 .env                Environment configuration (minimal for CLI tool)
 zscaler.crt         Corporate TLS proxy CA certificate
 tests/
-  test.sh           Integration test suite (110 tests, shell-based)
+  test.sh           Integration test suite (127 tests, shell-based)
   hello.c           Test program with dead functions
   lib.c             Shared library test with dead internals
   arm-hello.c       ARM nostdlib test program (AArch64/ARM32)
   tail-dead.c       Test for tail-position dead code removal
   big-dead.c        Test for large dead code physical shrinking
+  dead-branch.c     Dead branch after noreturn call (exit)
+  combined-dead.c   Combined dead functions + dead branches
   gen_dotnet.py     Generator for minimal .NET test assembly
 docs/
   spec.md           Business specification

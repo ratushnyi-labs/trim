@@ -1,3 +1,4 @@
+use crate::analysis::cfg::DeadBlock;
 use crate::types::Section;
 use std::collections::HashMap;
 
@@ -9,6 +10,32 @@ pub fn dead_intervals(
         dead.values().map(|&(a, s)| (a, a + s)).collect();
     v.sort();
     v
+}
+
+/// Convert dead blocks to sorted intervals.
+pub fn block_intervals(
+    blocks: &[DeadBlock],
+) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = blocks
+        .iter()
+        .map(|b| (b.addr, b.addr + b.size))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Merge two sorted interval lists into one sorted,
+/// non-overlapping list.
+pub fn combine_intervals(
+    a: &[(u64, u64)],
+    b: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    let mut all: Vec<(u64, u64)> = Vec::with_capacity(
+        a.len() + b.len(),
+    );
+    all.extend_from_slice(a);
+    all.extend_from_slice(b);
+    merge_intervals(&mut all)
 }
 
 /// Total dead bytes before a given address.

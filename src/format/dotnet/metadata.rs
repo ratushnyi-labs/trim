@@ -159,7 +159,7 @@ fn read_com_descriptor_rva(
 
 fn rva_to_offset(
     data: &[u8],
-    pe_off: usize,
+    _pe_off: usize,
     coff_off: usize,
     rva: u32,
 ) -> Option<usize> {

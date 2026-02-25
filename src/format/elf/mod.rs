@@ -6,10 +6,14 @@ use crate::analysis::reachability::{compute_live_set, find_dead};
 use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
+use crate::analysis::cfg::DeadBlock;
 use crate::patch::compact::compact_text;
 use crate::patch::data_ptrs::patch_data_ptrs;
-use crate::patch::relocs::{dead_intervals, defrag_intervals};
-use crate::patch::zerofill::zero_fill;
+use crate::patch::relocs::{
+    block_intervals, combine_intervals, dead_intervals,
+    defrag_intervals,
+};
+use crate::patch::zerofill::{zero_fill, zero_fill_blocks};
 use crate::types::{
     Arch, DecodedInstr, Endian, FuncMap, Section,
 };
@@ -24,20 +28,33 @@ const DECODE_SECTIONS: &[&str] = &[
 pub fn analyze_elf(
     data: &[u8],
 ) -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
+    let (funcs, dead, sections, _) = analyze_elf_full(data);
+    (funcs, dead, sections)
+}
+
+/// Analyze ELF returning import names (PLT) alongside.
+pub fn analyze_elf_full(
+    data: &[u8],
+) -> (
+    FuncMap,
+    HashMap<String, (u64, u64)>,
+    Vec<Section>,
+    HashMap<u64, String>,
+) {
     let elf = match goblin::elf::Elf::parse(data) {
         Ok(e) => e,
-        Err(_) => return empty_result(),
+        Err(_) => return empty_full(),
     };
     let sections = sections::get_sections(&elf);
     let (ts, te) = match sections::text_bounds(&sections) {
         Some(b) => b,
-        None => return empty_result(),
+        None => return empty_full(),
     };
-    let text_sec = match sections.iter().find(|s| s.name == ".text")
-    {
-        Some(s) => s,
-        None => return empty_result(),
-    };
+    let text_sec =
+        match sections.iter().find(|s| s.name == ".text") {
+            Some(s) => s,
+            None => return empty_full(),
+        };
     let arch = detect_arch(data);
     let instrs = crate::arch::decode_text(
         data,
@@ -47,14 +64,17 @@ pub fn analyze_elf(
         arch,
     );
     if instrs.is_empty() {
-        return empty_result();
+        return empty_full();
     }
-    let funcs = build_func_map(&elf, data, &sections, &instrs, ts, te);
+    let funcs =
+        build_func_map(&elf, data, &sections, &instrs, ts, te);
     if funcs.is_empty() {
-        return empty_result();
+        return empty_full();
     }
+    let plt_names =
+        symbols::get_plt_names(&elf, &sections);
     let dead = run_analysis(&funcs, &instrs, data, &sections);
-    (funcs, dead, sections)
+    (funcs, dead, sections, plt_names)
 }
 
 fn build_func_map(
@@ -104,41 +124,64 @@ fn run_analysis(
     find_dead(funcs, &live)
 }
 
-fn empty_result()
--> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
-    (FuncMap::new(), HashMap::new(), Vec::new())
+fn empty_full() -> (
+    FuncMap,
+    HashMap<String, (u64, u64)>,
+    Vec<Section>,
+    HashMap<u64, String>,
+) {
+    (FuncMap::new(), HashMap::new(), Vec::new(), HashMap::new())
 }
 
 /// Reassemble: patch refs, compact .text, update ELF metadata.
+/// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_elf(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
     sections: &[Section],
-) -> (usize, u64) {
+) -> (usize, u64, usize, u64) {
     let arch = detect_arch(data);
     if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
-        return zero_fill(data, dead, sections);
+        let (fc, fs) = zero_fill(data, dead, sections);
+        let (bc, bs) =
+            zero_fill_blocks(data, dead_blocks, sections, arch);
+        return (fc, fs, bc, bs);
     }
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
-        None => return zero_fill(data, dead, sections),
+        None => {
+            let (fc, fs) = zero_fill(data, dead, sections);
+            let (bc, bs) = zero_fill_blocks(
+                data, dead_blocks, sections, arch,
+            );
+            return (fc, fs, bc, bs);
+        }
     };
-    let intervals = dead_intervals(dead);
-    let arch = detect_arch(data);
+    let func_ivs = dead_intervals(dead);
+    let blk_ivs = block_intervals(dead_blocks);
+    let combined = combine_intervals(&func_ivs, &blk_ivs);
     let intervals = defrag_intervals(
-        &intervals,
+        &combined,
         data,
         sections,
         crate::arch::padding_fn(arch),
     );
     let instrs = decode_sections(data, sections);
     if instrs.is_empty() {
-        return zero_fill(data, dead, sections);
+        let (fc, fs) = zero_fill(data, dead, sections);
+        let (bc, bs) =
+            zero_fill_blocks(data, dead_blocks, sections, arch);
+        return (fc, fs, bc, bs);
     }
-    let arch = detect_arch(data);
-    apply_patches(data, &instrs, &intervals, sections, ts, te, arch);
+    apply_patches(
+        data, &instrs, &intervals, sections, ts, te, arch,
+    );
     let saved = compact_text(data, sections, &intervals);
-    (dead.len(), saved)
+    let blk_bytes: u64 =
+        dead_blocks.iter().map(|b| b.size).sum();
+    let func_saved = saved.saturating_sub(blk_bytes);
+    (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
 fn decode_sections(

@@ -166,7 +166,7 @@ pub fn get_string(
 
 /// Calculate file offset for a table's first row.
 fn table_offset(
-    data: &[u8],
+    _data: &[u8],
     ts: &TableStream,
     table_id: usize,
 ) -> usize {

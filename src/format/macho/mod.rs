@@ -5,7 +5,8 @@ use crate::analysis::reachability::{compute_live_set, find_dead};
 use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
-use crate::patch::zerofill::zero_fill;
+use crate::analysis::cfg::DeadBlock;
+use crate::patch::zerofill::{zero_fill, zero_fill_blocks};
 use crate::types::{
     Arch, DecodedInstr, Endian, FuncMap, Section,
 };
@@ -116,7 +117,40 @@ fn empty_result()
 pub fn reassemble_macho(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
     sections: &[Section],
-) -> (usize, u64) {
-    zero_fill(data, dead, sections)
+) -> (usize, u64, usize, u64) {
+    let arch = detect_arch_macho_raw(data);
+    let (fc, fs) = zero_fill(data, dead, sections);
+    let (bc, bs) =
+        zero_fill_blocks(data, dead_blocks, sections, arch);
+    (fc, fs, bc, bs)
+}
+
+fn detect_arch_macho_raw(data: &[u8]) -> Arch {
+    if data.len() < 8 {
+        return Arch::X86_64;
+    }
+    let magic = u32::from_le_bytes(
+        data[0..4].try_into().unwrap_or([0; 4]),
+    );
+    let ct_off = if magic == 0xFEED_FACF
+        || magic == 0xFEED_FACE
+    {
+        4
+    } else {
+        return Arch::X86_64;
+    };
+    let ct = u32::from_le_bytes(
+        data[ct_off..ct_off + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    match ct {
+        0x0100_0007 => Arch::X86_64,
+        0x0100_000C => Arch::Aarch64,
+        0x0C => Arch::Arm32,
+        0x07 => Arch::X86_32,
+        _ => Arch::X86_64,
+    }
 }
