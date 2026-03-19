@@ -142,13 +142,6 @@ pub fn reassemble_elf(
     sections: &[Section],
 ) -> (usize, u64, usize, u64) {
     let arch = detect_arch(data);
-    if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
-        let (fc, fs) = zero_fill(data, dead, sections);
-        let (bc, bs) = zero_fill_blocks(
-            data, dead_blocks, sections, arch,
-        );
-        return (fc, fs, bc, bs);
-    }
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
         None => {
@@ -167,6 +160,7 @@ pub fn reassemble_elf(
         data,
         sections,
         crate::arch::padding_fn(arch),
+        crate::arch::instr_align(arch),
     );
     let instrs = decode_sections(data, sections);
     if instrs.is_empty() {
@@ -224,7 +218,38 @@ fn apply_patches(
                 data, instrs, intervals, ts, te,
             );
         }
-        _ => {}
+        Arch::Aarch64 => {
+            crate::arch::aarch64_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        Arch::Arm32 => {
+            crate::arch::arm32_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        Arch::RiscV64 | Arch::RiscV32 => {
+            crate::arch::riscv_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        Arch::Mips32 | Arch::Mips64 => {
+            let big_endian = detect_endian(data) == Endian::Big;
+            crate::arch::mips_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+                big_endian,
+            );
+        }
+        Arch::S390x => {
+            crate::arch::s390x_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        Arch::LoongArch64 => {
+            crate::arch::loongarch_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
     }
     let is64 = detect_is64(data);
     let endian = detect_endian(data);

@@ -1,6 +1,81 @@
 use crate::patch::relocs::{page_shrink, total_shift};
 use crate::types::Section;
 
+// ---- Endian helpers -----------------------------------------------
+
+fn elf_be(data: &[u8]) -> bool {
+    data.len() > 5 && data[5] == 2
+}
+
+fn read_u16e(data: &[u8], off: usize, be: bool) -> u16 {
+    if off + 2 > data.len() {
+        return 0;
+    }
+    let b: [u8; 2] =
+        data[off..off + 2].try_into().unwrap_or([0; 2]);
+    if be { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }
+}
+
+fn read_u32e(data: &[u8], off: usize, be: bool) -> u32 {
+    if off + 4 > data.len() {
+        return 0;
+    }
+    let b: [u8; 4] =
+        data[off..off + 4].try_into().unwrap_or([0; 4]);
+    if be { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) }
+}
+
+fn read_u64e(data: &[u8], off: usize, be: bool) -> u64 {
+    if off + 8 > data.len() {
+        return 0;
+    }
+    let b: [u8; 8] =
+        data[off..off + 8].try_into().unwrap_or([0; 8]);
+    if be { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) }
+}
+
+fn write_u32e(data: &mut [u8], off: usize, val: u32, be: bool) {
+    if off + 4 <= data.len() {
+        let b = if be {
+            val.to_be_bytes()
+        } else {
+            val.to_le_bytes()
+        };
+        data[off..off + 4].copy_from_slice(&b);
+    }
+}
+
+fn write_u64e(data: &mut [u8], off: usize, val: u64, be: bool) {
+    if off + 8 <= data.len() {
+        let b = if be {
+            val.to_be_bytes()
+        } else {
+            val.to_le_bytes()
+        };
+        data[off..off + 8].copy_from_slice(&b);
+    }
+}
+
+fn read_i64e(data: &[u8], off: usize, be: bool) -> i64 {
+    if off + 8 > data.len() {
+        return 0;
+    }
+    let b: [u8; 8] =
+        data[off..off + 8].try_into().unwrap_or([0; 8]);
+    if be { i64::from_be_bytes(b) } else { i64::from_le_bytes(b) }
+}
+
+fn write_i64e(data: &mut [u8], off: usize, val: i64, be: bool) {
+    if off + 8 <= data.len() {
+        let b = if be {
+            val.to_be_bytes()
+        } else {
+            val.to_le_bytes()
+        };
+        data[off..off + 8].copy_from_slice(&b);
+    }
+}
+
 // ---- Entry point ------------------------------------------------
 
 /// Patch ELF entry point if it shifted due to compaction.
@@ -13,28 +88,30 @@ pub fn patch_entry_point(
     if data.len() < 64 || &data[..4] != b"\x7fELF" {
         return;
     }
+    let be = elf_be(data);
     let is64 = data[4] == 2;
     let (off, sz) =
         if is64 { (24usize, 8usize) } else { (24, 4) };
     if off + sz > data.len() {
         return;
     }
-    let entry = read_entry(data, off, is64);
+    let entry = read_entry(data, off, is64, be);
     let shift = total_shift(entry, intervals, ts, te);
     if shift > 0 {
-        write_entry(data, off, entry - shift, is64);
+        write_entry(data, off, entry - shift, is64, be);
     }
 }
 
-fn read_entry(data: &[u8], off: usize, is64: bool) -> u64 {
+fn read_entry(
+    data: &[u8],
+    off: usize,
+    is64: bool,
+    be: bool,
+) -> u64 {
     if is64 {
-        u64::from_le_bytes(
-            data[off..off + 8].try_into().unwrap_or([0; 8]),
-        )
+        read_u64e(data, off, be)
     } else {
-        u32::from_le_bytes(
-            data[off..off + 4].try_into().unwrap_or([0; 4]),
-        ) as u64
+        read_u32e(data, off, be) as u64
     }
 }
 
@@ -43,13 +120,12 @@ fn write_entry(
     off: usize,
     val: u64,
     is64: bool,
+    be: bool,
 ) {
     if is64 {
-        data[off..off + 8]
-            .copy_from_slice(&val.to_le_bytes());
+        write_u64e(data, off, val, be);
     } else {
-        data[off..off + 4]
-            .copy_from_slice(&(val as u32).to_le_bytes());
+        write_u32e(data, off, val as u32, be);
     }
 }
 
@@ -63,6 +139,7 @@ pub fn patch_rela_dyn(
     ts: u64,
     te: u64,
 ) {
+    let be = elf_be(data);
     for sec in sections {
         if sec.name != ".rela.dyn" && sec.name != ".rela.plt" {
             continue;
@@ -73,7 +150,7 @@ pub fn patch_rela_dyn(
         while i + entry_size <= end
             && i + entry_size <= data.len()
         {
-            patch_rela_entry(data, i, intervals, ts, te);
+            patch_rela_entry(data, i, intervals, ts, te, be);
             i += entry_size;
         }
     }
@@ -85,28 +162,22 @@ fn patch_rela_entry(
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
+    be: bool,
 ) {
-    let r_offset = u64::from_le_bytes(
-        data[i..i + 8].try_into().unwrap_or([0; 8]),
-    );
+    let r_offset = read_u64e(data, i, be);
     let off_shift = total_shift(r_offset, intervals, ts, te);
     if off_shift > 0 {
         let new_off = r_offset - off_shift;
-        data[i..i + 8].copy_from_slice(&new_off.to_le_bytes());
+        write_u64e(data, i, new_off, be);
     }
-    let r_info = u64::from_le_bytes(
-        data[i + 8..i + 16].try_into().unwrap_or([0; 8]),
-    );
+    let r_info = read_u64e(data, i + 8, be);
     if (r_info & 0xFFFFFFFF) == 8 {
-        let addend = i64::from_le_bytes(
-            data[i + 16..i + 24].try_into().unwrap_or([0; 8]),
-        );
+        let addend = read_i64e(data, i + 16, be);
         let a = addend as u64;
         let shift = total_shift(a, intervals, ts, te);
         if shift > 0 {
             let new_addend = addend - shift as i64;
-            data[i + 16..i + 24]
-                .copy_from_slice(&new_addend.to_le_bytes());
+            write_i64e(data, i + 16, new_addend, be);
         }
     }
 }
@@ -121,11 +192,12 @@ pub fn patch_symbols(
     ts: u64,
     te: u64,
 ) {
+    let be = elf_be(data);
     for sec in sections {
         if sec.name != ".symtab" && sec.name != ".dynsym" {
             continue;
         }
-        patch_symtab(data, sec, intervals, ts, te);
+        patch_symtab(data, sec, intervals, ts, te, be);
     }
 }
 
@@ -135,6 +207,7 @@ fn patch_symtab(
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
+    be: bool,
 ) {
     let is64 = data.len() > 4 && data[4] == 2;
     let (entry_sz, val_off, val_sz) = if is64 {
@@ -148,6 +221,7 @@ fn patch_symtab(
     while i + entry_sz <= end {
         patch_one_sym(
             data, i, val_off, val_sz, is64, intervals, ts, te,
+            be,
         );
         i += entry_sz;
     }
@@ -162,19 +236,12 @@ fn patch_one_sym(
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
+    be: bool,
 ) {
     let val = if is64 {
-        u64::from_le_bytes(
-            data[i + val_off..i + val_off + 8]
-                .try_into()
-                .unwrap_or([0; 8]),
-        )
+        read_u64e(data, i + val_off, be)
     } else {
-        u32::from_le_bytes(
-            data[i + val_off..i + val_off + 4]
-                .try_into()
-                .unwrap_or([0; 4]),
-        ) as u64
+        read_u32e(data, i + val_off, be) as u64
     };
     if val == 0 {
         return;
@@ -185,11 +252,9 @@ fn patch_one_sym(
     }
     let new_val = val - shift;
     if is64 {
-        data[i + val_off..i + val_off + 8]
-            .copy_from_slice(&new_val.to_le_bytes());
+        write_u64e(data, i + val_off, new_val, be);
     } else {
-        data[i + val_off..i + val_off + 4]
-            .copy_from_slice(&(new_val as u32).to_le_bytes());
+        write_u32e(data, i + val_off, new_val as u32, be);
     }
 }
 
@@ -219,6 +284,7 @@ pub fn patch_dynamic(
     ts: u64,
     te: u64,
 ) {
+    let be = elf_be(data);
     for sec in sections {
         if sec.name != ".dynamic" {
             continue;
@@ -228,14 +294,12 @@ pub fn patch_dynamic(
         let end = (sec.offset as usize + sec.size as usize)
             .min(data.len());
         while i + entry_sz <= end {
-            let d_tag = u64::from_le_bytes(
-                data[i..i + 8].try_into().unwrap_or([0; 8]),
-            );
+            let d_tag = read_u64e(data, i, be);
             if d_tag == 0 {
                 break;
             }
             if ADDR_TAGS.contains(&d_tag) {
-                patch_dyn_val(data, i + 8, intervals, ts, te);
+                patch_dyn_val(data, i + 8, intervals, ts, te, be);
             }
             i += entry_sz;
         }
@@ -248,18 +312,16 @@ fn patch_dyn_val(
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
+    be: bool,
 ) {
-    let d_val = u64::from_le_bytes(
-        data[off..off + 8].try_into().unwrap_or([0; 8]),
-    );
+    let d_val = read_u64e(data, off, be);
     if d_val == 0 {
         return;
     }
     let shift = total_shift(d_val, intervals, ts, te);
     if shift > 0 {
         let new_val = d_val - shift;
-        data[off..off + 8]
-            .copy_from_slice(&new_val.to_le_bytes());
+        write_u64e(data, off, new_val, be);
     }
 }
 
@@ -279,6 +341,7 @@ pub fn patch_headers(
     if data[4] != 2 {
         return;
     }
+    let be = elf_be(data);
     let ps = page_shrink(intervals);
     if ps == 0 {
         return;
@@ -290,12 +353,12 @@ pub fn patch_headers(
         };
     let text_file_end = text_sec.offset + text_sec.size;
     patch_shdrs(
-        data, intervals, ts, te, ps, text_sec, text_file_end,
+        data, intervals, ts, te, ps, text_sec, text_file_end, be,
     );
     patch_phdrs(
-        data, intervals, ts, te, ps, text_sec, text_file_end,
+        data, intervals, ts, te, ps, text_sec, text_file_end, be,
     );
-    patch_elf_shoff(data, ps, text_file_end);
+    patch_elf_shoff(data, ps, text_file_end, be);
 }
 
 fn patch_shdrs(
@@ -306,11 +369,10 @@ fn patch_shdrs(
     ps: u64,
     text_sec: &Section,
     text_file_end: u64,
+    be: bool,
 ) {
-    let e_shoff = read_u64(data, 40) as usize;
-    let e_shnum = u16::from_le_bytes(
-        data[60..62].try_into().unwrap_or([0; 2]),
-    ) as usize;
+    let e_shoff = read_u64e(data, 40, be) as usize;
+    let e_shnum = read_u16e(data, 60, be) as usize;
     for idx in 0..e_shnum {
         let base = e_shoff + idx * 64;
         if base + 64 > data.len() {
@@ -318,7 +380,7 @@ fn patch_shdrs(
         }
         patch_one_shdr(
             data, base, intervals, ts, te, ps, text_sec,
-            text_file_end,
+            text_file_end, be,
         );
     }
 }
@@ -332,23 +394,24 @@ fn patch_one_shdr(
     ps: u64,
     text_sec: &Section,
     text_file_end: u64,
+    be: bool,
 ) {
-    let sh_addr = read_u64(data, base + 16);
-    let sh_offset = read_u64(data, base + 24);
-    let sh_size_val = read_u64(data, base + 32);
+    let sh_addr = read_u64e(data, base + 16, be);
+    let sh_offset = read_u64e(data, base + 24, be);
+    let sh_size_val = read_u64e(data, base + 32, be);
     if sh_addr > 0 {
         let shift = total_shift(sh_addr, intervals, ts, te);
         if shift > 0 {
-            write_u64(data, base + 16, sh_addr - shift);
+            write_u64e(data, base + 16, sh_addr - shift, be);
         }
     }
     let is_text = sh_addr == text_sec.vaddr
         && sh_offset == text_sec.offset;
     if is_text {
-        write_u64(data, base + 32, sh_size_val - ps);
+        write_u64e(data, base + 32, sh_size_val - ps, be);
     }
     if sh_offset >= text_file_end {
-        write_u64(data, base + 24, sh_offset - ps);
+        write_u64e(data, base + 24, sh_offset - ps, be);
     }
 }
 
@@ -360,11 +423,10 @@ fn patch_phdrs(
     ps: u64,
     text_sec: &Section,
     text_file_end: u64,
+    be: bool,
 ) {
-    let e_phoff = read_u64(data, 32) as usize;
-    let e_phnum = u16::from_le_bytes(
-        data[56..58].try_into().unwrap_or([0; 2]),
-    ) as usize;
+    let e_phoff = read_u64e(data, 32, be) as usize;
+    let e_phnum = read_u16e(data, 56, be) as usize;
     for idx in 0..e_phnum {
         let base = e_phoff + idx * 56;
         if base + 56 > data.len() {
@@ -372,7 +434,7 @@ fn patch_phdrs(
         }
         patch_one_phdr(
             data, base, intervals, ts, te, ps, text_sec,
-            text_file_end,
+            text_file_end, be,
         );
     }
 }
@@ -386,27 +448,28 @@ fn patch_one_phdr(
     ps: u64,
     _text_sec: &Section,
     text_file_end: u64,
+    be: bool,
 ) {
-    let p_offset = read_u64(data, base + 8);
-    let p_vaddr = read_u64(data, base + 16);
-    let p_paddr = read_u64(data, base + 24);
-    let p_filesz = read_u64(data, base + 32);
-    let p_memsz = read_u64(data, base + 40);
+    let p_offset = read_u64e(data, base + 8, be);
+    let p_vaddr = read_u64e(data, base + 16, be);
+    let p_paddr = read_u64e(data, base + 24, be);
+    let p_filesz = read_u64e(data, base + 32, be);
+    let p_memsz = read_u64e(data, base + 40, be);
     let contains_text =
         p_vaddr <= ts && te <= p_vaddr + p_memsz;
     if contains_text {
-        write_u64(data, base + 32, p_filesz - ps);
-        write_u64(data, base + 40, p_memsz - ps);
+        write_u64e(data, base + 32, p_filesz - ps, be);
+        write_u64e(data, base + 40, p_memsz - ps, be);
     }
     if p_vaddr > 0 {
         let shift = total_shift(p_vaddr, intervals, ts, te);
         if shift > 0 {
-            write_u64(data, base + 16, p_vaddr - shift);
-            write_u64(data, base + 24, p_paddr - shift);
+            write_u64e(data, base + 16, p_vaddr - shift, be);
+            write_u64e(data, base + 24, p_paddr - shift, be);
         }
     }
     if p_offset >= text_file_end {
-        write_u64(data, base + 8, p_offset - ps);
+        write_u64e(data, base + 8, p_offset - ps, be);
     }
 }
 
@@ -414,24 +477,10 @@ fn patch_elf_shoff(
     data: &mut [u8],
     ps: u64,
     text_file_end: u64,
+    be: bool,
 ) {
-    let e_shoff = read_u64(data, 40);
+    let e_shoff = read_u64e(data, 40, be);
     if e_shoff >= text_file_end {
-        write_u64(data, 40, e_shoff - ps);
-    }
-}
-
-fn read_u64(data: &[u8], off: usize) -> u64 {
-    if off + 8 > data.len() {
-        return 0;
-    }
-    u64::from_le_bytes(
-        data[off..off + 8].try_into().unwrap_or([0; 8]),
-    )
-}
-
-fn write_u64(data: &mut [u8], off: usize, val: u64) {
-    if off + 8 <= data.len() {
-        data[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        write_u64e(data, 40, e_shoff - ps, be);
     }
 }

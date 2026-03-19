@@ -34,10 +34,15 @@ pub fn analyze(
         &funcs, &instrs, &live_funcs, &import_names,
     );
     let arch = detect_arch_from_data(data);
+    let big_endian = detect_big_endian(data);
     let (sccp_dead, sccp_skipped) = run_sccp_analysis(
-        &funcs, &instrs, &live_funcs, arch, max_sccp_instrs,
+        &funcs, &instrs, &live_funcs, arch,
+        max_sccp_instrs, big_endian,
     );
     merge_dead_blocks(&mut dead_blocks, sccp_dead);
+    // Format-specific dead block detection for Wasm and .NET
+    let format_dead = find_format_dead_blocks(data, &dead_funcs);
+    merge_dead_blocks(&mut dead_blocks, format_dead);
     AnalysisResult {
         funcs,
         dead_funcs,
@@ -53,6 +58,7 @@ fn run_sccp_analysis(
     live_funcs: &HashSet<String>,
     arch: types::Arch,
     max_instrs: usize,
+    big_endian: bool,
 ) -> (Vec<analysis::cfg::DeadBlock>, Vec<(String, usize)>) {
     let mut all_dead = Vec::new();
     let mut skipped = Vec::new();
@@ -68,6 +74,7 @@ fn run_sccp_analysis(
         );
         let result = analysis::sccp::sccp_dead_blocks(
             &cfg, instrs, arch, funcs, max_instrs,
+            big_endian,
         );
         if result.skipped {
             skipped.push((
@@ -78,6 +85,96 @@ fn run_sccp_analysis(
         all_dead.extend(result.dead);
     }
     (all_dead, skipped)
+}
+
+fn find_format_dead_blocks(
+    data: &[u8],
+    dead_funcs: &HashMap<String, (u64, u64)>,
+) -> Vec<analysis::cfg::DeadBlock> {
+    match format::detect_format(data) {
+        Some(format::Format::Wasm) => {
+            format::wasm::find_wasm_dead_blocks(data, dead_funcs)
+        }
+        Some(format::Format::Dotnet) => {
+            find_dotnet_dead_blocks(data, dead_funcs)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn find_dotnet_dead_blocks(
+    data: &[u8],
+    dead_funcs: &HashMap<String, (u64, u64)>,
+) -> Vec<analysis::cfg::DeadBlock> {
+    let parsed = match parse_dotnet_for_blocks(data) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let rvas: Vec<u32> =
+        parsed.methods.iter().map(|m| m.rva).collect();
+    let names: Vec<String> = parsed
+        .methods
+        .iter()
+        .map(|m| {
+            format::dotnet::tables::get_string(
+                data, &parsed.root, m.name_idx,
+            )
+        })
+        .collect();
+    let dead_indices: HashSet<usize> = parsed
+        .methods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            let name = format::dotnet::tables::get_string(
+                data, &parsed.root, m.name_idx,
+            );
+            dead_funcs.contains_key(&name)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let all_indices: HashSet<usize> =
+        (0..parsed.methods.len()).collect();
+    let live_indices: HashSet<usize> = all_indices
+        .difference(&dead_indices)
+        .copied()
+        .collect();
+    let rva_fn = |rva: u32| -> Option<usize> {
+        format::dotnet::pe_rva_to_offset_pub(data, rva)
+    };
+    format::dotnet::il::find_il_dead_blocks(
+        data, &rvas, &live_indices, &dead_indices,
+        &rva_fn, &names,
+    )
+}
+
+struct DotnetParsed {
+    root: format::dotnet::metadata::MetadataRoot,
+    methods: Vec<format::dotnet::tables::MethodDef>,
+}
+
+fn parse_dotnet_for_blocks(data: &[u8]) -> Option<DotnetParsed> {
+    let cli_off =
+        format::dotnet::metadata::cli_header_offset(data)?;
+    let cli =
+        format::dotnet::metadata::parse_cli_header(
+            data, cli_off,
+        )?;
+    let md_off = format::dotnet::pe_rva_to_offset_pub(
+        data, cli.metadata_rva,
+    )?;
+    let root =
+        format::dotnet::metadata::parse_metadata_root(
+            data, md_off,
+        )?;
+    let ts =
+        format::dotnet::tables::parse_table_stream(data, &root)?;
+    let methods =
+        format::dotnet::tables::read_method_defs(data, &ts);
+    if methods.is_empty() {
+        return None;
+    }
+    Some(DotnetParsed { root, methods })
 }
 
 fn merge_dead_blocks(
@@ -156,6 +253,13 @@ fn decode_for_cfg(
     arch::decode_text(
         data, text.offset, text.vaddr, text.size, arch,
     )
+}
+
+fn detect_big_endian(data: &[u8]) -> bool {
+    if data.len() >= 6 && &data[..4] == b"\x7fELF" {
+        return data[5] == 2; // EI_DATA: 2 = big-endian
+    }
+    false
 }
 
 fn detect_arch_from_data(data: &[u8]) -> types::Arch {
@@ -265,7 +369,9 @@ fn reassemble_format(
             )
         }
         Some(format::Format::Wasm) => {
-            format::wasm::reassemble_wasm(data, dead)
+            format::wasm::reassemble_wasm(
+                data, dead, dead_blocks,
+            )
         }
         None => (0, 0, 0, 0),
     }

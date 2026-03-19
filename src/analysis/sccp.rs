@@ -1,9 +1,9 @@
 use crate::analysis::cfg::{DeadBlock, FuncCfg};
 use crate::analysis::dominance::compute_dom_tree;
-use crate::analysis::lattice::{eval_binop, eval_cmp, Value};
+use crate::analysis::lattice::{eval_binop, Value};
 use crate::analysis::regstate::{
-    x86_effects, SsaEffect, FLAGS_REG,
-    REG_COUNT, X86_CALLER_SAVED,
+    arch_effects, caller_saved, SsaEffect, FLAGS_REG,
+    REG_COUNT,
 };
 use crate::types::{Arch, DecodedInstr, FlowType, FuncMap};
 use std::collections::{HashSet, VecDeque};
@@ -25,10 +25,8 @@ pub fn sccp_dead_blocks(
     arch: Arch,
     _funcs: &FuncMap,
     max_instrs: usize,
+    big_endian: bool,
 ) -> SccpResult {
-    if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
-        return SccpResult { dead: Vec::new(), skipped: false, instr_count: 0 };
-    }
     if cfg.blocks.is_empty() {
         return SccpResult { dead: Vec::new(), skipped: false, instr_count: 0 };
     }
@@ -37,7 +35,8 @@ pub fn sccp_dead_blocks(
     if count > max_instrs {
         return SccpResult { dead: Vec::new(), skipped: true, instr_count: count };
     }
-    let block_effects = build_block_effects(cfg, &func_instrs);
+    let block_effects =
+        build_block_effects(cfg, &func_instrs, arch, big_endian);
     let n = cfg.blocks.len();
     let succs: Vec<Vec<usize>> =
         cfg.blocks.iter().map(|b| b.successors.clone()).collect();
@@ -45,7 +44,7 @@ pub fn sccp_dead_blocks(
     let mut state = SccpState::new(n);
     state.mark_edge_exec(cfg.entry_block);
     run_sccp(&mut state, cfg, &block_effects, &succs, &dom);
-    let dead = find_sccp_dead(cfg, &state);
+    let dead = find_sccp_dead(cfg, &state, arch);
     SccpResult { dead, skipped: false, instr_count: count }
 }
 
@@ -63,6 +62,8 @@ fn collect_func_instrs<'a>(
 fn build_block_effects(
     cfg: &FuncCfg,
     instrs: &[&DecodedInstr],
+    arch: Arch,
+    big_endian: bool,
 ) -> Vec<Vec<SsaEffect>> {
     cfg.blocks
         .iter()
@@ -73,7 +74,10 @@ fn build_block_effects(
                     && instr.addr < b.end_addr
                 {
                     add_instr_effects(
-                        &mut effects, instr,
+                        &mut effects,
+                        instr,
+                        arch,
+                        big_endian,
                     );
                 }
             }
@@ -85,14 +89,18 @@ fn build_block_effects(
 fn add_instr_effects(
     effects: &mut Vec<SsaEffect>,
     instr: &DecodedInstr,
+    arch: Arch,
+    big_endian: bool,
 ) {
     if instr.is_call {
-        for &r in X86_CALLER_SAVED {
+        for &r in caller_saved(arch) {
             effects.push(SsaEffect::Clobber(r));
         }
         return;
     }
-    let effs = x86_effects(&instr.raw, instr.addr);
+    let effs = arch_effects(
+        &instr.raw, instr.addr, arch, big_endian,
+    );
     effects.extend(effs);
 }
 
@@ -409,11 +417,20 @@ fn merge_and_enqueue(
 fn find_sccp_dead(
     cfg: &FuncCfg,
     state: &SccpState,
+    arch: Arch,
 ) -> Vec<DeadBlock> {
+    // MIPS has mandatory branch delay slots: the instruction after
+    // a branch/return is always executed. The CFG creates a separate
+    // block for it that appears unreachable. Filter these out by
+    // requiring dead blocks to be at least 2 instructions (8 bytes).
+    let min_size: u64 = match arch {
+        Arch::Mips32 | Arch::Mips64 => 8,
+        _ => 2,
+    };
     cfg.blocks
         .iter()
         .filter(|b| !state.is_exec(b.id))
-        .filter(|b| b.end_addr - b.start_addr >= 2)
+        .filter(|b| b.end_addr - b.start_addr >= min_size)
         .map(|b| DeadBlock {
             func_name: cfg.func_name.clone(),
             addr: b.start_addr,

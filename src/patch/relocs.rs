@@ -91,11 +91,15 @@ pub fn total_shift(
 
 /// Extend dead intervals to absorb adjacent padding bytes,
 /// then merge overlapping intervals.
+/// The `align` parameter ensures each interval's size stays
+/// a multiple of the architecture's instruction alignment,
+/// preventing misalignment of code after compaction.
 pub fn defrag_intervals(
     intervals: &[(u64, u64)],
     data: &[u8],
     sections: &[Section],
     is_padding: fn(u8) -> bool,
+    align: u64,
 ) -> Vec<(u64, u64)> {
     let text = match sections.iter().find(|s| s.name == ".text") {
         Some(s) => s,
@@ -106,8 +110,10 @@ pub fn defrag_intervals(
     let mut expanded: Vec<(u64, u64)> =
         Vec::with_capacity(intervals.len());
     for &(start, end) in intervals {
-        let (lo, hi) =
-            expand_one(data, text, ts, te, start, end, is_padding);
+        let (lo, hi) = expand_one(
+            data, text, ts, te, start, end, is_padding,
+            align,
+        );
         expanded.push((lo, hi));
     }
     merge_intervals(&mut expanded)
@@ -121,22 +127,35 @@ fn expand_one(
     start: u64,
     end: u64,
     is_padding: fn(u8) -> bool,
+    align: u64,
 ) -> (u64, u64) {
+    let step = if align > 1 { align } else { 1 };
     let mut lo = start;
     let mut hi = end;
-    while lo > ts {
-        let off = (text.offset + lo - 1 - ts) as usize;
-        if off >= data.len() || !is_padding(data[off]) {
-            break;
+    // Expand backward only for byte-aligned architectures
+    // (x86). For RISC architectures, zero padding bytes are
+    // indistinguishable from zero bytes inside instructions
+    // (e.g. ecall = 0x00000073), so backward expansion is
+    // unsafe.
+    if step == 1 {
+        while lo > ts {
+            let off = (text.offset + lo - 1 - ts) as usize;
+            if off >= data.len() || !is_padding(data[off]) {
+                break;
+            }
+            lo -= 1;
         }
-        lo -= 1;
     }
-    while hi < te {
-        let off = (text.offset + hi - ts) as usize;
-        if off >= data.len() || !is_padding(data[off]) {
-            break;
+    // Expand forward in instruction-aligned steps.
+    'fwd: while hi + step <= te {
+        for k in 0..step {
+            let off =
+                (text.offset + hi + k - ts) as usize;
+            if off >= data.len() || !is_padding(data[off]) {
+                break 'fwd;
+            }
         }
-        hi += 1;
+        hi += step;
     }
     (lo, hi)
 }

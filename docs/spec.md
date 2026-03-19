@@ -5,12 +5,13 @@
 ## 1. What the System Does
 
 xstrip is a dead code analyzer and remover for compiled binaries. It
-supports ELF, PE/COFF, Mach-O, and .NET managed assemblies. It finds
-unreachable functions using address-based call graph analysis (or IL
-call graph for .NET), patches dead code with zero-fills, and for x86
-ELF binaries physically shrinks the binary by removing dead code
-regions and updating metadata. It works directly on compiled binaries
-— no source code or recompilation needed.
+supports ELF, PE/COFF, Mach-O, .NET managed assemblies, and WebAssembly
+modules. It finds unreachable functions using address-based call graph
+analysis (or IL call graph for .NET / Wasm call graph), patches dead code,
+and physically shrinks ELF, PE, and Mach-O binaries by removing dead code
+regions, patching instruction offsets, and updating format metadata. It
+works directly on compiled binaries — no source code or recompilation
+needed.
 
 xstrip is a static musl binary (Rust) with zero runtime dependencies,
 distributed as a scratch-based Docker image or standalone binary for
@@ -69,9 +70,9 @@ x86_64 and aarch64 Linux.
             |
             v
 +----------------------------+
-| Patch: zero-fill dead code |
-| (x86 ELF: also compact    |
-|  and update headers)       |
+| Patch: compact dead code,  |
+| patch instruction offsets, |
+| update format metadata     |
 +----------------------------+
             |
             v
@@ -292,9 +293,44 @@ live functions. Three levels of analysis:
    taken based on constant analysis of register values. Conservative:
    memory treated as unknown at all times, caller-saved registers
    clobbered at call sites, indirect branches assume all targets live.
+   Works on all native architectures (x86-64, x86-32, AArch64, ARM32,
+   RISC-V, MIPS, s390x, LoongArch64).
 
 Dead branches are reported alongside dead functions in analysis output.
 Dead blocks are compacted through the same pipeline as dead functions.
+
+### BR-008: Physical Compaction (SDD-013)
+
+For native binary formats (ELF, PE, Mach-O), xstrip physically removes
+dead code from the .text section and patches all affected metadata:
+
+- **ELF:** All architectures. Patches entry point, section/program
+  headers, .rela.dyn/.rela.plt relocations, .symtab/.dynsym symbols,
+  .dynamic section addresses, data pointers (.got, .init_array, etc.).
+  Big-endian aware for s390x and MIPS.
+- **PE:** All architectures. Patches AddressOfEntryPoint, section
+  headers (VirtualSize, SizeOfRawData, PointerToRawData), SizeOfCode,
+  SizeOfImage, COFF symbols, export address table (EAT), base
+  relocations (.reloc HIGHLOW/DIR64), and .pdata exception entries.
+- **Mach-O:** All architectures. Patches LC_MAIN/LC_UNIXTHREAD entry
+  point, LC_SEGMENT_64/LC_SEGMENT load commands (vmaddr, vmsize,
+  fileoff, filesize), section headers, and LC_SYMTAB nlist entries.
+
+Per-architecture instruction offset patching handles branch/call
+recalculation for all supported architectures.
+
+### BR-009: Wasm & .NET Dead Branch Detection (SDD-013)
+
+In addition to dead function detection, xstrip detects dead branches
+within live function/method bodies for bytecode formats:
+
+- **WebAssembly:** Detects unreachable code after `unreachable` (0x00),
+  `return` (0x0F), and unconditional `br` (0x0C) opcodes until the
+  next control flow boundary (`end`/`else`). Dead regions are filled
+  with `nop` (0x01) during reassembly.
+- **.NET IL:** Detects unreachable code after `throw` (0x7A), `ret`
+  (0x2A), unconditional `br` (0x38/0x2B), and `rethrow` (0xFE 0x1A)
+  until the next branch target.
 
 ---
 
@@ -320,7 +356,8 @@ Dead blocks are compacted through the same pipeline as dead functions.
    e. BFS reachability from roots (entry, globals, data refs)
    f. Report dead functions found (to stderr)
 7. If `--dry-run`: exit 0 (no binary output)
-8. Patch dead code (zero-fill; x86 ELF also compacts)
+8. Patch dead code (ELF/PE/Mach-O: compact + update metadata;
+   Wasm/dotnet: zero-fill dead functions + nop dead branches)
 9. Write output:
    - In-place mode: overwrite each file
    - Stream mode: write to output file or stdout

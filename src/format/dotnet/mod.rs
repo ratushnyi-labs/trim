@@ -233,6 +233,14 @@ fn estimate_method_size(data: &[u8], rva: u32) -> u64 {
     }
 }
 
+/// Public wrapper for PE RVA-to-offset conversion.
+pub fn pe_rva_to_offset_pub(
+    data: &[u8],
+    rva: u32,
+) -> Option<usize> {
+    pe_rva_to_offset(data, rva)
+}
+
 fn pe_rva_to_offset(
     data: &[u8],
     rva: u32,

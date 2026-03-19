@@ -1,3 +1,4 @@
+pub mod patch;
 pub mod sections;
 pub mod symbols;
 
@@ -6,6 +7,12 @@ use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
 use crate::analysis::cfg::DeadBlock;
+use crate::patch::compact::compact_text;
+use crate::patch::data_ptrs::patch_data_ptrs;
+use crate::patch::relocs::{
+    block_intervals, combine_intervals, dead_intervals,
+    defrag_intervals,
+};
 use crate::patch::zerofill::{zero_fill, zero_fill_blocks};
 use crate::types::{
     Arch, DecodedInstr, Endian, FuncMap, Section,
@@ -105,7 +112,8 @@ fn empty_result()
     (FuncMap::new(), HashMap::new(), Vec::new())
 }
 
-/// Reassemble PE: zero-fill dead code.
+/// Reassemble PE: patch refs, compact .text, update PE metadata.
+/// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_pe(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
@@ -113,10 +121,110 @@ pub fn reassemble_pe(
     sections: &[Section],
 ) -> (usize, u64, usize, u64) {
     let arch = detect_arch_pe_raw(data);
-    let (fc, fs) = zero_fill(data, dead, sections);
-    let (bc, bs) =
-        zero_fill_blocks(data, dead_blocks, sections, arch);
-    (fc, fs, bc, bs)
+    let (ts, te) = match sections::text_bounds(sections) {
+        Some(b) => b,
+        None => {
+            let (fc, fs) = zero_fill(data, dead, sections);
+            let (bc, bs) =
+                zero_fill_blocks(data, dead_blocks, sections, arch);
+            return (fc, fs, bc, bs);
+        }
+    };
+    let func_ivs = dead_intervals(dead);
+    let blk_ivs = block_intervals(dead_blocks);
+    let combined = combine_intervals(&func_ivs, &blk_ivs);
+    let intervals = defrag_intervals(
+        &combined,
+        data,
+        sections,
+        crate::arch::padding_fn(arch),
+        crate::arch::instr_align(arch),
+    );
+    let instrs = decode_pe_sections(data, sections, arch);
+    if instrs.is_empty() {
+        let (fc, fs) = zero_fill(data, dead, sections);
+        let (bc, bs) =
+            zero_fill_blocks(data, dead_blocks, sections, arch);
+        return (fc, fs, bc, bs);
+    }
+    apply_pe_patches(
+        data, &instrs, &intervals, sections, ts, te, arch,
+    );
+    let saved = compact_text(data, sections, &intervals);
+    let blk_bytes: u64 =
+        dead_blocks.iter().map(|b| b.size).sum();
+    let func_saved = saved.saturating_sub(blk_bytes);
+    (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
+}
+
+fn decode_pe_sections(
+    data: &[u8],
+    sections: &[Section],
+    arch: Arch,
+) -> Vec<DecodedInstr> {
+    let mut instrs = Vec::new();
+    if let Some(sec) =
+        sections.iter().find(|s| s.name == ".text")
+    {
+        instrs.extend(crate::arch::decode_text(
+            data, sec.offset, sec.vaddr, sec.size, arch,
+        ));
+    }
+    instrs
+}
+
+fn apply_pe_patches(
+    data: &mut Vec<u8>,
+    instrs: &[DecodedInstr],
+    intervals: &[(u64, u64)],
+    sections: &[Section],
+    ts: u64,
+    te: u64,
+    arch: Arch,
+) {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => {
+            use crate::arch::x86_patch;
+            x86_patch::patch_call_jmp(
+                data, instrs, intervals, sections, ts, te,
+            );
+            x86_patch::patch_pc_rel(
+                data, instrs, intervals, sections, ts, te,
+            );
+            x86_patch::patch_jump_tables(
+                data, instrs, intervals, ts, te,
+            );
+        }
+        Arch::Aarch64 => {
+            crate::arch::aarch64_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        Arch::Arm32 => {
+            crate::arch::arm32_patch::patch_branches(
+                data, instrs, intervals, sections, ts, te,
+            );
+        }
+        _ => {}
+    }
+    let is64 = matches!(arch, Arch::X86_64 | Arch::Aarch64);
+    patch_data_ptrs(
+        data, sections, intervals, ts, te, is64, Endian::Little,
+    );
+    patch::patch_entry_point(data, intervals, ts, te);
+    patch::patch_section_headers(
+        data, sections, intervals, ts, te,
+    );
+    patch::patch_symbols(data, intervals, ts, te);
+    patch::patch_exports(
+        data, sections, intervals, ts, te,
+    );
+    patch::patch_base_relocs(
+        data, sections, intervals, ts, te,
+    );
+    patch::patch_pdata(
+        data, sections, intervals, ts, te,
+    );
 }
 
 fn detect_arch_pe_raw(data: &[u8]) -> Arch {

@@ -1,3 +1,4 @@
+use crate::analysis::cfg::DeadBlock;
 use crate::format::dotnet::metadata::read_u32;
 use std::collections::{HashMap, HashSet};
 
@@ -141,4 +142,246 @@ fn op2_size(op2: u8) -> usize {
         0x1C..=0x1E => 0,
         _ => 0,
     }
+}
+
+// ---- Dead branch detection in IL --------------------------------
+
+/// Detect dead branches within live IL method bodies.
+/// Finds unreachable code after `throw`, `ret`, unconditional
+/// `br`, and `rethrow` until the next branch target.
+pub fn find_il_dead_blocks(
+    data: &[u8],
+    method_rvas: &[u32],
+    live_methods: &HashSet<usize>,
+    dead_methods: &HashSet<usize>,
+    pe_rva_to_offset: &dyn Fn(u32) -> Option<usize>,
+    method_names: &[String],
+) -> Vec<DeadBlock> {
+    let mut blocks = Vec::new();
+    for (idx, &rva) in method_rvas.iter().enumerate() {
+        if rva == 0 {
+            continue;
+        }
+        if !live_methods.contains(&idx) {
+            continue;
+        }
+        if dead_methods.contains(&idx) {
+            continue;
+        }
+        let off = match pe_rva_to_offset(rva) {
+            Some(o) => o,
+            None => continue,
+        };
+        let name = if idx < method_names.len() {
+            &method_names[idx]
+        } else {
+            continue;
+        };
+        scan_method_dead_blocks(
+            data, off, rva, name, &mut blocks,
+        );
+    }
+    blocks
+}
+
+fn scan_method_dead_blocks(
+    data: &[u8],
+    offset: usize,
+    rva: u32,
+    name: &str,
+    blocks: &mut Vec<DeadBlock>,
+) {
+    if offset >= data.len() {
+        return;
+    }
+    let header = data[offset];
+    let (code_off, code_size) = if header & 0x03 == 0x02 {
+        (offset + 1, (header >> 2) as usize)
+    } else if header & 0x03 == 0x03 {
+        parse_fat_header(data, offset)
+    } else {
+        return;
+    };
+    if code_off == 0 || code_size == 0 {
+        return;
+    }
+    if code_off + code_size > data.len() {
+        return;
+    }
+    // First pass: collect all branch targets
+    let targets = collect_il_branch_targets(
+        data, code_off, code_size,
+    );
+    // Second pass: find dead regions
+    let end = code_off + code_size;
+    let mut pos = code_off;
+    while pos < end {
+        let op = data[pos];
+        let instr_start = pos;
+        pos += 1;
+        let is_terminator = match op {
+            0x2A => true, // ret
+            0x7A => true, // throw
+            0x2B => {
+                // br.s (short branch)
+                pos += 1;
+                true
+            }
+            0x38 => {
+                // br (long branch)
+                pos += 4;
+                true
+            }
+            0xFE if pos < end && data[pos] == 0x1A => {
+                // rethrow
+                pos += 1;
+                true
+            }
+            _ => {
+                if op == OP_LDFTN_PREFIX && pos < end {
+                    pos += 1 + op2_size(data[pos - 1]);
+                    // We already consumed the prefix, fix up
+                    let p2 = instr_start + 1;
+                    if p2 < end {
+                        pos = p2 + 1 + op2_size(data[p2]);
+                    }
+                    false
+                } else {
+                    pos = instr_start + 1
+                        + opcode_operand_size(op);
+                    false
+                }
+            }
+        };
+        if !is_terminator {
+            continue;
+        }
+        // Skip the operand if we haven't yet
+        if op == 0x2A || op == 0x7A {
+            // no operand — pos already advanced past opcode
+        }
+        // pos is now at the start of potentially dead code
+        let dead_start = pos;
+        if dead_start >= end {
+            break;
+        }
+        // Check if next byte is a branch target — if so, not dead
+        if targets.contains(&(dead_start - code_off)) {
+            continue;
+        }
+        // Scan forward until we hit a branch target or end
+        let mut dead_end = dead_start;
+        while dead_end < end {
+            let rel = dead_end - code_off;
+            if rel > 0 && targets.contains(&rel) {
+                break;
+            }
+            let skip_op = data[dead_end];
+            dead_end += 1 + opcode_operand_size(skip_op);
+        }
+        // Clamp to actual branch target
+        let mut final_end = dead_end.min(end);
+        for &t in &targets {
+            let abs_t = code_off + t;
+            if abs_t > dead_start && abs_t < final_end {
+                final_end = abs_t;
+            }
+        }
+        let size = final_end - dead_start;
+        if size >= 2 {
+            // Use RVA-based addressing for .NET methods
+            let rva_off = dead_start - offset;
+            blocks.push(DeadBlock {
+                func_name: name.to_string(),
+                addr: rva as u64 + rva_off as u64,
+                size: size as u64,
+            });
+        }
+        pos = final_end;
+    }
+}
+
+/// Collect all branch target offsets (relative to code_off).
+fn collect_il_branch_targets(
+    data: &[u8],
+    code_off: usize,
+    code_size: usize,
+) -> HashSet<usize> {
+    let mut targets = HashSet::new();
+    let end = code_off + code_size;
+    let mut pos = code_off;
+    while pos < end {
+        let op = data[pos];
+        pos += 1;
+        match op {
+            // Short conditional branches
+            0x2C..=0x37 => {
+                if pos < end {
+                    let offset =
+                        data[pos] as i8 as i32;
+                    pos += 1;
+                    let tgt =
+                        pos as i32 + offset - code_off as i32;
+                    if tgt >= 0 && (tgt as usize) < code_size {
+                        targets.insert(tgt as usize);
+                    }
+                }
+            }
+            // Short unconditional branch
+            0x2B => {
+                if pos < end {
+                    let offset =
+                        data[pos] as i8 as i32;
+                    pos += 1;
+                    let tgt =
+                        pos as i32 + offset - code_off as i32;
+                    if tgt >= 0 && (tgt as usize) < code_size {
+                        targets.insert(tgt as usize);
+                    }
+                }
+            }
+            // Long conditional branches
+            0x38..=0x43 => {
+                if pos + 4 <= end {
+                    let offset = read_u32(data, pos) as i32;
+                    let tgt = (pos + 4) as i32 + offset
+                        - code_off as i32;
+                    if tgt >= 0 && (tgt as usize) < code_size {
+                        targets.insert(tgt as usize);
+                    }
+                }
+                pos += 4;
+            }
+            // switch
+            0x45 => {
+                if pos + 4 <= end {
+                    let n = read_u32(data, pos) as usize;
+                    pos += 4;
+                    let base = pos + n * 4;
+                    for _ in 0..n {
+                        if pos + 4 <= end {
+                            let offset =
+                                read_u32(data, pos) as i32;
+                            let tgt = base as i32 + offset
+                                - code_off as i32;
+                            if tgt >= 0
+                                && (tgt as usize) < code_size
+                            {
+                                targets.insert(tgt as usize);
+                            }
+                        }
+                        pos += 4;
+                    }
+                }
+            }
+            0xFE if pos < end => {
+                let op2 = data[pos];
+                pos += 1 + op2_size(op2);
+            }
+            _ => {
+                pos += opcode_operand_size(op);
+            }
+        }
+    }
+    targets
 }

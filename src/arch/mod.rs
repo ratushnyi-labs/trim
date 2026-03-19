@@ -82,6 +82,20 @@ pub fn padding_fn(arch: Arch) -> fn(u8) -> bool {
     }
 }
 
+/// Minimum instruction alignment for a given architecture.
+/// Intervals must be multiples of this to avoid misaligning code.
+pub fn instr_align(arch: Arch) -> u64 {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => 1,
+        Arch::Aarch64 => 4,
+        Arch::Arm32 => 4,
+        Arch::RiscV64 | Arch::RiscV32 => 2,
+        Arch::Mips32 | Arch::Mips64 => 4,
+        Arch::S390x => 2,
+        Arch::LoongArch64 => 4,
+    }
+}
+
 /// Detect MIPS endianness from ELF EI_DATA byte.
 fn detect_mips_endian(data: &[u8]) -> bool {
     if data.len() > 5

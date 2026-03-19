@@ -1,3 +1,4 @@
+use crate::analysis::cfg::DeadBlock;
 use crate::types::{FuncInfo, FuncMap, Section};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -18,11 +19,13 @@ pub fn analyze_wasm(
     (funcs, dead, Vec::new())
 }
 
-/// Patch dead Wasm function bodies with `unreachable; end`.
-/// Returns (func_count, func_saved, 0, 0).
+/// Patch dead Wasm function bodies with `unreachable; end`
+/// and zero dead blocks within live functions.
+/// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_wasm(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
 ) -> (usize, u64, usize, u64) {
     let mut count = 0;
     let mut saved = 0u64;
@@ -39,7 +42,22 @@ pub fn reassemble_wasm(
             saved += (sz as u64).saturating_sub(2);
         }
     }
-    (count, saved, 0, 0)
+    // Zero dead blocks (dead branches within live functions)
+    let mut blk_count = 0;
+    let mut blk_saved = 0u64;
+    for db in dead_blocks {
+        let off = db.addr as usize;
+        let sz = db.size as usize;
+        if off + sz <= data.len() && sz >= 1 {
+            // Fill with nop (0x01) to preserve bytecode structure
+            for b in &mut data[off..off + sz] {
+                *b = 0x01; // Wasm nop
+            }
+            blk_count += 1;
+            blk_saved += db.size;
+        }
+    }
+    (count, saved, blk_count, blk_saved)
 }
 
 struct WasmModule {
@@ -262,6 +280,271 @@ fn bfs_live(module: &WasmModule) -> HashSet<u32> {
         }
     }
     visited
+}
+
+/// Detect dead branches within live Wasm function bodies.
+/// Finds unreachable code after `unreachable`, `return`, and
+/// unconditional `br` opcodes until the next control boundary.
+pub fn find_wasm_dead_blocks(
+    data: &[u8],
+    dead_funcs: &HashMap<String, (u64, u64)>,
+) -> Vec<DeadBlock> {
+    let module = match parse_module(data) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+    let live = bfs_live(&module);
+    let dead_func_indices: HashSet<u32> = module
+        .functions
+        .iter()
+        .filter(|f| !live.contains(&f.index))
+        .map(|f| f.index)
+        .collect();
+    let mut blocks = Vec::new();
+    for f in &module.functions {
+        if dead_func_indices.contains(&f.index) {
+            continue;
+        }
+        if dead_funcs.contains_key(&f.name) {
+            continue;
+        }
+        scan_wasm_body_dead(
+            data, f, &mut blocks,
+        );
+    }
+    blocks
+}
+
+fn scan_wasm_body_dead(
+    data: &[u8],
+    func: &WasmFunc,
+    blocks: &mut Vec<DeadBlock>,
+) {
+    let start = func.body_offset as usize;
+    let end = start + func.body_size as usize;
+    if start >= data.len() || end > data.len() {
+        return;
+    }
+    // Scan the raw bytes for patterns:
+    // After unreachable (0x00) or return (0x0F) or br (0x0C),
+    // until end (0x0B) or else (0x05) or a block boundary.
+    let body = &data[start..end];
+    let mut pos = 0usize;
+    // Skip locals declaration
+    pos = skip_locals(body, pos);
+    let mut dead_start: Option<usize> = None;
+    let mut depth = 0u32; // block nesting depth
+    while pos < body.len() {
+        let op = body[pos];
+        // Track block nesting
+        match op {
+            0x02 | 0x03 | 0x04 => {
+                // block, loop, if — increase depth
+                if dead_start.is_some() {
+                    // Inside dead region, just track depth
+                    depth += 1;
+                    pos = skip_block_type(body, pos + 1);
+                    continue;
+                }
+                depth += 1;
+                pos = skip_block_type(body, pos + 1);
+                continue;
+            }
+            0x05 => {
+                // else
+                if dead_start.is_some() && depth == 0 {
+                    // End of dead region at this boundary
+                    let ds = dead_start.unwrap();
+                    let dead_off = start + ds;
+                    let dead_sz = pos - ds;
+                    if dead_sz >= 2 {
+                        blocks.push(DeadBlock {
+                            func_name: func.name.clone(),
+                            addr: dead_off as u64,
+                            size: dead_sz as u64,
+                        });
+                    }
+                    dead_start = None;
+                } else if dead_start.is_some() && depth > 0 {
+                    // else inside nested block in dead region
+                }
+                pos += 1;
+                continue;
+            }
+            0x0B => {
+                // end
+                if dead_start.is_some() && depth == 0 {
+                    let ds = dead_start.unwrap();
+                    let dead_off = start + ds;
+                    let dead_sz = pos - ds;
+                    if dead_sz >= 2 {
+                        blocks.push(DeadBlock {
+                            func_name: func.name.clone(),
+                            addr: dead_off as u64,
+                            size: dead_sz as u64,
+                        });
+                    }
+                    dead_start = None;
+                } else if dead_start.is_some() && depth > 0 {
+                    depth -= 1;
+                } else if depth > 0 {
+                    depth -= 1;
+                }
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if dead_start.is_some() {
+            pos = skip_wasm_instr(body, pos);
+            continue;
+        }
+        // Check for dead-start triggers
+        match op {
+            0x00 => {
+                // unreachable — code after is dead
+                pos += 1;
+                dead_start = Some(pos);
+                continue;
+            }
+            0x0F => {
+                // return — code after is dead
+                pos += 1;
+                dead_start = Some(pos);
+                continue;
+            }
+            0x0C => {
+                // br — unconditional branch, code after dead
+                pos += 1;
+                pos = skip_leb128(body, pos); // label index
+                dead_start = Some(pos);
+                continue;
+            }
+            _ => {
+                pos = skip_wasm_instr(body, pos);
+            }
+        }
+    }
+}
+
+fn skip_locals(body: &[u8], mut pos: usize) -> usize {
+    if pos >= body.len() {
+        return pos;
+    }
+    let (count, new_pos) = read_leb128_u32(body, pos);
+    pos = new_pos;
+    for _ in 0..count {
+        let (_cnt, p) = read_leb128_u32(body, pos);
+        pos = p;
+        if pos < body.len() {
+            pos += 1; // valtype
+        }
+    }
+    pos
+}
+
+fn skip_block_type(body: &[u8], pos: usize) -> usize {
+    if pos >= body.len() {
+        return pos;
+    }
+    let b = body[pos];
+    if b == 0x40 {
+        // empty block type
+        pos + 1
+    } else if b >= 0x60 && b <= 0x7F {
+        // valtype
+        pos + 1
+    } else {
+        // s33 type index
+        skip_leb128(body, pos)
+    }
+}
+
+fn skip_wasm_instr(body: &[u8], pos: usize) -> usize {
+    if pos >= body.len() {
+        return body.len();
+    }
+    let op = body[pos];
+    match op {
+        // No operands
+        0x00 | 0x01 | 0x0F | 0x1A | 0x1B | 0x45..=0xC4
+        | 0xD1 => pos + 1,
+        // Block-like: block type
+        0x02 | 0x03 | 0x04 => skip_block_type(body, pos + 1),
+        // br, br_if: label index (LEB128)
+        0x0C | 0x0D => skip_leb128(body, pos + 1),
+        // br_table: vec(label) + default
+        0x0E => {
+            let mut p = pos + 1;
+            let (count, np) = read_leb128_u32(body, p);
+            p = np;
+            for _ in 0..=count {
+                p = skip_leb128(body, p);
+            }
+            p
+        }
+        // call, local.get/set/tee, global.get/set
+        0x10 | 0x20..=0x24 => skip_leb128(body, pos + 1),
+        // call_indirect: type + table
+        0x11 => {
+            let p = skip_leb128(body, pos + 1);
+            skip_leb128(body, p)
+        }
+        // memory instructions: align + offset
+        0x28..=0x3E => {
+            let p = skip_leb128(body, pos + 1);
+            skip_leb128(body, p)
+        }
+        // memory.size, memory.grow
+        0x3F | 0x40 => pos + 2,
+        // i32.const
+        0x41 => skip_leb128(body, pos + 1),
+        // i64.const
+        0x42 => skip_leb128(body, pos + 1),
+        // f32.const
+        0x43 => pos + 5,
+        // f64.const
+        0x44 => pos + 9,
+        // else, end
+        0x05 | 0x0B => pos + 1,
+        // drop, select
+        0xD0 => pos + 2, // ref.null
+        // multi-byte prefix (0xFC, 0xFD, 0xFE)
+        0xFC | 0xFD | 0xFE => {
+            // Skip the sub-opcode LEB128
+            skip_leb128(body, pos + 1)
+        }
+        _ => pos + 1,
+    }
+}
+
+fn read_leb128_u32(data: &[u8], mut pos: usize) -> (u32, usize) {
+    let mut result = 0u32;
+    let mut shift = 0;
+    while pos < data.len() {
+        let b = data[pos];
+        pos += 1;
+        result |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            break;
+        }
+    }
+    (result, pos)
+}
+
+fn skip_leb128(data: &[u8], mut pos: usize) -> usize {
+    while pos < data.len() {
+        let b = data[pos];
+        pos += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    pos
 }
 
 fn empty() -> (
