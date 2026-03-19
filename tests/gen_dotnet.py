@@ -75,9 +75,10 @@ def build_method_bodies(sec_rva, body_file_off):
     main_hdr = bytes([(len(main_code) << 2) | 0x02])
     bodies += main_hdr + main_code
 
-    # Method 1: LiveHelper — just ret
+    # Method 1: LiveHelper — has dead code after ret
+    # IL: nop + nop + ret + nop + nop + nop + nop (dead after ret)
     rvas.append(cur_rva())
-    live_code = b"\x2A"
+    live_code = b"\x00\x00\x2A\x00\x00\x00\x00"
     live_hdr = bytes([(len(live_code) << 2) | 0x02])
     bodies += live_hdr + live_code
 
@@ -87,9 +88,17 @@ def build_method_bodies(sec_rva, body_file_off):
     dead1_hdr = bytes([(len(dead1_code) << 2) | 0x02])
     bodies += dead1_hdr + dead1_code
 
-    # Method 3: DeadMethod2 — just ret
+    # Method 3: DeadMethod2 — has dead code after throw
+    # IL: nop + newobj System.Exception (dummy token) + throw
+    #     + nop + nop + nop + nop + nop (dead after throw)
     rvas.append(cur_rva())
-    dead2_code = b"\x2A"
+    dead2_code = (
+        b"\x00"             # nop
+        + b"\x73"           # newobj
+        + le32(0x0A000001)  # MemberRef token (dummy)
+        + b"\x7A"           # throw
+        + b"\x00\x00\x00\x00\x00"  # dead code after throw
+    )
     dead2_hdr = bytes([(len(dead2_code) << 2) | 0x02])
     bodies += dead2_hdr + dead2_code
 

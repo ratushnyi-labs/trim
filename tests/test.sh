@@ -784,6 +784,16 @@ file /work/test-dotnet-patch | grep -qi 'pe' && \
     fail ".NET: patched file" "not PE"
 
 # =============================================
+# .NET IL dead branch detection
+# =============================================
+printf '\n--- .NET IL dead branch detection ---\n'
+output=$(xstrip --dry-run /work/hello-dotnet.exe 2>&1)
+echo "$output"
+echo "$output" | grep -q 'dead branch' && \
+    pass ".NET: detected dead branches" || \
+    fail ".NET: dead branches" "not found"
+
+# =============================================
 # Dead branch detection: noreturn calls
 # =============================================
 printf '\n--- Dead branch detection: noreturn calls ---\n'
@@ -895,6 +905,44 @@ echo "$patch_out" | grep -q 'dead branches removed' && \
     fail "Combined: branch compaction" "not reported"
 
 # =============================================
+# PE metadata validation: patching preserves format
+# =============================================
+printf '\n--- PE metadata validation ---\n'
+clang-19 --target=x86_64-w64-mingw32 -g -O0 -fno-inline -shared \
+    -fuse-ld=lld -o /work/test-pe-meta.dll /tests/lib.c 2>/dev/null
+orig_sz_pe_meta=$(stat -c%s /work/test-pe-meta.dll)
+xstrip --in-place /work/test-pe-meta.dll 2>/dev/null
+new_sz_pe_meta=$(stat -c%s /work/test-pe-meta.dll)
+
+[ "$new_sz_pe_meta" -le "$orig_sz_pe_meta" ] && \
+    pass "PE metadata: patched DLL valid" || \
+    fail "PE metadata: patched DLL" "size grew"
+
+file_info=$(file /work/test-pe-meta.dll)
+echo "$file_info" | grep -q 'PE32' && \
+    pass "PE metadata: patched DLL still PE" || \
+    fail "PE metadata: patched type" "got: $file_info"
+
+# =============================================
+# Mach-O metadata validation: patching preserves format
+# =============================================
+printf '\n--- Mach-O metadata validation ---\n'
+clang-19 -c --target=arm64-apple-macosx -g -O0 -fno-inline \
+    -o /work/test-macho-meta /tests/big-dead.c
+orig_sz_macho_meta=$(stat -c%s /work/test-macho-meta)
+xstrip --in-place /work/test-macho-meta 2>/dev/null
+new_sz_macho_meta=$(stat -c%s /work/test-macho-meta)
+
+[ "$new_sz_macho_meta" -le "$orig_sz_macho_meta" ] && \
+    pass "Mach-O metadata: patched file valid" || \
+    fail "Mach-O metadata: patched file" "size grew"
+
+file_info=$(file /work/test-macho-meta)
+echo "$file_info" | grep -qi 'mach-o' && \
+    pass "Mach-O metadata: patched file still Mach-O" || \
+    fail "Mach-O metadata: patched type" "got: $file_info"
+
+# =============================================
 # Dead code detection: AArch64
 # =============================================
 printf '\n--- Dead code detection: AArch64 ---\n'
@@ -932,7 +980,8 @@ echo "$file_info" | grep -q 'ELF.*ARM aarch64' && \
 printf '\n--- Patching: AArch64 ---\n'
 cp /work/hello-aarch64 /work/test-aarch64-patch
 orig_sz_a64=$(stat -c%s /work/test-aarch64-patch)
-xstrip --in-place /work/test-aarch64-patch
+patch_out_a64=$(xstrip --in-place /work/test-aarch64-patch 2>&1)
+echo "$patch_out_a64"
 new_sz_a64=$(stat -c%s /work/test-aarch64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_a64" "$new_sz_a64"
 
@@ -944,6 +993,10 @@ file_info=$(file /work/test-aarch64-patch)
 echo "$file_info" | grep -q 'ELF' && \
     pass "AArch64: patched file still ELF" || \
     fail "AArch64: patched type" "got: $file_info"
+
+echo "$patch_out_a64" | grep -q 'dead functions removed' && \
+    pass "AArch64: compaction reported" || \
+    fail "AArch64: compaction" "not reported"
 
 # =============================================
 # Dead code detection: ARM32
@@ -983,7 +1036,8 @@ echo "$file_info" | grep -q 'ELF.*ARM' && \
 printf '\n--- Patching: ARM32 ---\n'
 cp /work/hello-arm32 /work/test-arm32-patch
 orig_sz_arm32=$(stat -c%s /work/test-arm32-patch)
-xstrip --in-place /work/test-arm32-patch
+patch_out_arm32=$(xstrip --in-place /work/test-arm32-patch 2>&1)
+echo "$patch_out_arm32"
 new_sz_arm32=$(stat -c%s /work/test-arm32-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_arm32" "$new_sz_arm32"
 
@@ -995,6 +1049,10 @@ file_info=$(file /work/test-arm32-patch)
 echo "$file_info" | grep -q 'ELF' && \
     pass "ARM32: patched file still ELF" || \
     fail "ARM32: patched type" "got: $file_info"
+
+echo "$patch_out_arm32" | grep -q 'dead functions removed' && \
+    pass "ARM32: compaction reported" || \
+    fail "ARM32: compaction" "not reported"
 
 # =============================================
 # Dead code detection: RISC-V 64
@@ -1034,7 +1092,8 @@ echo "$file_info" | grep -q 'ELF.*RISC-V' && \
 printf '\n--- Patching: RISC-V 64 ---\n'
 cp /work/hello-riscv64 /work/test-riscv64-patch
 orig_sz_rv=$(stat -c%s /work/test-riscv64-patch)
-xstrip --in-place /work/test-riscv64-patch
+patch_out_rv=$(xstrip --in-place /work/test-riscv64-patch 2>&1)
+echo "$patch_out_rv"
 new_sz_rv=$(stat -c%s /work/test-riscv64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_rv" "$new_sz_rv"
 
@@ -1050,6 +1109,10 @@ echo "$file_info" | grep -q 'ELF' && \
 qemu-riscv64 /work/test-riscv64-patch > /dev/null 2>&1 && \
     pass "RISC-V64: patched binary executes via QEMU" || \
     fail "RISC-V64: QEMU execution" "crashed"
+
+echo "$patch_out_rv" | grep -q 'dead functions removed' && \
+    pass "RISC-V64: compaction reported" || \
+    fail "RISC-V64: compaction" "not reported"
 
 # =============================================
 # Dead code detection: MIPS (big-endian)
@@ -1089,7 +1152,8 @@ echo "$file_info" | grep -q 'ELF.*MIPS' && \
 printf '\n--- Patching: MIPS ---\n'
 cp /work/hello-mips /work/test-mips-patch
 orig_sz_mips=$(stat -c%s /work/test-mips-patch)
-xstrip --in-place /work/test-mips-patch
+patch_out_mips=$(xstrip --in-place /work/test-mips-patch 2>&1)
+echo "$patch_out_mips"
 new_sz_mips=$(stat -c%s /work/test-mips-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_mips" "$new_sz_mips"
 
@@ -1105,6 +1169,10 @@ echo "$file_info" | grep -q 'ELF' && \
 qemu-mips /work/test-mips-patch > /dev/null 2>&1 && \
     pass "MIPS: patched binary executes via QEMU" || \
     fail "MIPS: QEMU execution" "crashed"
+
+echo "$patch_out_mips" | grep -q 'dead functions removed' && \
+    pass "MIPS: compaction reported" || \
+    fail "MIPS: compaction" "not reported"
 
 # =============================================
 # Dead code detection: s390x
@@ -1144,7 +1212,8 @@ echo "$file_info" | grep -q 'ELF.*S/390' && \
 printf '\n--- Patching: s390x ---\n'
 cp /work/hello-s390x /work/test-s390x-patch
 orig_sz_s390=$(stat -c%s /work/test-s390x-patch)
-xstrip --in-place /work/test-s390x-patch
+patch_out_s390=$(xstrip --in-place /work/test-s390x-patch 2>&1)
+echo "$patch_out_s390"
 new_sz_s390=$(stat -c%s /work/test-s390x-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_s390" "$new_sz_s390"
 
@@ -1160,6 +1229,10 @@ echo "$file_info" | grep -q 'ELF' && \
 qemu-s390x /work/test-s390x-patch > /dev/null 2>&1 && \
     pass "s390x: patched binary executes via QEMU" || \
     fail "s390x: QEMU execution" "crashed"
+
+echo "$patch_out_s390" | grep -q 'dead functions removed' && \
+    pass "s390x: compaction reported" || \
+    fail "s390x: compaction" "not reported"
 
 # =============================================
 # Dead code detection: LoongArch64
@@ -1199,7 +1272,8 @@ echo "$file_info" | grep -q 'ELF.*LoongArch' && \
 printf '\n--- Patching: LoongArch64 ---\n'
 cp /work/hello-loongarch64 /work/test-loongarch64-patch
 orig_sz_la=$(stat -c%s /work/test-loongarch64-patch)
-xstrip --in-place /work/test-loongarch64-patch
+patch_out_la=$(xstrip --in-place /work/test-loongarch64-patch 2>&1)
+echo "$patch_out_la"
 new_sz_la=$(stat -c%s /work/test-loongarch64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_la" "$new_sz_la"
 
@@ -1215,6 +1289,10 @@ echo "$file_info" | grep -q 'ELF' && \
 qemu-loongarch64 /work/test-loongarch64-patch > /dev/null 2>&1 && \
     pass "LoongArch64: patched binary executes via QEMU" || \
     fail "LoongArch64: QEMU execution" "crashed"
+
+echo "$patch_out_la" | grep -q 'dead functions removed' && \
+    pass "LoongArch64: compaction reported" || \
+    fail "LoongArch64: compaction" "not reported"
 
 # =============================================
 # Dead code detection: WebAssembly
@@ -1244,12 +1322,23 @@ echo "$output" | grep -q '  compute' && \
     pass "Wasm: exported compute correctly kept"
 
 # =============================================
+# Wasm dead branch detection
+# =============================================
+printf '\n--- Wasm dead branch detection ---\n'
+output=$(xstrip --dry-run /work/lib.wasm 2>&1)
+echo "$output"
+echo "$output" | grep -q 'dead branch' && \
+    pass "Wasm: detected dead branches" || \
+    fail "Wasm: dead branches" "not found"
+
+# =============================================
 # Patching: WebAssembly
 # =============================================
 printf '\n--- Patching: WebAssembly ---\n'
 cp /work/lib.wasm /work/test-wasm-patch
 orig_sz_wasm=$(stat -c%s /work/test-wasm-patch)
-xstrip --in-place /work/test-wasm-patch
+patch_out_wasm=$(xstrip --in-place /work/test-wasm-patch 2>&1)
+echo "$patch_out_wasm"
 new_sz_wasm=$(stat -c%s /work/test-wasm-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_wasm" "$new_sz_wasm"
 
@@ -1261,6 +1350,10 @@ file_info=$(file /work/test-wasm-patch)
 echo "$file_info" | grep -q 'WebAssembly\|wasm' && \
     pass "Wasm: patched file still WebAssembly" || \
     fail "Wasm: patched type" "got: $file_info"
+
+echo "$patch_out_wasm" | grep -q 'dead branches removed' && \
+    pass "Wasm: dead branch compaction reported" || \
+    fail "Wasm: dead branch compaction" "not reported"
 
 # =============================================
 # Cleanup
