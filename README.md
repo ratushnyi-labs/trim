@@ -1,11 +1,12 @@
 # xstrip
 
-Dead code analyzer and remover for ELF binaries.
+Dead code analyzer and remover for compiled binaries.
 
-xstrip finds unreachable functions in compiled binaries using address-based
-call graph analysis, patches them with INT3 (`0xCC`) fills, and physically
-shrinks the binary. It works directly on the binary — no source code or
-recompilation needed.
+xstrip finds unreachable functions and dead branches in compiled binaries
+using address-based call graph analysis, patches them with zero-fills, and
+for x86 ELF physically shrinks the binary. Supports ELF, PE/COFF, Mach-O,
+.NET assemblies, and WebAssembly across 8+ architectures. It works directly
+on the binary — no source code or recompilation needed.
 
 ## Quick Start
 
@@ -46,17 +47,17 @@ docker run --rm -i xstrip-strip - < myapp > myapp.patched
 
 ## How It Works
 
-1. Parses ELF headers and symbol tables (static + dynamic)
-2. Disassembles `.text` with a full x86-64 decoder ([iced-x86](https://github.com/icedland/iced))
-3. Builds an address-based call graph from branch/call targets and RIP-relative references
-4. BFS reachability from roots (entry point, global symbols, data-section references)
-5. Patches unreachable functions with `0xCC` (INT3)
-6. Physically shrinks the binary by removing dead code bytes and updating all ELF metadata
+1. Auto-detects binary format from magic bytes (ELF, PE/COFF, Mach-O, .NET, WebAssembly)
+2. Parses headers, symbol tables, and section metadata
+3. Decodes instructions for the target architecture (x86-64, x86-32, AArch64, ARM32, RISC-V, MIPS, s390x, LoongArch64) or IL opcodes (.NET) or Wasm function bodies
+4. Builds an address-based call graph from branch/call targets and cross-references
+5. BFS reachability from roots (entry point, global symbols, data-section references)
+6. Detects dead branches within live functions via CFG analysis, intra-function compaction, and SSA-based constant propagation
+7. Patches unreachable code with zero-fills (x86 ELF also physically shrinks the binary)
 
-Works on stripped binaries (no `.symtab`), statically linked binaries, and
-shared libraries. Compilers already eliminate dead branches within functions
-at `-O1`+; xstrip catches whole **functions** that the linker pulled in but
-nothing calls.
+Works on stripped binaries (no `.symtab`), statically linked binaries, shared
+libraries, Windows PE executables/DLLs, Mach-O objects, .NET assemblies, and
+WebAssembly modules. No source code or recompilation needed.
 
 ## Example Output
 
@@ -72,13 +73,13 @@ Size: 26840 -> 22744 bytes
 
 ## Supported Formats
 
-| Format | Analyze | Patch | Notes |
-|--------|---------|-------|-------|
-| ELF executables | Yes | Yes | Dynamic and static linking |
-| ELF shared libraries (.so) | Yes | Yes | Exports preserved |
-| ELF stripped binaries | Yes | Yes | Function boundaries inferred |
-| PE/COFF | — | — | Planned |
-| Mach-O | — | — | Planned |
+| Format | Analyze | Patch | Architectures | Notes |
+|--------|---------|-------|---------------|-------|
+| ELF | Yes | Yes | x86-64, x86-32, AArch64, ARM32, RISC-V, MIPS, s390x, LoongArch64 | Compact+shrink for x86, zero-fill for others |
+| PE/COFF | Yes | Yes | x86-64, x86-32, AArch64, ARM32 | Zero-fill patching |
+| Mach-O | Yes | Yes | x86-64, AArch64, ARM32 | Zero-fill patching |
+| .NET | Yes | Yes | IL (arch-independent) | IL-level dead method detection |
+| WebAssembly | Yes | Yes | Wasm | Function-level call graph analysis |
 
 ## Options
 
@@ -127,7 +128,7 @@ Requires Docker with Compose V2 and Buildx:
 
 ```bash
 docker compose build strip    # production image (native arch)
-docker compose run --rm test  # run test suite (70 tests)
+docker compose run --rm test  # run test suite (171 tests)
 sh dist.sh                    # static binaries for amd64 + arm64
 ```
 

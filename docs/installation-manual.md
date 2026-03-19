@@ -97,10 +97,11 @@ docker compose run --rm strip -i /work/myapp
 
 | Format    | Analyze | Patch  | Architectures       | Notes                          |
 |-----------|---------|--------|----------------------|--------------------------------|
-| ELF       | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32 | Compact+shrink for x86, zero-fill for ARM |
+| ELF       | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32, RISC-V, MIPS, s390x, LoongArch64 | Compact+shrink for x86, zero-fill for others |
 | PE/COFF   | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32 | Zero-fill patching             |
 | Mach-O    | Yes     | Yes    | x86-64, AArch64, ARM32 | Zero-fill patching             |
 | .NET      | Yes     | Yes    | IL (arch-independent) | IL-level dead method detection |
+| WebAssembly | Yes   | Yes    | Wasm                 | Function-level call graph analysis |
 
 ## Output
 
