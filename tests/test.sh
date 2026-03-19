@@ -44,7 +44,8 @@ printf 'Built: hello.exe (%d bytes, PE)\n' \
     "$(stat -c%s /work/hello.exe)"
 
 clang-19 --target=wasm32 -g -O0 -fno-inline -nostdlib \
-    -Wl,--no-entry -Wl,--export-all \
+    -Wl,--no-entry -Wl,--no-gc-sections \
+    -Wl,--export=add -Wl,--export=multiply -Wl,--export=compute \
     -o /work/lib.wasm /tests/lib.c
 printf 'Built: lib.wasm (%d bytes, Wasm)\n' \
     "$(stat -c%s /work/lib.wasm)"
@@ -69,6 +70,30 @@ clang-19 --target=armv7-linux-gnueabihf -nostdlib -static -g -O0 \
     /tests/arm-hello.c 2>/dev/null
 printf 'Built: hello-arm32 (%d bytes, ELF ARM32)\n' \
     "$(stat -c%s /work/hello-arm32)"
+
+clang-19 --target=riscv64-linux-gnu -march=rv64gc -nostdlib -static \
+    -g -O0 -fno-inline -fuse-ld=lld -o /work/hello-riscv64 \
+    /tests/riscv-hello.c 2>/dev/null
+printf 'Built: hello-riscv64 (%d bytes, ELF RISC-V 64)\n' \
+    "$(stat -c%s /work/hello-riscv64)"
+
+clang-19 --target=mips-linux-gnu -nostdlib -static -g -O0 \
+    -fno-inline -fno-pic -fuse-ld=lld -o /work/hello-mips \
+    /tests/mips-hello.c 2>/dev/null
+printf 'Built: hello-mips (%d bytes, ELF MIPS)\n' \
+    "$(stat -c%s /work/hello-mips)"
+
+clang-19 --target=s390x-linux-gnu -nostdlib -static -g -O0 \
+    -fno-inline -fuse-ld=lld -o /work/hello-s390x \
+    /tests/s390x-hello.c 2>/dev/null
+printf 'Built: hello-s390x (%d bytes, ELF s390x)\n' \
+    "$(stat -c%s /work/hello-s390x)"
+
+clang-19 --target=loongarch64-linux-gnu -nostdlib -static -g -O0 \
+    -fno-inline -fuse-ld=lld -o /work/hello-loongarch64 \
+    /tests/loongarch-hello.c 2>/dev/null
+printf 'Built: hello-loongarch64 (%d bytes, ELF LoongArch64)\n' \
+    "$(stat -c%s /work/hello-loongarch64)"
 
 # =============================================
 # Dead code detection: ELF dynamic
@@ -970,6 +995,272 @@ file_info=$(file /work/test-arm32-patch)
 echo "$file_info" | grep -q 'ELF' && \
     pass "ARM32: patched file still ELF" || \
     fail "ARM32: patched type" "got: $file_info"
+
+# =============================================
+# Dead code detection: RISC-V 64
+# =============================================
+printf '\n--- Dead code detection: RISC-V 64 ---\n'
+output=$(xstrip --dry-run /work/hello-riscv64 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "RISC-V64: detected dead_compute" || \
+    fail "RISC-V64: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "RISC-V64: detected dead_factorial" || \
+    fail "RISC-V64: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "RISC-V64: false positive" "_start flagged as dead" || \
+    pass "RISC-V64: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "RISC-V64: false positive" "live_add flagged as dead" || \
+    pass "RISC-V64: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "RISC-V64: false positive" "live_multiply flagged" || \
+    pass "RISC-V64: live_multiply correctly kept"
+
+file_info=$(file /work/hello-riscv64)
+echo "$file_info" | grep -q 'ELF.*RISC-V' && \
+    pass "RISC-V64: correct ELF type" || \
+    fail "RISC-V64: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: RISC-V 64
+# =============================================
+printf '\n--- Patching: RISC-V 64 ---\n'
+cp /work/hello-riscv64 /work/test-riscv64-patch
+orig_sz_rv=$(stat -c%s /work/test-riscv64-patch)
+xstrip --in-place /work/test-riscv64-patch
+new_sz_rv=$(stat -c%s /work/test-riscv64-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_rv" "$new_sz_rv"
+
+[ "$new_sz_rv" -le "$orig_sz_rv" ] && \
+    pass "RISC-V64: patched file valid" || \
+    fail "RISC-V64: patched file" "size grew"
+
+file_info=$(file /work/test-riscv64-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "RISC-V64: patched file still ELF" || \
+    fail "RISC-V64: patched type" "got: $file_info"
+
+qemu-riscv64 /work/test-riscv64-patch > /dev/null 2>&1 && \
+    pass "RISC-V64: patched binary executes via QEMU" || \
+    fail "RISC-V64: QEMU execution" "crashed"
+
+# =============================================
+# Dead code detection: MIPS (big-endian)
+# =============================================
+printf '\n--- Dead code detection: MIPS ---\n'
+output=$(xstrip --dry-run /work/hello-mips 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "MIPS: detected dead_compute" || \
+    fail "MIPS: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "MIPS: detected dead_factorial" || \
+    fail "MIPS: dead_factorial" "not found"
+
+echo "$output" | grep -q '  __start' && \
+    fail "MIPS: false positive" "__start flagged as dead" || \
+    pass "MIPS: __start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "MIPS: false positive" "live_add flagged as dead" || \
+    pass "MIPS: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "MIPS: false positive" "live_multiply flagged" || \
+    pass "MIPS: live_multiply correctly kept"
+
+file_info=$(file /work/hello-mips)
+echo "$file_info" | grep -q 'ELF.*MIPS' && \
+    pass "MIPS: correct ELF type" || \
+    fail "MIPS: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: MIPS
+# =============================================
+printf '\n--- Patching: MIPS ---\n'
+cp /work/hello-mips /work/test-mips-patch
+orig_sz_mips=$(stat -c%s /work/test-mips-patch)
+xstrip --in-place /work/test-mips-patch
+new_sz_mips=$(stat -c%s /work/test-mips-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_mips" "$new_sz_mips"
+
+[ "$new_sz_mips" -le "$orig_sz_mips" ] && \
+    pass "MIPS: patched file valid" || \
+    fail "MIPS: patched file" "size grew"
+
+file_info=$(file /work/test-mips-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "MIPS: patched file still ELF" || \
+    fail "MIPS: patched type" "got: $file_info"
+
+qemu-mips /work/test-mips-patch > /dev/null 2>&1 && \
+    pass "MIPS: patched binary executes via QEMU" || \
+    fail "MIPS: QEMU execution" "crashed"
+
+# =============================================
+# Dead code detection: s390x
+# =============================================
+printf '\n--- Dead code detection: s390x ---\n'
+output=$(xstrip --dry-run /work/hello-s390x 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "s390x: detected dead_compute" || \
+    fail "s390x: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "s390x: detected dead_factorial" || \
+    fail "s390x: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "s390x: false positive" "_start flagged as dead" || \
+    pass "s390x: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "s390x: false positive" "live_add flagged as dead" || \
+    pass "s390x: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "s390x: false positive" "live_multiply flagged" || \
+    pass "s390x: live_multiply correctly kept"
+
+file_info=$(file /work/hello-s390x)
+echo "$file_info" | grep -q 'ELF.*S/390' && \
+    pass "s390x: correct ELF type" || \
+    fail "s390x: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: s390x
+# =============================================
+printf '\n--- Patching: s390x ---\n'
+cp /work/hello-s390x /work/test-s390x-patch
+orig_sz_s390=$(stat -c%s /work/test-s390x-patch)
+xstrip --in-place /work/test-s390x-patch
+new_sz_s390=$(stat -c%s /work/test-s390x-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_s390" "$new_sz_s390"
+
+[ "$new_sz_s390" -le "$orig_sz_s390" ] && \
+    pass "s390x: patched file valid" || \
+    fail "s390x: patched file" "size grew"
+
+file_info=$(file /work/test-s390x-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "s390x: patched file still ELF" || \
+    fail "s390x: patched type" "got: $file_info"
+
+qemu-s390x /work/test-s390x-patch > /dev/null 2>&1 && \
+    pass "s390x: patched binary executes via QEMU" || \
+    fail "s390x: QEMU execution" "crashed"
+
+# =============================================
+# Dead code detection: LoongArch64
+# =============================================
+printf '\n--- Dead code detection: LoongArch64 ---\n'
+output=$(xstrip --dry-run /work/hello-loongarch64 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "LoongArch64: detected dead_compute" || \
+    fail "LoongArch64: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "LoongArch64: detected dead_factorial" || \
+    fail "LoongArch64: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "LoongArch64: false positive" "_start flagged" || \
+    pass "LoongArch64: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "LoongArch64: false positive" "live_add flagged" || \
+    pass "LoongArch64: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "LoongArch64: false positive" "live_multiply flagged" || \
+    pass "LoongArch64: live_multiply correctly kept"
+
+file_info=$(file /work/hello-loongarch64)
+echo "$file_info" | grep -q 'ELF.*LoongArch' && \
+    pass "LoongArch64: correct ELF type" || \
+    fail "LoongArch64: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: LoongArch64
+# =============================================
+printf '\n--- Patching: LoongArch64 ---\n'
+cp /work/hello-loongarch64 /work/test-loongarch64-patch
+orig_sz_la=$(stat -c%s /work/test-loongarch64-patch)
+xstrip --in-place /work/test-loongarch64-patch
+new_sz_la=$(stat -c%s /work/test-loongarch64-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_la" "$new_sz_la"
+
+[ "$new_sz_la" -le "$orig_sz_la" ] && \
+    pass "LoongArch64: patched file valid" || \
+    fail "LoongArch64: patched file" "size grew"
+
+file_info=$(file /work/test-loongarch64-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "LoongArch64: patched file still ELF" || \
+    fail "LoongArch64: patched type" "got: $file_info"
+
+qemu-loongarch64 /work/test-loongarch64-patch > /dev/null 2>&1 && \
+    pass "LoongArch64: patched binary executes via QEMU" || \
+    fail "LoongArch64: QEMU execution" "crashed"
+
+# =============================================
+# Dead code detection: WebAssembly
+# =============================================
+printf '\n--- Dead code detection: WebAssembly ---\n'
+output=$(xstrip --dry-run /work/lib.wasm 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass "Wasm: analysis completed" || \
+    fail "Wasm: analysis" "not completed"
+
+echo "$output" | grep -q 'dead functions' && \
+    pass "Wasm: detected dead functions" || \
+    fail "Wasm: dead functions" "none found"
+
+echo "$output" | grep -q '  add' && \
+    fail "Wasm: false positive" "exported add flagged" || \
+    pass "Wasm: exported add correctly kept"
+
+echo "$output" | grep -q '  multiply' && \
+    fail "Wasm: false positive" "exported multiply flagged" || \
+    pass "Wasm: exported multiply correctly kept"
+
+echo "$output" | grep -q '  compute' && \
+    fail "Wasm: false positive" "exported compute flagged" || \
+    pass "Wasm: exported compute correctly kept"
+
+# =============================================
+# Patching: WebAssembly
+# =============================================
+printf '\n--- Patching: WebAssembly ---\n'
+cp /work/lib.wasm /work/test-wasm-patch
+orig_sz_wasm=$(stat -c%s /work/test-wasm-patch)
+xstrip --in-place /work/test-wasm-patch
+new_sz_wasm=$(stat -c%s /work/test-wasm-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_wasm" "$new_sz_wasm"
+
+[ "$new_sz_wasm" -le "$orig_sz_wasm" ] && \
+    pass "Wasm: patched file valid" || \
+    fail "Wasm: patched file" "size grew"
+
+file_info=$(file /work/test-wasm-patch)
+echo "$file_info" | grep -q 'WebAssembly\|wasm' && \
+    pass "Wasm: patched file still WebAssembly" || \
+    fail "Wasm: patched type" "got: $file_info"
 
 # =============================================
 # Cleanup

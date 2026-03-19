@@ -15,12 +15,27 @@ Cargo.lock          Dependency lock file (reproducible builds)
 src/                Rust source code
   main.rs           CLI entry point
   lib.rs            Core analysis and patching logic (format dispatch)
-  arch/             Architecture-specific decoders (x86, AArch64, ARM32)
+  arch/             Architecture-specific decoders
+    x86.rs          x86-64/x86-32 decoder (iced-x86)
+    x86_patch.rs    x86 padding/patching
+    aarch64.rs      AArch64 decoder (custom)
+    aarch64_patch.rs AArch64 padding
+    arm32.rs        ARM32 decoder (custom)
+    arm32_patch.rs  ARM32 padding
+    riscv.rs        RISC-V RV32/RV64+C decoder (custom)
+    riscv_patch.rs  RISC-V padding
+    mips.rs         MIPS32/64 decoder (custom)
+    mips_patch.rs   MIPS padding
+    s390x.rs        s390x decoder (custom, variable-length)
+    s390x_patch.rs  s390x padding
+    loongarch.rs    LoongArch64 decoder (custom)
+    loongarch_patch.rs LoongArch padding
   format/           Format-specific modules
     elf/            ELF analysis, sections, symbols, patching
     pe/             PE/COFF analysis, sections, symbols
     macho/          Mach-O analysis, sections, symbols
     dotnet/         .NET IL metadata parsing, call graph, patching
+    wasm/           WebAssembly function-level analysis (wasmparser)
   analysis/         Format-agnostic reachability analysis
   decode/           Instruction decoding, call graph, function inference
   patch/            Shared patching utilities (zero-fill, compact, relocs)
@@ -35,10 +50,14 @@ xstrip.sh           Host-side wrapper (builds image, runs container)
 .env                Environment configuration (minimal for CLI tool)
 zscaler.crt         Corporate TLS proxy CA certificate
 tests/
-  test.sh           Integration test suite (127 tests, shell-based)
+  test.sh           Integration test suite (shell-based)
   hello.c           Test program with dead functions
   lib.c             Shared library test with dead internals
   arm-hello.c       ARM nostdlib test program (AArch64/ARM32)
+  riscv-hello.c     RISC-V nostdlib test program (RV64GC)
+  mips-hello.c      MIPS nostdlib test program (big-endian)
+  s390x-hello.c     s390x nostdlib test program
+  loongarch-hello.c LoongArch64 nostdlib test program
   tail-dead.c       Test for tail-position dead code removal
   big-dead.c        Test for large dead code physical shrinking
   dead-branch.c     Dead branch after noreturn call (exit)
@@ -121,7 +140,7 @@ This executes the integration tests that:
 1. Compile test executables with dead code (ELF dynamic, static, shared library)
 2. Cross-compile PE (Windows) EXE and DLL test binaries
 3. Cross-compile Mach-O object files (arm64-apple-macosx)
-4. Cross-compile AArch64 and ARM32 ELF binaries
+4. Cross-compile AArch64, ARM32, RISC-V, MIPS, s390x, and LoongArch64 ELF binaries
 5. Generate .NET managed assembly test fixture
 6. Verify dead code detection across all formats (no false positives)
 7. Verify in-place patched binaries execute correctly with expected output

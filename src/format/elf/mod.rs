@@ -144,8 +144,9 @@ pub fn reassemble_elf(
     let arch = detect_arch(data);
     if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
         let (fc, fs) = zero_fill(data, dead, sections);
-        let (bc, bs) =
-            zero_fill_blocks(data, dead_blocks, sections, arch);
+        let (bc, bs) = zero_fill_blocks(
+            data, dead_blocks, sections, arch,
+        );
         return (fc, fs, bc, bs);
     }
     let (ts, te) = match sections::text_bounds(sections) {
@@ -239,14 +240,30 @@ fn detect_arch(data: &[u8]) -> Arch {
     if data.len() < 20 {
         return Arch::X86_64;
     }
-    let e_machine = u16::from_le_bytes(
-        data[18..20].try_into().unwrap_or([0; 2]),
-    );
+    let is_be = data.len() > 5 && data[5] == 2;
+    let e_machine = if is_be {
+        u16::from_be_bytes(
+            data[18..20].try_into().unwrap_or([0; 2]),
+        )
+    } else {
+        u16::from_le_bytes(
+            data[18..20].try_into().unwrap_or([0; 2]),
+        )
+    };
+    let is64 = data.len() > 4 && data[4] == 2;
     match e_machine {
         0x3E => Arch::X86_64,
         0x03 => Arch::X86_32,
         0xB7 => Arch::Aarch64,
         0x28 => Arch::Arm32,
+        0xF3 => {
+            if is64 { Arch::RiscV64 } else { Arch::RiscV32 }
+        }
+        0x08 => {
+            if is64 { Arch::Mips64 } else { Arch::Mips32 }
+        }
+        0x16 => Arch::S390x,
+        0x102 => Arch::LoongArch64,
         _ => Arch::X86_64,
     }
 }

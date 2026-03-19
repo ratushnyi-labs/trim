@@ -119,6 +119,11 @@ fn analyze_format(
                 format::dotnet::analyze_dotnet(data);
             (f, d, s, HashMap::new())
         }
+        Some(format::Format::Wasm) => {
+            let (f, d, s) =
+                format::wasm::analyze_wasm(data);
+            (f, d, s, HashMap::new())
+        }
         None => (
             FuncMap::new(),
             HashMap::new(),
@@ -167,14 +172,32 @@ fn detect_elf_arch(data: &[u8]) -> types::Arch {
     if data.len() < 20 {
         return types::Arch::X86_64;
     }
-    let em = u16::from_le_bytes(
-        data[18..20].try_into().unwrap_or([0; 2]),
-    );
+    let is_be = data.len() > 5 && data[5] == 2;
+    let em = if is_be {
+        u16::from_be_bytes(
+            data[18..20].try_into().unwrap_or([0; 2]),
+        )
+    } else {
+        u16::from_le_bytes(
+            data[18..20].try_into().unwrap_or([0; 2]),
+        )
+    };
+    let is64 = data.len() > 4 && data[4] == 2;
     match em {
         0x3E => types::Arch::X86_64,
         0x03 => types::Arch::X86_32,
         0xB7 => types::Arch::Aarch64,
         0x28 => types::Arch::Arm32,
+        0xF3 => {
+            if is64 { types::Arch::RiscV64 }
+            else { types::Arch::RiscV32 }
+        }
+        0x08 => {
+            if is64 { types::Arch::Mips64 }
+            else { types::Arch::Mips32 }
+        }
+        0x16 => types::Arch::S390x,
+        0x102 => types::Arch::LoongArch64,
         _ => types::Arch::X86_64,
     }
 }
@@ -199,6 +222,7 @@ fn detect_pe_arch(data: &[u8]) -> types::Arch {
         0x014C => types::Arch::X86_32,
         0xAA64 => types::Arch::Aarch64,
         0x01C0 => types::Arch::Arm32,
+        0x5064 => types::Arch::RiscV64,
         _ => types::Arch::X86_64,
     }
 }
@@ -239,6 +263,9 @@ fn reassemble_format(
             format::dotnet::reassemble_dotnet(
                 data, dead, dead_blocks, sections,
             )
+        }
+        Some(format::Format::Wasm) => {
+            format::wasm::reassemble_wasm(data, dead)
         }
         None => (0, 0, 0, 0),
     }

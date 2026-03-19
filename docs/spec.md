@@ -21,9 +21,10 @@ x86_64 and aarch64 Linux.
 - **Dead code removal:** Finds and removes unreachable functions from
   compiled binaries, reducing attack surface and binary size.
 - **Multi-format:** Supports ELF (Linux), PE/COFF (Windows), Mach-O
-  (macOS), and .NET managed assemblies.
-- **Multi-architecture:** Analyzes x86-64, x86-32, AArch64, and ARM32
-  instruction sets across all supported formats.
+  (macOS), .NET managed assemblies, and WebAssembly modules.
+- **Multi-architecture:** Analyzes x86-64, x86-32, AArch64, ARM32,
+  RISC-V, MIPS, s390x, and LoongArch64 instruction sets across all
+  supported formats, plus WebAssembly function-level analysis.
 - **No source needed:** Works on any supported binary — no recompilation,
   no build system integration required.
 - **No host dependencies:** Available as a static binary or scratch Docker
@@ -252,10 +253,12 @@ CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/cffa_edfe).
 
 ### BR-003: Supported Formats
 
-The tool supports ELF (Linux), PE/COFF (Windows), Mach-O (macOS), and
-.NET managed assemblies. Architecture support includes x86-64, x86-32,
-AArch64, and ARM32 across all native formats. .NET uses IL-level
-analysis independent of CPU architecture.
+The tool supports ELF (Linux), PE/COFF (Windows), Mach-O (macOS),
+.NET managed assemblies, and WebAssembly modules. Architecture support
+includes x86-64, x86-32, AArch64, ARM32, RISC-V (RV32/RV64),
+MIPS (32/64, big/little-endian), s390x, and LoongArch64 across all
+native formats. .NET uses IL-level analysis independent of CPU
+architecture. WebAssembly uses function-level call graph analysis.
 
 ### BR-004: Independent File Processing
 

@@ -7,6 +7,12 @@ pub enum Arch {
     X86_32,
     Aarch64,
     Arm32,
+    RiscV64,
+    RiscV32,
+    Mips32,
+    Mips64,
+    S390x,
+    LoongArch64,
 }
 
 /// Byte order.

@@ -51,6 +51,13 @@ pub fn zero_fill_blocks(
 fn fill_byte(arch: Arch) -> u8 {
     match arch {
         Arch::X86_64 | Arch::X86_32 => 0xCC,
-        Arch::Aarch64 | Arch::Arm32 => 0x00,
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::RiscV64
+        | Arch::RiscV32
+        | Arch::Mips32
+        | Arch::Mips64
+        | Arch::S390x
+        | Arch::LoongArch64 => 0x00,
     }
 }

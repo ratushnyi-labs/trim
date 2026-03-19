@@ -42,6 +42,8 @@ pub static RUNTIME_KEEP: LazyLock<HashSet<&'static str>> =
             "wmainCRTStartup",
             "__main",
             "__security_init_cookie",
+            // MIPS entry point
+            "__start",
             // ARM runtime symbols
             "__aeabi_unwind_cpp_pr0",
             "__aeabi_unwind_cpp_pr1",

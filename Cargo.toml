@@ -10,6 +10,7 @@ goblin = { version = "0.10", default-features = false, features = ["elf64", "elf
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 memmap2 = "0.9"
 anyhow = "1"
+wasmparser = "0.245"
 
 [profile.release]
 opt-level = "z"
