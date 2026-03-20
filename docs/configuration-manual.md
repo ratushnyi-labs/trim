@@ -121,5 +121,5 @@ production. The test runtime stage is Alpine 3.23 with additional packages:
 | lld19           | LLVM linker for clang19                    |
 | llvm19          | llvm-strip for pre-stripped tests           |
 | mingw-w64-gcc   | Cross-compile Windows PE binaries          |
-| python3         | Generate .NET test assembly fixture        |
+| python3         | Generate .NET and Java test fixtures       |
 | file            | Detect binary format in tests              |

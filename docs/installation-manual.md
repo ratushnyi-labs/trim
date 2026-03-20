@@ -95,13 +95,14 @@ docker compose run --rm strip -i /work/myapp
 
 ## Supported Formats
 
-| Format    | Analyze | Patch  | Architectures       | Notes                          |
-|-----------|---------|--------|----------------------|--------------------------------|
-| ELF       | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32, RISC-V, MIPS, s390x, LoongArch64 | Compact+shrink for x86, zero-fill for others |
-| PE/COFF   | Yes     | Yes    | x86-64, x86-32, AArch64, ARM32 | Zero-fill patching             |
-| Mach-O    | Yes     | Yes    | x86-64, AArch64, ARM32 | Zero-fill patching             |
-| .NET      | Yes     | Yes    | IL (arch-independent) | IL-level dead method detection |
-| WebAssembly | Yes   | Yes    | Wasm                 | Function-level call graph analysis |
+| Format      | Analyze | Patch | Architectures       | Notes                          |
+|-------------|---------|-------|----------------------|--------------------------------|
+| ELF         | Yes     | Yes   | x86-64, x86-32, AArch64, ARM32, RISC-V, MIPS, s390x, LoongArch64 | Physical compaction + offset patching |
+| PE/COFF     | Yes     | Yes   | x86-64, x86-32, AArch64, ARM32 | Physical compaction + metadata patching |
+| Mach-O      | Yes     | Yes   | x86-64, AArch64, ARM32 | Physical compaction + load command patching |
+| .NET        | Yes     | Yes   | IL (arch-independent) | IL dead method compaction via PE pipeline |
+| WebAssembly | Yes     | Yes   | Wasm                 | Code section rebuild, function-level analysis |
+| Java .class | Yes     | Yes   | JVM bytecode         | Dead method removal, bytecode call graph |
 
 ## Output
 
@@ -142,7 +143,7 @@ Patch mode removes dead code and reports freed bytes:
 - **"not found":** The file path does not exist or is not a regular file.
 - **"not writable":** The file is read-only; `chmod u+w` to fix.
 - **"skipped":** The file is not a recognized binary format (ELF, PE,
-  Mach-O, .NET) or has no functions to analyze.
+  Mach-O, .NET, Wasm, Java .class) or has no functions to analyze.
 
 ## Reverse Proxy Support
 
