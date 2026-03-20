@@ -1,4 +1,76 @@
 use crate::format::dotnet::metadata::read_u32;
+use crate::patch::relocs::total_shift;
+
+fn write_u32(data: &mut [u8], off: usize, val: u32) {
+    if off + 4 <= data.len() {
+        data[off..off + 4]
+            .copy_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// Shift MethodDef RVAs to account for compacted dead intervals.
+pub fn patch_method_rvas(
+    data: &mut [u8],
+    table_off: usize,
+    row_size: usize,
+    count: usize,
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+) {
+    for i in 0..count {
+        let off = table_off + i * row_size;
+        if off + 4 > data.len() {
+            break;
+        }
+        let rva = read_u32(data, off);
+        if rva == 0 {
+            continue;
+        }
+        let shift =
+            total_shift(rva as u64, intervals, ts, te);
+        if shift > 0 {
+            write_u32(
+                data,
+                off,
+                (rva as u64 - shift) as u32,
+            );
+        }
+    }
+}
+
+/// Shift CLI header RVA fields after compaction.
+pub fn patch_cli_rvas(
+    data: &mut [u8],
+    cli_offset: usize,
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+) {
+    // CLI header RVA fields: metadata(+8), resources(+24),
+    // strong_name(+32), code_manager(+40), vtable(+48),
+    // export_addr(+56), native_header(+64)
+    let rva_fields = [8, 24, 32, 40, 48, 56, 64];
+    for &field_off in &rva_fields {
+        let off = cli_offset + field_off;
+        if off + 4 > data.len() {
+            break;
+        }
+        let rva = read_u32(data, off);
+        if rva == 0 {
+            continue;
+        }
+        let shift =
+            total_shift(rva as u64, intervals, ts, te);
+        if shift > 0 {
+            write_u32(
+                data,
+                off,
+                (rva as u64 - shift) as u32,
+            );
+        }
+    }
+}
 
 /// Zero dead IL method bodies, replacing with `ret`.
 /// Returns (count_patched, bytes_saved).

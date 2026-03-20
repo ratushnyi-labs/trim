@@ -59,6 +59,10 @@ python3 /tests/gen_dotnet.py > /work/hello-dotnet.exe
 printf 'Built: hello-dotnet.exe (%d bytes, .NET)\n' \
     "$(stat -c%s /work/hello-dotnet.exe)"
 
+python3 /tests/gen_java.py > /work/hello-java.class
+printf 'Built: hello-java.class (%d bytes, Java)\n' \
+    "$(stat -c%s /work/hello-java.class)"
+
 clang-19 --target=aarch64-linux-gnu -nostdlib -static -g -O0 \
     -fno-inline -fuse-ld=lld -o /work/hello-aarch64 \
     /tests/arm-hello.c 2>/dev/null
@@ -1354,6 +1358,72 @@ echo "$file_info" | grep -q 'WebAssembly\|wasm' && \
 echo "$patch_out_wasm" | grep -q 'dead branches removed' && \
     pass "Wasm: dead branch compaction reported" || \
     fail "Wasm: dead branch compaction" "not reported"
+
+# Wasm physical shrink: file must not grow (dead func body is already
+# minimal at 2 bytes, so strict shrinkage only happens with larger bodies)
+[ "$new_sz_wasm" -le "$orig_sz_wasm" ] && \
+    pass "Wasm: physical compaction (no growth)" || \
+    fail "Wasm: physical compaction" "size $new_sz_wasm > $orig_sz_wasm"
+
+# =============================================
+# Dead code detection: Java .class
+# =============================================
+printf '\n--- Dead code detection: Java .class ---\n'
+output=$(xstrip --dry-run /work/hello-java.class 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'analyzing:' && \
+    pass "Java: analysis completed" || \
+    fail "Java: analysis" "not completed"
+
+echo "$output" | grep -q 'functions' && \
+    pass "Java: functions discovered" || \
+    fail "Java: functions" "none found"
+
+echo "$output" | grep -q 'deadMethod1' && \
+    pass "Java: detected deadMethod1" || \
+    fail "Java: deadMethod1" "not found"
+
+echo "$output" | grep -q 'deadMethod2' && \
+    pass "Java: detected deadMethod2" || \
+    fail "Java: deadMethod2" "not found"
+
+echo "$output" | grep -q '    main:' && \
+    fail "Java: false positive" "main flagged as dead" || \
+    pass "Java: main correctly kept"
+
+echo "$output" | grep -q '    liveHelper:' && \
+    fail "Java: false positive" "liveHelper flagged" || \
+    pass "Java: liveHelper correctly kept"
+
+echo "$output" | grep -q '    <init>:' && \
+    fail "Java: false positive" "<init> flagged" || \
+    pass "Java: <init> correctly kept"
+
+# =============================================
+# Patching: Java .class
+# =============================================
+printf '\n--- Patching: Java .class ---\n'
+cp /work/hello-java.class /work/test-java-patch.class
+orig_sz_java=$(stat -c%s /work/test-java-patch.class)
+patch_out_java=$(xstrip --in-place /work/test-java-patch.class 2>&1)
+echo "$patch_out_java"
+new_sz_java=$(stat -c%s /work/test-java-patch.class)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_java" "$new_sz_java"
+
+[ "$new_sz_java" -lt "$orig_sz_java" ] && \
+    pass "Java: file physically shrunk" || \
+    fail "Java: physical shrink" "size $new_sz_java >= $orig_sz_java"
+
+echo "$patch_out_java" | grep -q 'dead functions removed' && \
+    pass "Java: compaction reported" || \
+    fail "Java: compaction" "not reported"
+
+# Verify the patched class file still has CAFEBABE magic
+head_bytes=$(xxd -l 4 -p /work/test-java-patch.class)
+[ "$head_bytes" = "cafebabe" ] && \
+    pass "Java: patched file has valid magic" || \
+    fail "Java: magic" "got: $head_bytes"
 
 # =============================================
 # Cleanup

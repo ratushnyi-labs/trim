@@ -4,6 +4,8 @@ pub mod patch;
 pub mod tables;
 
 use crate::analysis::cfg::DeadBlock;
+use crate::patch::compact::compact_text;
+use crate::patch::relocs::dead_intervals;
 use crate::types::{FuncInfo, FuncMap, Section};
 use std::collections::{HashMap, HashSet};
 
@@ -272,13 +274,15 @@ fn pe_rva_to_offset(
     None
 }
 
-/// Reassemble .NET assembly: zero dead IL methods.
+/// Reassemble .NET assembly: zero dead methods, nop-fill dead
+/// blocks, then physically compact by removing dead method bodies.
 pub fn reassemble_dotnet(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
-    _dead_blocks: &[DeadBlock],
+    dead_blocks: &[DeadBlock],
     _sections: &[Section],
 ) -> (usize, u64, usize, u64) {
+    // Step 1: Zero dead method bodies (ret + zeros)
     let dead_rvas: Vec<(u32, String)> = dead
         .iter()
         .map(|(n, &(a, _))| (a as u32, n.clone()))
@@ -287,9 +291,140 @@ pub fn reassemble_dotnet(
     let rva_fn = |rva: u32| -> Option<usize> {
         pe_rva_to_offset(&orig, rva)
     };
-    let (fc, fs) =
+    let (fc, _) =
         patch::zero_dead_methods(data, &dead_rvas, &rva_fn);
-    (fc, fs, 0, 0)
+    // Step 2: Nop-fill dead blocks (dead branches in live methods)
+    let mut blk_count = 0;
+    let mut blk_saved = 0u64;
+    for db in dead_blocks {
+        if let Some(off) =
+            pe_rva_to_offset(data, db.addr as u32)
+        {
+            let sz = db.size as usize;
+            if off + sz <= data.len() {
+                for b in &mut data[off..off + sz] {
+                    *b = 0x00;
+                }
+                blk_count += 1;
+                blk_saved += db.size;
+            }
+        }
+    }
+    if dead.is_empty() {
+        return (0, 0, blk_count, blk_saved);
+    }
+    // Step 3: Build dead intervals (functions only, not blocks)
+    let sections = dotnet_sections(data);
+    let text = match sections
+        .iter()
+        .find(|s| s.name == ".text")
+    {
+        Some(s) => s,
+        None => return (fc, 0, blk_count, blk_saved),
+    };
+    let ts = text.vaddr;
+    let te = text.vaddr + text.size;
+    let intervals = dead_intervals(dead);
+    if intervals.is_empty() {
+        return (fc, 0, blk_count, blk_saved);
+    }
+    // Step 4: Patch .NET metadata RVAs
+    if let Some(info) = parse_for_reassembly(data) {
+        patch::patch_method_rvas(
+            data,
+            info.method_table_off,
+            info.method_row_size,
+            info.method_count,
+            &intervals,
+            ts,
+            te,
+        );
+        patch::patch_cli_rvas(
+            data, info.cli_offset, &intervals, ts, te,
+        );
+    }
+    // Step 5: Patch PE headers
+    crate::format::pe::patch::patch_entry_point(
+        data, &intervals, ts, te,
+    );
+    crate::format::pe::patch::patch_section_headers(
+        data, &sections, &intervals, ts, te,
+    );
+    // Step 6: Physical compaction
+    let saved = compact_text(data, &sections, &intervals);
+    (fc, saved, blk_count, blk_saved)
+}
+
+struct ReassemblyInfo {
+    cli_offset: usize,
+    method_table_off: usize,
+    method_row_size: usize,
+    method_count: usize,
+}
+
+fn parse_for_reassembly(
+    data: &[u8],
+) -> Option<ReassemblyInfo> {
+    let cli_off = metadata::cli_header_offset(data)?;
+    let cli =
+        metadata::parse_cli_header(data, cli_off)?;
+    let md_off =
+        pe_rva_to_offset(data, cli.metadata_rva)?;
+    let root =
+        metadata::parse_metadata_root(data, md_off)?;
+    let ts =
+        tables::parse_table_stream(data, &root)?;
+    let (off, rsz, count) =
+        tables::method_def_table_info(data, &ts);
+    Some(ReassemblyInfo {
+        cli_offset: cli_off,
+        method_table_off: off,
+        method_row_size: rsz,
+        method_count: count,
+    })
+}
+
+/// Parse PE section headers from a .NET assembly.
+fn dotnet_sections(data: &[u8]) -> Vec<Section> {
+    if data.len() < 0x3C + 4 {
+        return Vec::new();
+    }
+    let pe_off =
+        metadata::read_u32(data, 0x3C) as usize;
+    let coff_off = pe_off + 4;
+    if coff_off + 20 > data.len() {
+        return Vec::new();
+    }
+    let num =
+        metadata::read_u16(data, coff_off + 2) as usize;
+    let opt_sz =
+        metadata::read_u16(data, coff_off + 16) as usize;
+    let sec_off = coff_off + 20 + opt_sz;
+    let mut sections = Vec::new();
+    for i in 0..num {
+        let s = sec_off + i * 40;
+        if s + 40 > data.len() {
+            break;
+        }
+        let nb = &data[s..s + 8];
+        let ne = nb
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(8);
+        let name =
+            String::from_utf8_lossy(&nb[..ne]).to_string();
+        sections.push(Section {
+            name,
+            vaddr: metadata::read_u32(data, s + 12)
+                as u64,
+            size: metadata::read_u32(data, s + 8)
+                as u64,
+            offset: metadata::read_u32(data, s + 20)
+                as u64,
+            align: 1,
+        });
+    }
+    sections
 }
 
 fn empty()

@@ -1,5 +1,6 @@
 pub mod dotnet;
 pub mod elf;
+pub mod java;
 pub mod macho;
 pub mod pe;
 pub mod wasm;
@@ -12,6 +13,7 @@ pub enum Format {
     MachO,
     Dotnet,
     Wasm,
+    Java,
 }
 
 /// Detect binary format from magic bytes.
@@ -31,7 +33,17 @@ pub fn detect_format(data: &[u8]) -> Option<Format> {
     if data.len() >= 4 && is_wasm_magic(data) {
         return Some(Format::Wasm);
     }
+    if data.len() >= 4 && is_java_magic(data) {
+        return Some(Format::Java);
+    }
     None
+}
+
+fn is_java_magic(data: &[u8]) -> bool {
+    data[0] == 0xCA
+        && data[1] == 0xFE
+        && data[2] == 0xBA
+        && data[3] == 0xBE
 }
 
 fn is_macho_magic(data: &[u8]) -> bool {

@@ -5,13 +5,13 @@
 ## 1. What the System Does
 
 xstrip is a dead code analyzer and remover for compiled binaries. It
-supports ELF, PE/COFF, Mach-O, .NET managed assemblies, and WebAssembly
-modules. It finds unreachable functions using address-based call graph
-analysis (or IL call graph for .NET / Wasm call graph), patches dead code,
-and physically shrinks ELF, PE, and Mach-O binaries by removing dead code
-regions, patching instruction offsets, and updating format metadata. It
-works directly on compiled binaries — no source code or recompilation
-needed.
+supports ELF, PE/COFF, Mach-O, .NET managed assemblies, WebAssembly
+modules, and Java .class files. It finds unreachable functions using
+address-based call graph analysis (or IL call graph for .NET / Wasm call
+graph / bytecode call graph for Java), patches dead code, and physically
+shrinks binaries by removing dead code regions, patching instruction
+offsets, and updating format metadata. It works directly on compiled
+binaries — no source code or recompilation needed.
 
 xstrip is a static musl binary (Rust) with zero runtime dependencies,
 distributed as a scratch-based Docker image or standalone binary for
@@ -22,7 +22,8 @@ x86_64 and aarch64 Linux.
 - **Dead code removal:** Finds and removes unreachable functions from
   compiled binaries, reducing attack surface and binary size.
 - **Multi-format:** Supports ELF (Linux), PE/COFF (Windows), Mach-O
-  (macOS), .NET managed assemblies, and WebAssembly modules.
+  (macOS), .NET managed assemblies, WebAssembly modules, and Java
+  .class files.
 - **Multi-architecture:** Analyzes x86-64, x86-32, AArch64, ARM32,
   RISC-V, MIPS, s390x, and LoongArch64 instruction sets across all
   supported formats, plus WebAssembly function-level analysis.
@@ -250,16 +251,18 @@ an output file or stdout. In-place modification requires the explicit
 
 xstrip auto-detects the binary format from magic bytes. No format flag
 is needed from the user. Detection order: ELF (`\x7fELF`), .NET (MZ +
-CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/cffa_edfe).
+CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/
+cffa_edfe), Wasm (`\x00asm`), Java (`0xCAFEBABE`).
 
 ### BR-003: Supported Formats
 
 The tool supports ELF (Linux), PE/COFF (Windows), Mach-O (macOS),
-.NET managed assemblies, and WebAssembly modules. Architecture support
-includes x86-64, x86-32, AArch64, ARM32, RISC-V (RV32/RV64),
-MIPS (32/64, big/little-endian), s390x, and LoongArch64 across all
-native formats. .NET uses IL-level analysis independent of CPU
-architecture. WebAssembly uses function-level call graph analysis.
+.NET managed assemblies, WebAssembly modules, and Java .class files.
+Architecture support includes x86-64, x86-32, AArch64, ARM32, RISC-V
+(RV32/RV64), MIPS (32/64, big/little-endian), s390x, and LoongArch64
+across all native formats. .NET uses IL-level analysis independent of
+CPU architecture. WebAssembly uses function-level call graph analysis.
+Java uses bytecode call graph analysis (invoke* opcodes).
 
 ### BR-004: Independent File Processing
 
@@ -319,7 +322,7 @@ dead code from the .text section and patches all affected metadata:
 Per-architecture instruction offset patching handles branch/call
 recalculation for all supported architectures.
 
-### BR-009: Wasm & .NET Dead Branch Detection (SDD-013)
+### BR-009: Wasm, .NET & Java Dead Branch Detection (SDD-013, SDD-014)
 
 In addition to dead function detection, xstrip detects dead branches
 within live function/method bodies for bytecode formats:
@@ -331,6 +334,28 @@ within live function/method bodies for bytecode formats:
 - **.NET IL:** Detects unreachable code after `throw` (0x7A), `ret`
   (0x2A), unconditional `br` (0x38/0x2B), and `rethrow` (0xFE 0x1A)
   until the next branch target.
+- **Java:** Detects unreachable code after `ireturn` (0xAC), `lreturn`
+  (0xAD), `freturn` (0xAE), `dreturn` (0xAF), `areturn` (0xB0),
+  `return` (0xB1), `athrow` (0xBF), `goto` (0xA7), and `goto_w`
+  (0xC8) until the next branch target. Dead regions are nop-filled
+  (0x00) during reassembly.
+
+### BR-010: Wasm, .NET & Java Physical Compaction (SDD-014)
+
+All binary formats are physically compacted, not just native formats:
+
+- **WebAssembly:** The Code section is rebuilt with dead function bodies
+  replaced by minimal 3-byte stubs (`unreachable` + `end`). Function
+  indices are preserved (required by Wasm call semantics). Dead branches
+  within live functions are nop-filled but not physically removed.
+- **.NET:** Dead method bodies are converted to dead intervals and
+  compacted via the PE compaction pipeline (`compact_text`). MethodDef
+  RVAs, CLI header RVAs, section headers, and PE metadata are patched.
+  Dead branches within live methods are nop-filled (IL branch offsets
+  cannot be physically removed without rewriting all targets).
+- **Java:** Dead methods are physically removed from the .class file by
+  rebuilding the methods table without them and updating `methods_count`.
+  Dead branches within live methods are nop-filled (0x00).
 
 ---
 
@@ -349,15 +374,17 @@ within live function/method bodies for bytecode formats:
    - Two positional args → stream mode: write to output file (UC-001)
 5. Read input data (file or stdin)
 6. Analyze:
-   a. Detect format (ELF/PE/Mach-O/.NET) from magic bytes
+   a. Detect format (ELF/PE/Mach-O/.NET/Wasm/Java) from magic bytes
    b. Parse headers and symbol tables
    c. Decode instructions (x86/ARM) or IL (.NET)
    d. Build call graph from branch/call targets or IL opcodes
    e. BFS reachability from roots (entry, globals, data refs)
    f. Report dead functions found (to stderr)
 7. If `--dry-run`: exit 0 (no binary output)
-8. Patch dead code (ELF/PE/Mach-O: compact + update metadata;
-   Wasm/dotnet: zero-fill dead functions + nop dead branches)
+8. Patch dead code (all formats: compact dead code + update metadata;
+   ELF/PE/Mach-O: remove dead regions + patch offsets; Wasm: rebuild
+   Code section; .NET: compact via PE pipeline; Java: rebuild methods
+   table)
 9. Write output:
    - In-place mode: overwrite each file
    - Stream mode: write to output file or stdout

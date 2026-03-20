@@ -98,6 +98,11 @@ fn find_format_dead_blocks(
         Some(format::Format::Dotnet) => {
             find_dotnet_dead_blocks(data, dead_funcs)
         }
+        Some(format::Format::Java) => {
+            format::java::find_java_dead_blocks(
+                data, dead_funcs,
+            )
+        }
         _ => Vec::new(),
     }
 }
@@ -219,6 +224,11 @@ fn analyze_format(
         Some(format::Format::Wasm) => {
             let (f, d, s) =
                 format::wasm::analyze_wasm(data);
+            (f, d, s, HashMap::new())
+        }
+        Some(format::Format::Java) => {
+            let (f, d, s) =
+                format::java::analyze_java(data);
             (f, d, s, HashMap::new())
         }
         None => (
@@ -370,6 +380,11 @@ fn reassemble_format(
         }
         Some(format::Format::Wasm) => {
             format::wasm::reassemble_wasm(
+                data, dead, dead_blocks,
+            )
+        }
+        Some(format::Format::Java) => {
+            format::java::reassemble_java(
                 data, dead, dead_blocks,
             )
         }

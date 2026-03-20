@@ -36,6 +36,7 @@ src/                Rust source code
     macho/          Mach-O analysis, sections, symbols
     dotnet/         .NET IL metadata parsing, call graph, patching
     wasm/           WebAssembly function-level analysis (wasmparser)
+    java/           Java .class file parser, bytecode call graph
   analysis/         Format-agnostic reachability analysis
   decode/           Instruction decoding, call graph, function inference
   patch/            Shared patching utilities (zero-fill, compact, relocs)
@@ -63,6 +64,7 @@ tests/
   dead-branch.c     Dead branch after noreturn call (exit)
   combined-dead.c   Combined dead functions + dead branches
   gen_dotnet.py     Generator for minimal .NET test assembly
+  gen_java.py       Generator for minimal Java .class test file
 docs/
   spec.md           Business specification
   rules.md          Development rules
@@ -142,15 +144,16 @@ This executes the integration tests that:
 3. Cross-compile Mach-O object files (arm64-apple-macosx)
 4. Cross-compile AArch64, ARM32, RISC-V, MIPS, s390x, and LoongArch64 ELF binaries
 5. Generate .NET managed assembly test fixture
-6. Verify dead code detection across all formats (no false positives)
-7. Verify in-place patched binaries execute correctly with expected output
-8. Verify physical file size reduction for large dead code (x86 ELF)
-9. Verify already-stripped binaries are handled correctly
-10. Test error handling (missing files, non-writable, no args)
-11. Test security scenarios (path traversal, symlinks, corrupted files)
-12. Verify stream mode (input → output file, input → stdout)
-13. Verify pipe mode (stdin → stdout)
-14. Verify dry-run over pipe (stdin analysis)
+6. Generate Java .class file test fixture (gen_java.py)
+7. Verify dead code detection across all formats (no false positives)
+8. Verify in-place patched binaries execute correctly with expected output
+9. Verify physical file size reduction for large dead code (x86 ELF)
+10. Verify already-stripped binaries are handled correctly
+11. Test error handling (missing files, non-writable, no args)
+12. Test security scenarios (path traversal, symlinks, corrupted files)
+13. Verify stream mode (input → output file, input → stdout)
+14. Verify pipe mode (stdin → stdout)
+15. Verify dry-run over pipe (stdin analysis)
 
 ### Test program design
 
@@ -166,6 +169,9 @@ Test C files contain intentional dead code patterns:
 - `big-dead.c` — 30 large dead functions (>7KB) to test physical shrinking
 - `gen_dotnet.py` — generates minimal .NET PE assembly with Main,
   LiveHelper (live), DeadMethod1, DeadMethod2 (dead)
+- `gen_java.py` — generates minimal Java .class file (version 52/Java 8)
+  with `<init>`, main, liveHelper (live), deadMethod1, deadMethod2 (dead);
+  call graph uses invokestatic for liveHelper, invokespecial for super init
 
 ## Quick manual test
 

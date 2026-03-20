@@ -312,6 +312,20 @@ fn member_ref_parent_sz(counts: &[u32; 64]) -> usize {
     if coded_idx_wide(&tables, counts) { 4 } else { 2 }
 }
 
+/// Return (first_row_file_offset, row_size, count) for MethodDef.
+pub fn method_def_table_info(
+    data: &[u8],
+    ts: &TableStream,
+) -> (usize, usize, usize) {
+    let count = ts.row_counts[TID_METHODDEF] as usize;
+    let sw = (ts.heap_sizes & 0x01) != 0;
+    let bw = (ts.heap_sizes & 0x04) != 0;
+    let pw = ts.row_counts[0x08] > 0xFFFF;
+    let rsz = method_def_row_size(sw, bw, pw);
+    let off = table_offset(data, ts, TID_METHODDEF);
+    (off, rsz, count)
+}
+
 fn read_u64(data: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(
         data[off..off + 8].try_into().unwrap_or([0; 8]),
