@@ -20,37 +20,24 @@ pub fn analyze_wasm(
 }
 
 /// Physically compact dead Wasm functions to minimal bodies and
-/// nop-fill dead blocks within live functions.
+/// physically remove dead blocks within live functions.
 /// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_wasm(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
     dead_blocks: &[DeadBlock],
 ) -> (usize, u64, usize, u64) {
-    // Step 1: Nop-fill dead branches within live functions (before compaction)
-    let mut blk_count = 0;
-    let mut blk_saved = 0u64;
-    for db in dead_blocks {
-        let off = db.addr as usize;
-        let sz = db.size as usize;
-        if off + sz <= data.len() && sz >= 1 {
-            for b in &mut data[off..off + sz] {
-                *b = 0x01; // Wasm nop
-            }
-            blk_count += 1;
-            blk_saved += db.size;
-        }
-    }
-    let count = dead.len();
-    if count == 0 {
-        return (0, 0, blk_count, blk_saved);
-    }
-    // Step 2: Physical compaction — rebuild Code section
+    let blk_count = dead_blocks.len();
+    let blk_saved: u64 =
+        dead_blocks.iter().map(|b| b.size).sum();
     let (code_start, code_end) =
         match parse_code_section_bounds(data) {
             Some(b) => b,
-            None => return (0, 0, blk_count, blk_saved),
+            None => return (0, 0, 0, 0),
         };
+    // Build per-function dead block ranges (absolute offsets)
+    let block_ranges =
+        build_block_ranges(data, code_start, code_end, dead_blocks);
     let dead_offsets: HashSet<usize> =
         dead.values().map(|&(off, _)| off as usize).collect();
     let new_code = rebuild_code_section(
@@ -58,18 +45,72 @@ pub fn reassemble_wasm(
         code_start,
         code_end,
         &dead_offsets,
+        &block_ranges,
     );
     let saved = (code_end - code_start)
         .saturating_sub(new_code.len()) as u64;
     // Reconstruct module: [before_code][new_code][after_code]
-    let mut new_data =
-        Vec::with_capacity(code_start + new_code.len() + data.len() - code_end);
+    let mut new_data = Vec::with_capacity(
+        code_start + new_code.len() + data.len() - code_end,
+    );
     new_data.extend_from_slice(&data[..code_start]);
     new_data.extend_from_slice(&new_code);
     new_data.extend_from_slice(&data[code_end..]);
     data.clear();
     data.extend_from_slice(&new_data);
+    let count = dead.len();
     (count, saved, blk_count, blk_saved)
+}
+
+/// Map dead blocks to their containing function bodies.
+/// Returns a map: body_content_start → sorted Vec<(abs_start, abs_end)>.
+fn build_block_ranges(
+    data: &[u8],
+    code_start: usize,
+    _code_end: usize,
+    dead_blocks: &[DeadBlock],
+) -> HashMap<usize, Vec<(usize, usize)>> {
+    if dead_blocks.is_empty() {
+        return HashMap::new();
+    }
+    // Walk functions in Code section to get body ranges
+    let mut funcs: Vec<(usize, usize)> = Vec::new(); // (body_content_start, body_end)
+    let mut pos = code_start + 1; // skip 0x0A
+    let (_section_size, new_pos) =
+        read_leb128_u32(data, pos);
+    pos = new_pos;
+    let (num_funcs, new_pos) =
+        read_leb128_u32(data, pos);
+    pos = new_pos;
+    for _ in 0..num_funcs {
+        let (body_size, body_content_start) =
+            read_leb128_u32(data, pos);
+        let body_end =
+            body_content_start + body_size as usize;
+        funcs.push((body_content_start, body_end));
+        pos = body_end;
+    }
+    // Assign each dead block to the function it falls in
+    let mut result: HashMap<usize, Vec<(usize, usize)>> =
+        HashMap::new();
+    for db in dead_blocks {
+        let db_start = db.addr as usize;
+        let db_end = db_start + db.size as usize;
+        for &(bcs, be) in &funcs {
+            if db_start >= bcs && db_end <= be {
+                result
+                    .entry(bcs)
+                    .or_default()
+                    .push((db_start, db_end));
+                break;
+            }
+        }
+    }
+    // Sort each function's dead ranges
+    for ranges in result.values_mut() {
+        ranges.sort_by_key(|&(s, _)| s);
+    }
+    result
 }
 
 struct WasmModule {
@@ -572,15 +613,16 @@ fn parse_code_section_bounds(
     None
 }
 
-/// Rebuild the Code section with dead functions replaced by minimal
-/// 3-byte bodies (0 locals + unreachable + end).
+/// Rebuild the Code section: dead functions get minimal bodies,
+/// live functions with dead blocks get compacted bodies.
 fn rebuild_code_section(
     data: &[u8],
     code_start: usize,
     code_end: usize,
     dead_offsets: &HashSet<usize>,
+    block_ranges: &HashMap<usize, Vec<(usize, usize)>>,
 ) -> Vec<u8> {
-    let mut pos = code_start + 1; // skip section ID (0x0A)
+    let mut pos = code_start + 1; // skip 0x0A
     let (_section_size, new_pos) =
         read_leb128_u32(data, pos);
     pos = new_pos;
@@ -590,39 +632,86 @@ fn rebuild_code_section(
     let mut bodies = Vec::new();
     for _ in 0..num_functions {
         let entry_start = pos;
-        let (body_size, body_content_start) =
+        let (body_size, bcs) =
             read_leb128_u32(data, pos);
-        let entry_end =
-            body_content_start + body_size as usize;
-        if dead_offsets.contains(&body_content_start) {
-            let orig_entry_size = entry_end - entry_start;
-            if orig_entry_size <= 4 {
-                // Original is already tiny; keep it to
-                // avoid growing the file.
-                bodies.extend_from_slice(
-                    &data[entry_start..entry_end.min(code_end)],
-                );
-            } else {
-                // Minimal body: size=3, 0 locals, unreachable, end
-                bodies.extend_from_slice(&[
-                    0x03, 0x00, 0x00, 0x0B,
-                ]);
-            }
+        let entry_end = bcs + body_size as usize;
+        if dead_offsets.contains(&bcs) {
+            emit_dead_func(
+                &mut bodies, data, entry_start,
+                entry_end, code_end,
+            );
+        } else if let Some(ranges) = block_ranges.get(&bcs)
+        {
+            // Live function with dead blocks: compact
+            let body = &data[bcs..entry_end.min(code_end)];
+            let compacted = excise_ranges(body, bcs, ranges);
+            let size_leb =
+                write_leb128_u32(compacted.len() as u32);
+            bodies.extend_from_slice(&size_leb);
+            bodies.extend_from_slice(&compacted);
         } else {
-            // Copy original entry verbatim (body_size LEB + body)
-            let src = if entry_end <= code_end {
-                &data[entry_start..entry_end]
-            } else {
-                &data[entry_start..code_end]
-            };
-            bodies.extend_from_slice(src);
+            // Live function, no dead blocks: copy verbatim
+            let end = entry_end.min(code_end);
+            bodies.extend_from_slice(
+                &data[entry_start..end],
+            );
         }
         pos = entry_end;
     }
-    // Wrap: 0x0A + section_size LEB + num_functions LEB + bodies
+    wrap_code_section(num_functions, &bodies)
+}
+
+fn emit_dead_func(
+    bodies: &mut Vec<u8>,
+    data: &[u8],
+    entry_start: usize,
+    entry_end: usize,
+    code_end: usize,
+) {
+    let orig_size = entry_end - entry_start;
+    if orig_size <= 4 {
+        bodies.extend_from_slice(
+            &data[entry_start..entry_end.min(code_end)],
+        );
+    } else {
+        // Minimal body: size=3, 0 locals, unreachable, end
+        bodies.extend_from_slice(&[
+            0x03, 0x00, 0x00, 0x0B,
+        ]);
+    }
+}
+
+/// Remove dead ranges from a function body.
+/// `ranges` are absolute offsets; `base` is body start.
+fn excise_ranges(
+    body: &[u8],
+    base: usize,
+    ranges: &[(usize, usize)],
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(body.len());
+    let mut pos = 0usize;
+    for &(abs_start, abs_end) in ranges {
+        let rel_start = abs_start.saturating_sub(base);
+        let rel_end = abs_end.saturating_sub(base);
+        if rel_start > pos && rel_start <= body.len() {
+            result.extend_from_slice(
+                &body[pos..rel_start],
+            );
+        }
+        pos = rel_end;
+    }
+    if pos < body.len() {
+        result.extend_from_slice(&body[pos..]);
+    }
+    result
+}
+
+fn wrap_code_section(
+    num_functions: u32,
+    bodies: &[u8],
+) -> Vec<u8> {
     let num_funcs_leb = write_leb128_u32(num_functions);
-    let content_size =
-        num_funcs_leb.len() + bodies.len();
+    let content_size = num_funcs_leb.len() + bodies.len();
     let section_size_leb =
         write_leb128_u32(content_size as u32);
     let mut section = Vec::with_capacity(
@@ -631,7 +720,7 @@ fn rebuild_code_section(
     section.push(0x0A);
     section.extend_from_slice(&section_size_leb);
     section.extend_from_slice(&num_funcs_leb);
-    section.extend_from_slice(&bodies);
+    section.extend_from_slice(bodies);
     section
 }
 

@@ -1359,11 +1359,11 @@ echo "$patch_out_wasm" | grep -q 'dead branches removed' && \
     pass "Wasm: dead branch compaction reported" || \
     fail "Wasm: dead branch compaction" "not reported"
 
-# Wasm physical shrink: file must not grow (dead func body is already
-# minimal at 2 bytes, so strict shrinkage only happens with larger bodies)
-[ "$new_sz_wasm" -le "$orig_sz_wasm" ] && \
-    pass "Wasm: physical compaction (no growth)" || \
-    fail "Wasm: physical compaction" "size $new_sz_wasm > $orig_sz_wasm"
+# Wasm physical shrink: file must be strictly smaller (dead branches
+# are physically removed from live function bodies)
+[ "$new_sz_wasm" -lt "$orig_sz_wasm" ] && \
+    pass "Wasm: file physically shrunk" || \
+    fail "Wasm: physical shrink" "size $new_sz_wasm >= $orig_sz_wasm"
 
 # =============================================
 # Dead code detection: Java .class

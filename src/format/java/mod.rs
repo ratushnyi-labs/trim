@@ -33,24 +33,34 @@ pub fn reassemble_java(
         Some(c) => c,
         None => return (0, 0, 0, 0),
     };
-    // Step 1: Nop-fill dead branches in live methods
-    let mut blk_count = 0;
-    let mut blk_saved = 0u64;
+    // Step 1: Group dead blocks by method (file-offset based)
+    let blk_count = dead_blocks.len();
+    let blk_saved: u64 =
+        dead_blocks.iter().map(|b| b.size).sum();
+    // Map dead blocks to method indices
+    let mut method_dead_blocks: HashMap<usize, Vec<(usize, usize)>> =
+        HashMap::new();
     for db in dead_blocks {
-        let off = db.addr as usize;
-        let sz = db.size as usize;
-        if off + sz <= data.len() && sz >= 1 {
-            for b in &mut data[off..off + sz] {
-                *b = 0x00; // JVM nop
+        let db_s = db.addr as usize;
+        let db_e = db_s + db.size as usize;
+        for (idx, m) in cf.methods.iter().enumerate() {
+            if let Some(co) = m.code_offset {
+                let ce = co + m.code_length;
+                if db_s >= co && db_e <= ce {
+                    method_dead_blocks
+                        .entry(idx)
+                        .or_default()
+                        .push((db_s, db_e));
+                    break;
+                }
             }
-            blk_count += 1;
-            blk_saved += db.size;
         }
     }
-    if dead.is_empty() {
-        return (0, 0, blk_count, blk_saved);
+    if dead.is_empty() && method_dead_blocks.is_empty() {
+        return (0, 0, 0, 0);
     }
-    // Step 2: Rebuild class file without dead methods
+    // Step 2: Rebuild class file without dead methods,
+    //         compacting dead branches in live methods
     let pool = &cf.constant_pool;
     let dead_indices: HashSet<usize> = cf
         .methods
@@ -62,18 +72,33 @@ pub fn reassemble_java(
         })
         .map(|(i, _)| i)
         .collect();
-    let live_methods: Vec<&classfile::MethodInfo> = cf
-        .methods
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !dead_indices.contains(i))
-        .map(|(_, m)| m)
-        .collect();
+    let live_methods: Vec<(usize, &classfile::MethodInfo)> =
+        cf.methods
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !dead_indices.contains(i))
+            .collect();
     let new_count = live_methods.len() as u16;
     let fc = dead_indices.len();
     // Build new method bytes from live methods
     let mut method_bytes = Vec::new();
-    for m in &live_methods {
+    for &(idx, m) in &live_methods {
+        if let Some(ranges) = method_dead_blocks.get(&idx) {
+            if let Some(compacted) =
+                bytecode::compact_method_code(
+                    data, m, ranges,
+                )
+            {
+                method_bytes.extend_from_slice(&compacted);
+                continue;
+            }
+            // Compaction failed: nop-fill in original data
+            for &(s, e) in ranges {
+                if e <= data.len() {
+                    data[s..e].fill(0x00);
+                }
+            }
+        }
         method_bytes.extend_from_slice(
             &data[m.raw_offset..m.raw_offset + m.raw_size],
         );

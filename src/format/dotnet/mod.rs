@@ -293,23 +293,12 @@ pub fn reassemble_dotnet(
     };
     let (fc, _) =
         patch::zero_dead_methods(data, &dead_rvas, &rva_fn);
-    // Step 2: Nop-fill dead blocks (dead branches in live methods)
-    let mut blk_count = 0;
-    let mut blk_saved = 0u64;
-    for db in dead_blocks {
-        if let Some(off) =
-            pe_rva_to_offset(data, db.addr as u32)
-        {
-            let sz = db.size as usize;
-            if off + sz <= data.len() {
-                for b in &mut data[off..off + sz] {
-                    *b = 0x00;
-                }
-                blk_count += 1;
-                blk_saved += db.size;
-            }
-        }
-    }
+    // Step 2: Compact dead blocks (dead branches in live methods)
+    let method_rvas = extract_method_rvas(data);
+    let sec_hdrs = dotnet_sections(data);
+    let (blk_count, blk_saved) = il::compact_il_dead_blocks(
+        data, dead_blocks, &method_rvas, &sec_hdrs,
+    );
     if dead.is_empty() {
         return (0, 0, blk_count, blk_saved);
     }
@@ -382,6 +371,23 @@ fn parse_for_reassembly(
         method_row_size: rsz,
         method_count: count,
     })
+}
+
+/// Extract method RVAs from the MethodDef metadata table.
+fn extract_method_rvas(data: &[u8]) -> Vec<u32> {
+    let info = match parse_for_reassembly(data) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let mut rvas = Vec::with_capacity(info.method_count);
+    for i in 0..info.method_count {
+        let off =
+            info.method_table_off + i * info.method_row_size;
+        if off + 4 <= data.len() {
+            rvas.push(metadata::read_u32(data, off));
+        }
+    }
+    rvas
 }
 
 /// Parse PE section headers from a .NET assembly.

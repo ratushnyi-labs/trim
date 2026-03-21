@@ -329,33 +329,32 @@ within live function/method bodies for bytecode formats:
 
 - **WebAssembly:** Detects unreachable code after `unreachable` (0x00),
   `return` (0x0F), and unconditional `br` (0x0C) opcodes until the
-  next control flow boundary (`end`/`else`). Dead regions are filled
-  with `nop` (0x01) during reassembly.
+  next control flow boundary (`end`/`else`).
 - **.NET IL:** Detects unreachable code after `throw` (0x7A), `ret`
   (0x2A), unconditional `br` (0x38/0x2B), and `rethrow` (0xFE 0x1A)
   until the next branch target.
 - **Java:** Detects unreachable code after `ireturn` (0xAC), `lreturn`
   (0xAD), `freturn` (0xAE), `dreturn` (0xAF), `areturn` (0xB0),
   `return` (0xB1), `athrow` (0xBF), `goto` (0xA7), and `goto_w`
-  (0xC8) until the next branch target. Dead regions are nop-filled
-  (0x00) during reassembly.
+  (0xC8) until the next branch target.
 
-### BR-010: Wasm, .NET & Java Physical Compaction (SDD-014)
+### BR-010: Wasm, .NET & Java Physical Compaction (SDD-014, SDD-015)
 
 All binary formats are physically compacted, not just native formats:
 
 - **WebAssembly:** The Code section is rebuilt with dead function bodies
-  replaced by minimal 3-byte stubs (`unreachable` + `end`). Function
-  indices are preserved (required by Wasm call semantics). Dead branches
-  within live functions are nop-filled but not physically removed.
-- **.NET:** Dead method bodies are converted to dead intervals and
-  compacted via the PE compaction pipeline (`compact_text`). MethodDef
-  RVAs, CLI header RVAs, section headers, and PE metadata are patched.
-  Dead branches within live methods are nop-filled (IL branch offsets
-  cannot be physically removed without rewriting all targets).
-- **Java:** Dead methods are physically removed from the .class file by
-  rebuilding the methods table without them and updating `methods_count`.
-  Dead branches within live methods are nop-filled (0x00).
+  replaced by minimal 3-byte stubs. Dead branches within live functions
+  are physically excised from function bodies (Wasm uses structural
+  labels, not byte offsets, so removal is safe).
+- **.NET:** Dead method bodies are compacted via the PE pipeline. Dead
+  branches within live methods are physically removed with branch offset
+  repatching (covers br.s, br, conditional branches, switch). Methods
+  with exception handlers (MoreSects flag) fall back to nop-fill.
+- **Java:** Dead methods are physically removed by rebuilding the
+  methods table. Dead branches within live methods are physically
+  removed with branch offset repatching. Methods with exception
+  handlers, tableswitch/lookupswitch, or StackMapTable fall back to
+  nop-fill.
 
 ---
 

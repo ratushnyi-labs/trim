@@ -27,6 +27,8 @@ pub struct MethodInfo {
     pub descriptor_index: u16,
     pub code_offset: Option<usize>, // file offset of Code attribute bytecode
     pub code_length: usize,
+    pub code_attr_offset: Option<usize>, // file offset of Code attr header
+    pub exception_table_len: u16,
     pub raw_offset: usize, // file offset of method_info start
     pub raw_size: usize,   // total bytes of this method_info
 }
@@ -214,7 +216,9 @@ fn parse_method(
     let attr_count = read_u16(data, pos + 6) as usize;
     pos += 8;
     let mut code_offset = None;
-    let mut code_length = 0;
+    let mut code_length = 0usize;
+    let mut code_attr_offset = None;
+    let mut exception_table_len = 0u16;
     for _ in 0..attr_count {
         if pos + 6 > data.len() {
             return None;
@@ -240,6 +244,14 @@ fn parse_method(
                     code_offset =
                         Some(attr_data_start + 8);
                     code_length = cl;
+                    code_attr_offset = Some(pos);
+                    // exception_table_length
+                    let et_off =
+                        attr_data_start + 8 + cl;
+                    if et_off + 2 <= data.len() {
+                        exception_table_len =
+                            read_u16(data, et_off);
+                    }
                 }
             }
         }
@@ -255,6 +267,8 @@ fn parse_method(
             descriptor_index,
             code_offset,
             code_length,
+            code_attr_offset,
+            exception_table_len,
             raw_offset: start,
             raw_size: pos - start,
         },

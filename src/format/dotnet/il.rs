@@ -144,6 +144,333 @@ fn op2_size(op2: u8) -> usize {
     }
 }
 
+// ---- IL dead branch physical compaction -------------------------
+
+/// Physically compact dead branches within live methods.
+/// Returns (compacted_count, bytes_saved).
+/// Falls back to nop-fill if method has exception handlers.
+pub fn compact_il_dead_blocks(
+    data: &mut [u8],
+    dead_blocks: &[DeadBlock],
+    method_rvas: &[u32],
+    sections: &[crate::types::Section],
+) -> (usize, u64) {
+    if dead_blocks.is_empty() {
+        return (0, 0);
+    }
+    let rva_fn = |rva: u32| -> Option<usize> {
+        rva_to_offset(sections, rva)
+    };
+    // Group dead blocks by method
+    let mut method_blocks: HashMap<usize, Vec<&DeadBlock>> =
+        HashMap::new();
+    for db in dead_blocks {
+        if let Some(idx) = find_method_for_rva(
+            method_rvas, db.addr as u32, data, &rva_fn,
+        ) {
+            method_blocks.entry(idx).or_default().push(db);
+        }
+    }
+    let mut count = 0usize;
+    let mut saved = 0u64;
+    for (&idx, blocks) in &method_blocks {
+        let rva = method_rvas[idx];
+        let off = match rva_fn(rva) {
+            Some(o) => o,
+            None => continue,
+        };
+        let (code_off, code_size) =
+            match parse_method_header(data, off) {
+                Some(v) => v,
+                None => continue,
+            };
+        // Convert dead block RVAs to code-relative ranges
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for db in blocks {
+            let db_off = match rva_fn(db.addr as u32) {
+                Some(o) => o,
+                None => continue,
+            };
+            let rel_s = db_off.saturating_sub(code_off);
+            let rel_e = rel_s + db.size as usize;
+            if rel_e <= code_size {
+                ranges.push((rel_s, rel_e));
+            }
+        }
+        if ranges.is_empty() { continue; }
+        ranges.sort_by_key(|&(s, _)| s);
+        let s = compact_one_method(
+            data, off, code_off, code_size, &ranges,
+        );
+        if s > 0 {
+            count += blocks.len();
+            saved += s;
+        } else {
+            // Fallback: nop-fill
+            for db in blocks {
+                if let Some(o) = rva_fn(db.addr as u32) {
+                    let sz = db.size as usize;
+                    if o + sz <= data.len() {
+                        data[o..o + sz].fill(0x00);
+                    }
+                }
+            }
+        }
+    }
+    (count, saved)
+}
+
+/// Convert RVA to file offset using section headers.
+fn rva_to_offset(
+    sections: &[crate::types::Section],
+    rva: u32,
+) -> Option<usize> {
+    let rva64 = rva as u64;
+    for s in sections {
+        let end = s.vaddr + s.size;
+        if rva64 >= s.vaddr && rva64 < end {
+            return Some(
+                (rva64 - s.vaddr + s.offset) as usize,
+            );
+        }
+    }
+    None
+}
+
+/// Find which method index a given RVA belongs to.
+fn find_method_for_rva(
+    method_rvas: &[u32],
+    rva: u32,
+    data: &[u8],
+    rva_fn: &dyn Fn(u32) -> Option<usize>,
+) -> Option<usize> {
+    for (idx, &mrva) in method_rvas.iter().enumerate() {
+        if mrva == 0 { continue; }
+        let off = rva_fn(mrva)?;
+        let (_, code_size) = parse_method_header(data, off)?;
+        let hdr_size = method_header_size(data, off)?;
+        let method_end_rva = mrva + hdr_size as u32
+            + code_size as u32;
+        if rva >= mrva && rva < method_end_rva {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn parse_method_header(
+    data: &[u8],
+    off: usize,
+) -> Option<(usize, usize)> {
+    if off >= data.len() { return None; }
+    let header = data[off];
+    if header & 0x03 == 0x02 {
+        Some((off + 1, (header >> 2) as usize))
+    } else if header & 0x03 == 0x03 {
+        let (co, cs) = parse_fat_header(data, off);
+        if co == 0 { None } else { Some((co, cs)) }
+    } else {
+        None
+    }
+}
+
+fn method_header_size(
+    data: &[u8],
+    off: usize,
+) -> Option<usize> {
+    if off >= data.len() { return None; }
+    let header = data[off];
+    if header & 0x03 == 0x02 {
+        Some(1)
+    } else if header & 0x03 == 0x03 {
+        if off + 2 > data.len() { return None; }
+        let fs = data[off] as u16
+            | ((data[off + 1] as u16) << 8);
+        Some((((fs >> 12) & 0x0F) * 4) as usize)
+    } else {
+        None
+    }
+}
+
+/// Compact dead blocks from one method. Returns bytes saved
+/// or 0 if compaction was skipped (e.g. exception handlers).
+/// `ranges` are code-relative (relative to code_off).
+fn compact_one_method(
+    data: &mut [u8],
+    off: usize,
+    code_off: usize,
+    code_size: usize,
+    ranges: &[(usize, usize)],
+) -> u64 {
+    if off >= data.len() { return 0; }
+    if code_off + code_size > data.len() || code_size == 0 {
+        return 0;
+    }
+    let header = data[off];
+    let is_fat = header & 0x03 == 0x03;
+    // Bail: fat header with MoreSects (exception handlers)
+    if is_fat && off + 1 < data.len() {
+        let flags = data[off] as u16
+            | ((data[off + 1] as u16) << 8);
+        if flags & 0x08 != 0 { return 0; }
+    }
+    // Patch branch offsets in-place
+    patch_il_branches(data, code_off, code_size, ranges);
+    // Build compacted bytecode
+    let code = &data[code_off..code_off + code_size];
+    let compacted = excise_il_ranges(code, ranges);
+    let saved = code_size - compacted.len();
+    if saved == 0 { return 0; }
+    // Write compacted code + zero-fill remainder
+    data[code_off..code_off + compacted.len()]
+        .copy_from_slice(&compacted);
+    data[code_off + compacted.len()..code_off + code_size]
+        .fill(0x00);
+    // Update header code_size
+    let new_size = compacted.len();
+    if !is_fat {
+        if new_size > 63 { return 0; }
+        data[off] = ((new_size as u8) << 2) | 0x02;
+    } else if off + 8 <= data.len() {
+        let sz_bytes = (new_size as u32).to_le_bytes();
+        data[off + 4..off + 8].copy_from_slice(&sz_bytes);
+    }
+    saved as u64
+}
+
+/// Shift function: total dead bytes before `offset`.
+fn il_shift(
+    offset: usize,
+    ranges: &[(usize, usize)],
+) -> usize {
+    let mut shift = 0;
+    for &(s, e) in ranges {
+        if s < offset {
+            shift += e.min(offset) - s;
+        }
+    }
+    shift
+}
+
+/// Patch all branch offsets in IL bytecode, accounting for
+/// dead ranges that will be removed.
+fn patch_il_branches(
+    data: &mut [u8],
+    code_off: usize,
+    code_size: usize,
+    ranges: &[(usize, usize)],
+) {
+    let end = code_off + code_size;
+    let mut pos = code_off;
+    while pos < end {
+        let op = data[pos];
+        let instr_start = pos;
+        pos += 1;
+        match op {
+            // Short branches (1-byte signed offset)
+            0x2B..=0x37 => {
+                if pos < end {
+                    let old =
+                        data[pos] as i8 as i32;
+                    let src_rel = pos + 1 - code_off;
+                    let tgt_rel =
+                        src_rel as i32 + old;
+                    let new_src =
+                        src_rel - il_shift(src_rel, ranges);
+                    let new_tgt = tgt_rel as usize
+                        - il_shift(tgt_rel as usize, ranges);
+                    let new_off =
+                        new_tgt as i32 - new_src as i32;
+                    data[pos] = new_off as i8 as u8;
+                    pos += 1;
+                }
+            }
+            // Long branches (4-byte signed offset)
+            0x38..=0x43 => {
+                if pos + 4 <= end {
+                    let old = i32::from_le_bytes([
+                        data[pos], data[pos + 1],
+                        data[pos + 2], data[pos + 3],
+                    ]);
+                    let src_rel = pos + 4 - code_off;
+                    let tgt_rel =
+                        src_rel as i32 + old;
+                    let new_src =
+                        src_rel - il_shift(src_rel, ranges);
+                    let new_tgt = tgt_rel as usize
+                        - il_shift(tgt_rel as usize, ranges);
+                    let new_off =
+                        new_tgt as i32 - new_src as i32;
+                    let bytes = new_off.to_le_bytes();
+                    data[pos..pos + 4]
+                        .copy_from_slice(&bytes);
+                }
+                pos += 4;
+            }
+            // switch
+            0x45 => {
+                if pos + 4 <= end {
+                    let n =
+                        read_u32(data, pos) as usize;
+                    pos += 4;
+                    let base_rel =
+                        pos + n * 4 - code_off;
+                    for _ in 0..n {
+                        if pos + 4 <= end {
+                            let old = i32::from_le_bytes([
+                                data[pos], data[pos + 1],
+                                data[pos + 2], data[pos + 3],
+                            ]);
+                            let tgt_rel =
+                                base_rel as i32 + old;
+                            let new_base = base_rel
+                                - il_shift(base_rel, ranges);
+                            let new_tgt = tgt_rel as usize
+                                - il_shift(
+                                    tgt_rel as usize,
+                                    ranges,
+                                );
+                            let new_off = new_tgt as i32
+                                - new_base as i32;
+                            let bytes =
+                                new_off.to_le_bytes();
+                            data[pos..pos + 4]
+                                .copy_from_slice(&bytes);
+                        }
+                        pos += 4;
+                    }
+                }
+            }
+            0xFE if pos < end => {
+                pos += 1 + op2_size(data[pos]);
+            }
+            _ => {
+                pos = instr_start + 1
+                    + opcode_operand_size(op);
+            }
+        }
+    }
+}
+
+/// Remove dead ranges from IL bytecode.
+fn excise_il_ranges(
+    code: &[u8],
+    ranges: &[(usize, usize)],
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(code.len());
+    let mut pos = 0usize;
+    for &(start, end) in ranges {
+        if start > pos {
+            result.extend_from_slice(&code[pos..start]);
+        }
+        pos = end;
+    }
+    if pos < code.len() {
+        result.extend_from_slice(&code[pos..]);
+    }
+    result
+}
+
 // ---- Dead branch detection in IL --------------------------------
 
 /// Detect dead branches within live IL method bodies.

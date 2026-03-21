@@ -90,8 +90,9 @@ def main():
     pool += utf8_entry("<init>")           # 15
     pool += nat_entry(15, 9)               # 16: <init>:()V
     pool += methodref_entry(4, 16)         # 17: Object.<init>
+    pool += utf8_entry("liveBranch")      # 18
 
-    cp_count = 18  # 17 entries + 1 (0-based offset)
+    cp_count = 19  # 18 entries + 1 (0-based offset)
 
     # Methods
     ACC_PUBLIC = 0x0001
@@ -179,8 +180,32 @@ def main():
     )
     m_dead2 = method_info(ACC_PRIVATE | ACC_STATIC, 11, 14, 7, 2, 3, dead2_code)
 
-    methods = m_init + m_main + m_live + m_dead1 + m_dead2
-    methods_count = 5
+    # liveBranch: public static int liveBranch()
+    # Has dead code after ireturn (10 bytes unreachable)
+    branch_code = (
+        b"\x03"                 # iconst_0
+        + b"\x3C"               # istore_1
+        + b"\x04"               # iconst_1
+        + b"\x3D"               # istore_2
+        + b"\x1B"               # iload_1
+        + b"\x1C"               # iload_2
+        + b"\x60"               # iadd
+        + b"\xAC"               # ireturn
+        # Dead code below (10 bytes, unreachable):
+        + b"\x10\x0A"          # bipush 10
+        + b"\x3C"               # istore_1
+        + b"\x10\x14"          # bipush 20
+        + b"\x3D"               # istore_2
+        + b"\x1B"               # iload_1
+        + b"\x1C"               # iload_2
+        + b"\x60"               # iadd
+        + b"\xAC"               # ireturn
+    )
+    m_branch = method_info(ACC_PUBLIC | ACC_STATIC, 18, 14, 7,
+                           2, 3, branch_code)
+
+    methods = m_init + m_main + m_live + m_branch + m_dead1 + m_dead2
+    methods_count = 6
 
     # Assemble class file
     out = b""
