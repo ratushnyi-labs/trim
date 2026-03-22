@@ -276,9 +276,10 @@ fn collect_branch_targets(
                         read_i32_be(data, p + 4);
                     let high =
                         read_i32_be(data, p + 8);
-                    let n =
-                        (high - low + 1).max(0) as usize;
-                    for j in 0..n {
+                    let n = (high as i64 - low as i64 + 1)
+                        .max(0) as usize;
+                    let max_n = (end - p - 12) / 4;
+                    for j in 0..n.min(max_n) {
                         let o = p + 12 + j * 4;
                         if o + 4 <= end {
                             let off =
@@ -301,9 +302,15 @@ fn collect_branch_targets(
                     targets.insert(
                         (rel_pc + def) as u32,
                     );
-                    let n =
-                        read_i32_be(data, p + 4) as usize;
-                    for j in 0..n {
+                    let raw_n =
+                        read_i32_be(data, p + 4);
+                    let n = if raw_n < 0 {
+                        0usize
+                    } else {
+                        raw_n as usize
+                    };
+                    let max_n = (end - p - 8) / 8;
+                    for j in 0..n.min(max_n) {
                         let o = p + 8 + j * 8 + 4;
                         if o + 4 <= end {
                             let off =
@@ -367,9 +374,10 @@ fn opcode_length(
             if p + 12 <= end {
                 let low = read_i32_be(data, p + 4);
                 let high = read_i32_be(data, p + 8);
-                let n =
-                    (high - low + 1).max(0) as usize;
-                1 + pad + 12 + n * 4
+                let n = (high as i64 - low as i64 + 1)
+                    .max(0) as usize;
+                let max_n = (end - p - 12) / 4;
+                1 + pad + 12 + n.min(max_n) * 4
             } else {
                 1
             }
@@ -380,9 +388,14 @@ fn opcode_length(
             let pad = (4 - ((base + 1) % 4)) % 4;
             let p = pos + 1 + pad;
             if p + 8 <= end {
-                let n =
-                    read_i32_be(data, p + 4) as usize;
-                1 + pad + 8 + n * 8
+                let raw_n = read_i32_be(data, p + 4);
+                let n = if raw_n < 0 {
+                    0usize
+                } else {
+                    raw_n as usize
+                };
+                let max_n = (end - p - 8) / 8;
+                1 + pad + 8 + n.min(max_n) * 8
             } else {
                 1
             }
@@ -446,19 +459,21 @@ pub fn compact_method_code(
     }
     if rel_ranges.is_empty() { return None; }
     rel_ranges.sort_by_key(|&(s, _)| s);
-    // Patch branch offsets in a working copy
-    let mut work = data.to_vec();
-    patch_java_branches(
-        &mut work, code_off, code_len, &rel_ranges,
+    // Clone only the code bytes (not the entire file)
+    let code_end = code_off + code_len;
+    if code_end > data.len() { return None; }
+    let mut code_copy =
+        data[code_off..code_end].to_vec();
+    patch_code_branches(
+        &mut code_copy, code_len, &rel_ranges,
     );
-    // Build compacted code
-    let code = &work[code_off..code_off + code_len];
-    let compacted = excise_ranges(code, &rel_ranges);
+    let compacted = excise_ranges(
+        &code_copy, &rel_ranges,
+    );
     let removed = code_len - compacted.len();
     if removed == 0 { return None; }
-    // Rebuild method_info with shorter Code attribute
     Some(rebuild_method_bytes(
-        &work, m, &compacted, removed,
+        data, m, &compacted, removed,
     ))
 }
 
@@ -494,7 +509,8 @@ fn has_stack_map(
     let et_off = code_off + code_len;
     if et_off + 2 > cf_data.len() { return false; }
     let et_len = read_u16_be(cf_data, et_off) as usize;
-    let attrs_off = et_off + 2 + et_len * 8;
+    let attrs_off =
+        et_off + 2 + et_len.saturating_mul(8);
     if attrs_off + 2 > cf_data.len() { return false; }
     let attr_count =
         read_u16_be(cf_data, attrs_off) as usize;
@@ -553,24 +569,24 @@ fn java_shift(
     shift
 }
 
-/// Patch all branch offsets in Java bytecode.
-fn patch_java_branches(
-    data: &mut [u8],
-    code_off: usize,
+/// Patch branch offsets in a code-only byte slice.
+/// `code` starts at PC 0. `ranges` are code-relative.
+fn patch_code_branches(
+    code: &mut [u8],
     code_len: usize,
     ranges: &[(usize, usize)],
 ) {
-    let end = code_off + code_len;
-    let mut pos = code_off;
+    let end = code_len.min(code.len());
+    let mut pos = 0usize;
     while pos < end {
-        let op = data[pos];
-        let pc = pos - code_off; // bytecode-relative PC
+        let op = code[pos];
+        let pc = pos;
         match op {
             // 2-byte signed offset branches
             0x99..=0xA8 | 0xC6 | 0xC7 => {
                 if pos + 3 <= end {
                     let old =
-                        read_i16_be(data, pos + 1) as i32;
+                        read_i16_be(code, pos + 1) as i32;
                     let tgt = pc as i32 + old;
                     let new_pc =
                         pc - java_shift(pc, ranges);
@@ -580,7 +596,7 @@ fn patch_java_branches(
                         new_tgt as i32 - new_pc as i32;
                     let bytes =
                         (new_off as i16).to_be_bytes();
-                    data[pos + 1..pos + 3]
+                    code[pos + 1..pos + 3]
                         .copy_from_slice(&bytes);
                 }
                 pos += 3;
@@ -588,7 +604,7 @@ fn patch_java_branches(
             // goto_w, jsr_w (4-byte signed offset)
             0xC8 | 0xC9 => {
                 if pos + 5 <= end {
-                    let old = read_i32_be(data, pos + 1);
+                    let old = read_i32_be(code, pos + 1);
                     let tgt = pc as i32 + old;
                     let new_pc =
                         pc - java_shift(pc, ranges);
@@ -597,13 +613,14 @@ fn patch_java_branches(
                     let new_off =
                         new_tgt as i32 - new_pc as i32;
                     let bytes = new_off.to_be_bytes();
-                    data[pos + 1..pos + 5]
+                    code[pos + 1..pos + 5]
                         .copy_from_slice(&bytes);
                 }
                 pos += 5;
             }
             _ => {
-                pos += opcode_length(op, data, pos, end);
+                pos +=
+                    opcode_length(op, code, pos, end);
             }
         }
     }

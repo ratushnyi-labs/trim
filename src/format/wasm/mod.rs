@@ -692,7 +692,8 @@ fn excise_ranges(
     let mut pos = 0usize;
     for &(abs_start, abs_end) in ranges {
         let rel_start = abs_start.saturating_sub(base);
-        let rel_end = abs_end.saturating_sub(base);
+        let rel_end =
+            abs_end.saturating_sub(base).min(body.len());
         if rel_start > pos && rel_start <= body.len() {
             result.extend_from_slice(
                 &body[pos..rel_start],

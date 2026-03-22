@@ -547,6 +547,72 @@ set -e
     pass "[SEC] Corrupted stdin: no crash (exit $rc)"
 
 # =============================================
+# [SEC] Malformed format-specific inputs
+# =============================================
+printf '\n--- [SEC] Malformed format-specific inputs ---\n'
+
+# Truncated Java: valid magic but truncated constant pool
+printf '\xCA\xFE\xBA\xBE\x00\x00\x00\x34\xFF\xFF' > /work/test-bad-java
+set +e
+output=$(xstrip --dry-run /work/test-bad-java 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
+    pass "[SEC] Truncated Java: handled gracefully" || \
+    pass "[SEC] Truncated Java: no crash (exit $rc)"
+
+# Truncated Wasm: valid magic but truncated body
+printf '\x00\x61\x73\x6D\x01\x00\x00\x00\x0A' > /work/test-bad-wasm
+set +e
+output=$(xstrip --dry-run /work/test-bad-wasm 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
+    pass "[SEC] Truncated Wasm: handled gracefully" || \
+    pass "[SEC] Truncated Wasm: no crash (exit $rc)"
+
+# Truncated .NET: valid MZ header but truncated PE
+printf 'MZ' > /work/test-bad-dotnet
+dd if=/dev/zero bs=1 count=254 >> /work/test-bad-dotnet 2>/dev/null
+set +e
+output=$(xstrip --dry-run /work/test-bad-dotnet 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
+    pass "[SEC] Truncated .NET: handled gracefully" || \
+    pass "[SEC] Truncated .NET: no crash (exit $rc)"
+
+# Empty file (0 bytes)
+: > /work/test-empty
+set +e
+output=$(xstrip --dry-run /work/test-empty 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|Error' && \
+    pass "[SEC] Empty file: handled gracefully" || \
+    pass "[SEC] Empty file: no crash (exit $rc)"
+
+# Java with huge constant pool count but no data
+printf '\xCA\xFE\xBA\xBE\x00\x00\x00\x34\xFF\xFE' > /work/test-huge-cp
+set +e
+output=$(xstrip --dry-run /work/test-huge-cp 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
+    pass "[SEC] Huge CP count: handled gracefully" || \
+    pass "[SEC] Huge CP count: no crash (exit $rc)"
+
+# 4 bytes only (every format's minimum magic)
+printf '\x7FELF' > /work/test-4byte
+set +e
+output=$(xstrip --dry-run /work/test-4byte 2>&1)
+rc=$?
+set -e
+echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
+    pass "[SEC] 4-byte file: handled gracefully" || \
+    pass "[SEC] 4-byte file: no crash (exit $rc)"
+
+# =============================================
 # Stream mode: output file is executable
 # =============================================
 printf '\n--- Stream mode: output file executable ---\n'

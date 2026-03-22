@@ -287,15 +287,14 @@ pub fn reassemble_dotnet(
         .iter()
         .map(|(n, &(a, _))| (a as u32, n.clone()))
         .collect();
-    let orig = data.clone();
+    let sec_hdrs = dotnet_sections(data);
     let rva_fn = |rva: u32| -> Option<usize> {
-        pe_rva_to_offset(&orig, rva)
+        rva_to_offset_sec(&sec_hdrs, rva)
     };
     let (fc, _) =
         patch::zero_dead_methods(data, &dead_rvas, &rva_fn);
     // Step 2: Compact dead blocks (dead branches in live methods)
     let method_rvas = extract_method_rvas(data);
-    let sec_hdrs = dotnet_sections(data);
     let (blk_count, blk_saved) = il::compact_il_dead_blocks(
         data, dead_blocks, &method_rvas, &sec_hdrs,
     );
@@ -371,6 +370,23 @@ fn parse_for_reassembly(
         method_row_size: rsz,
         method_count: count,
     })
+}
+
+/// Convert RVA to file offset using pre-parsed section headers.
+fn rva_to_offset_sec(
+    sections: &[Section],
+    rva: u32,
+) -> Option<usize> {
+    let rva64 = rva as u64;
+    for s in sections {
+        let end = s.vaddr + s.size;
+        if rva64 >= s.vaddr && rva64 < end {
+            return Some(
+                (rva64 - s.vaddr + s.offset) as usize,
+            );
+        }
+    }
+    None
 }
 
 /// Extract method RVAs from the MethodDef metadata table.

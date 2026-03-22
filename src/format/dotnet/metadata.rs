@@ -186,19 +186,23 @@ fn rva_to_offset(
 }
 
 pub fn read_u32(data: &[u8], off: usize) -> u32 {
+    if off + 4 > data.len() { return 0; }
     u32::from_le_bytes(
         data[off..off + 4].try_into().unwrap_or([0; 4]),
     )
 }
 
 pub fn read_u16(data: &[u8], off: usize) -> u16 {
+    if off + 2 > data.len() { return 0; }
     u16::from_le_bytes(
         data[off..off + 2].try_into().unwrap_or([0; 2]),
     )
 }
 
 fn read_cstr(data: &[u8], off: usize) -> Option<String> {
+    if off >= data.len() { return None; }
     let end = data[off..].iter().position(|&b| b == 0)?;
+    if off + end > data.len() { return None; }
     String::from_utf8(data[off..off + end].to_vec()).ok()
 }
 

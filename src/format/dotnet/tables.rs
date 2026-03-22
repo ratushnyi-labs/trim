@@ -160,6 +160,9 @@ pub fn get_string(
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(0);
+    if off + end > data.len() {
+        return String::new();
+    }
     String::from_utf8_lossy(&data[off..off + end])
         .to_string()
 }
@@ -174,7 +177,10 @@ fn table_offset(
     for i in 0..table_id {
         let count = ts.row_counts[i] as usize;
         if count > 0 {
-            off += count * row_size_for_table(i, ts);
+            let sz = row_size_for_table(i, ts);
+            off = off.saturating_add(
+                count.saturating_mul(sz),
+            );
         }
     }
     off

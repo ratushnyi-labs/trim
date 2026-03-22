@@ -342,12 +342,14 @@ pub fn cp_utf8(pool: &[CpEntry], idx: u16) -> &str {
 }
 
 fn read_u16(data: &[u8], off: usize) -> u16 {
+    if off + 2 > data.len() { return 0; }
     u16::from_be_bytes(
         data[off..off + 2].try_into().unwrap_or([0; 2]),
     )
 }
 
 fn read_u32(data: &[u8], off: usize) -> u32 {
+    if off + 4 > data.len() { return 0; }
     u32::from_be_bytes(
         data[off..off + 4].try_into().unwrap_or([0; 4]),
     )
