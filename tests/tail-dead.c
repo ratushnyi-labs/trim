@@ -1,5 +1,5 @@
 /* Test binary with dead functions at the end of .text.
- * Used to verify xstrip can truncate trailing dead code. */
+ * Used to verify trim can truncate trailing dead code. */
 #include <stdio.h>
 
 int live_add(int a, int b) { return a + b; }

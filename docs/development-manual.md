@@ -44,7 +44,7 @@ Dockerfile          Multi-arch production image (xx + scratch)
 Dockerfile.test     Multi-arch test image (xx + Alpine runtime)
 docker-compose.yml  Services: strip (production), test (testing)
 dist.sh             Build static binaries for amd64 + arm64
-xstrip.sh           Host-side wrapper (builds image, runs container)
+trim.sh           Host-side wrapper (builds image, runs container)
 .cargo/config.toml  Local cargo config (x86_64-musl target, not used in Docker)
 .dockerignore       Files excluded from Docker build context
 .gitignore          Git ignore rules
@@ -100,7 +100,7 @@ docker buildx build --platform linux/arm64 .
 sh dist.sh
 ```
 
-This produces `dist/xstrip-linux-amd64.tar.gz` and `dist/xstrip-linux-arm64.tar.gz`
+This produces `dist/trim-linux-amd64.tar.gz` and `dist/trim-linux-arm64.tar.gz`
 (archives containing static musl binaries with executable permissions).
 
 ## Multi-arch Build System
@@ -177,13 +177,13 @@ Test C files contain intentional dead code patterns:
 
 ```bash
 # Analyze dead code without modifying
-docker run --rm -v /path/to/binary:/work/binary xstrip-strip \
+docker run --rm -v /path/to/binary:/work/binary trim-strip \
     --dry-run /work/binary
 
 # Remove dead code (in-place)
-docker run --rm -v /path/to/binary:/work/binary xstrip-strip \
+docker run --rm -v /path/to/binary:/work/binary trim-strip \
     --in-place /work/binary
 
 # Stream mode via pipe (stdin → stdout)
-docker run --rm -i xstrip-strip - < /path/to/binary > /path/to/output
+docker run --rm -i trim-strip - < /path/to/binary > /path/to/output
 ```

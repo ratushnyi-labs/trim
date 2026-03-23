@@ -6,7 +6,7 @@
 ## Scope / Non-goals
 
 **Scope:**
-- Cross-compile xstrip for both x86_64 and aarch64 Linux using Docker `xx`
+- Cross-compile trim for both x86_64 and aarch64 Linux using Docker `xx`
 - Add an `export` stage to Dockerfile for `--output type=local` binary extraction
 - Create `dist.sh` script to produce both platform binaries in `dist/`
 - Update Dockerfile.test builder to use `xx` (test runtime unchanged)
@@ -23,8 +23,8 @@
 - AC-1: `docker compose run --rm test` passes all existing tests
 - AC-2: `docker buildx build --platform linux/amd64` succeeds
 - AC-3: `docker buildx build --platform linux/arm64` succeeds
-- AC-4: `dist.sh` produces `dist/xstrip-linux-amd64.tar.gz` (ELF x86-64, static)
-- AC-5: `dist.sh` produces `dist/xstrip-linux-arm64.tar.gz` (ELF aarch64, static)
+- AC-4: `dist.sh` produces `dist/trim-linux-amd64.tar.gz` (ELF x86-64, static)
+- AC-5: `dist.sh` produces `dist/trim-linux-arm64.tar.gz` (ELF aarch64, static)
 - AC-6: `.cargo/` directory is NOT copied into the Docker builder
 - AC-7: Runtime stage unchanged (scratch, non-root uid 10000, healthcheck)
 
@@ -47,8 +47,8 @@
 | AC-1  | `docker compose run --rm test` (all 70 tests) |
 | AC-2  | `docker buildx build --platform linux/amd64` |
 | AC-3  | `docker buildx build --platform linux/arm64` |
-| AC-4  | `dist/xstrip-linux-amd64.tar.gz` contains ELF x86-64 static |
-| AC-5  | `dist/xstrip-linux-arm64.tar.gz` contains ELF aarch64 static |
+| AC-4  | `dist/trim-linux-amd64.tar.gz` contains ELF x86-64 static |
+| AC-5  | `dist/trim-linux-arm64.tar.gz` contains ELF aarch64 static |
 | AC-6  | Dockerfile inspection (no COPY .cargo) |
 | AC-7  | Dockerfile inspection (scratch, USER 10000, HEALTHCHECK) |
 | SEC-1 | xx uses distro packages only |

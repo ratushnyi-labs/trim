@@ -12,7 +12,7 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
 ARG TARGETPLATFORM
 RUN xx-apk add --no-cache musl-dev
 
-ARG XSTRIP_VERSION
+ARG TRIM_VERSION
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
@@ -20,10 +20,10 @@ COPY LICENSE ./
 COPY src src
 
 RUN TRIPLE="$(xx-info march)-unknown-linux-musl" \
-    && if [ -n "$XSTRIP_VERSION" ]; then export XSTRIP_VERSION; fi \
+    && if [ -n "$TRIM_VERSION" ]; then export TRIM_VERSION; fi \
     && xx-cargo build --release \
-    && xx-verify "target/${TRIPLE}/release/xstrip" \
-    && cp "target/${TRIPLE}/release/xstrip" /xstrip
+    && xx-verify "target/${TRIPLE}/release/trim" \
+    && cp "target/${TRIPLE}/release/trim" /trim
 
 FROM alpine:3.23
 
@@ -47,14 +47,14 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
     && ln -s /usr/lib/llvm19/bin/wasm-ld /usr/local/bin/wasm-ld \
     && rm -rf /var/cache/apk/*
 
-COPY --from=builder /xstrip /usr/local/bin/xstrip
+COPY --from=builder /trim /usr/local/bin/trim
 
-RUN adduser -D -u 10000 xstrip \
-    && mkdir /work && chown xstrip:xstrip /work
+RUN adduser -D -u 10000 trim \
+    && mkdir /work && chown trim:trim /work
 
 COPY tests/ /tests/
 RUN chmod +x /tests/test.sh
 
-USER xstrip
+USER trim
 WORKDIR /work
 ENTRYPOINT ["/tests/test.sh"]

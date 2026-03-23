@@ -14,7 +14,7 @@
 - Profile-guided optimization (PGO) or runtime instrumentation
 - Inter-procedural constant propagation (callee value range narrowing)
 - Speculative devirtualization
-- Source-level or IR-level analysis (xstrip works on binaries only)
+- Source-level or IR-level analysis (trim works on binaries only)
 - .NET IL branch elimination (CIL has no fixed layout; JIT handles this)
 
 ## Acceptance Criteria
@@ -368,7 +368,7 @@ docker compose run --build --rm test
 
 After all phases:
 ```bash
-docker build -t xstrip . && docker run --rm xstrip --help
+docker build -t trim . && docker run --rm trim --help
 ```
 
 Update docs: `docs/spec.md` (BR-007), `docs/development-manual.md`,

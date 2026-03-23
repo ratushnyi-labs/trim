@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 use std::process;
 
-const VERSION: &str = match option_env!("XSTRIP_VERSION") {
+const VERSION: &str = match option_env!("TRIM_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -23,7 +23,7 @@ fn main() {
             process::exit(0);
         }
         Action::Version => {
-            println!("xstrip {}", VERSION);
+            println!("trim {}", VERSION);
             process::exit(0);
         }
         Action::License => {
@@ -56,7 +56,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let mut in_place = false;
     let mut dry_run = false;
-    let mut max_sccp = xstrip::analysis::sccp::DEFAULT_MAX_INSTRS;
+    let mut max_sccp = trim::analysis::sccp::DEFAULT_MAX_INSTRS;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -120,7 +120,7 @@ fn run_in_place(
 ) -> i32 {
     let mut rc = 0;
     for path in files {
-        match xstrip::process_file(path, dry_run, max_sccp) {
+        match trim::process_file(path, dry_run, max_sccp) {
             Ok(result) => {
                 if result != 0 {
                     rc = result;
@@ -169,7 +169,7 @@ fn run_stream(
         Err(rc) => return rc,
     };
     let label = if input == "-" { "<stdin>" } else { input };
-    let result = match xstrip::process_bytes(
+    let result = match trim::process_bytes(
         &data, label, dry_run, max_sccp,
     ) {
         Ok(r) => r,
@@ -218,20 +218,20 @@ fn read_stdin() -> io::Result<Vec<u8>> {
 
 fn eprint_usage() {
     eprintln!(
-        "xstrip {VERSION}\n\
+        "trim {VERSION}\n\
          Author: Pavlo Ratushnyi\n\
          \n\
-         Usage: xstrip [OPTIONS] <INPUT> [OUTPUT]\n\
+         Usage: trim [OPTIONS] <INPUT> [OUTPUT]\n\
          \n\
          Find and remove dead code from executables.\n\
          Supports: ELF, PE/COFF, Mach-O, .NET\n\
          \n\
          Modes:\n\
-         \x20 xstrip INPUT OUTPUT       Write patched binary to OUTPUT\n\
-         \x20 xstrip INPUT              Write patched binary to stdout\n\
-         \x20 xstrip -                  Read stdin, write to stdout\n\
-         \x20 xstrip -i FILE [FILE...]  Modify files in-place\n\
-         \x20 xstrip --dry-run INPUT    Analyze only, report to stderr\n\
+         \x20 trim INPUT OUTPUT       Write patched binary to OUTPUT\n\
+         \x20 trim INPUT              Write patched binary to stdout\n\
+         \x20 trim -                  Read stdin, write to stdout\n\
+         \x20 trim -i FILE [FILE...]  Modify files in-place\n\
+         \x20 trim --dry-run INPUT    Analyze only, report to stderr\n\
          \n\
          Options:\n\
          \x20 --in-place, -i          Modify files in-place\n\

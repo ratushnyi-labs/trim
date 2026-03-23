@@ -31,16 +31,16 @@ jobs:
       - uses: taiki-e/install-action@cargo-zigbuild
       - name: Build
         run: |
-          XSTRIP_VERSION="${GITHUB_REF_NAME#v}"
-          export XSTRIP_VERSION
+          TRIM_VERSION="${GITHUB_REF_NAME#v}"
+          export TRIM_VERSION
           cargo zigbuild --release --target ${{ matrix.target }}
-          chmod +x "target/${{ matrix.target }}/release/xstrip"
-          tar -czf "xstrip-linux-${{ matrix.suffix }}.tar.gz" \
-              -C "target/${{ matrix.target }}/release" xstrip
+          chmod +x "target/${{ matrix.target }}/release/trim"
+          tar -czf "trim-linux-${{ matrix.suffix }}.tar.gz" \
+              -C "target/${{ matrix.target }}/release" trim
       - uses: actions/upload-artifact@v4
         with:
-          name: xstrip-linux-${{ matrix.suffix }}
-          path: xstrip-linux-${{ matrix.suffix }}.tar.gz
+          name: trim-linux-${{ matrix.suffix }}
+          path: trim-linux-${{ matrix.suffix }}.tar.gz
 
   release:
     needs: build

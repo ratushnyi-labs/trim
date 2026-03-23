@@ -1,6 +1,6 @@
 /* Minimal test for s390x cross-compiled ELF (no libc dependency).
  * Build: clang --target=s390x-linux-gnu -nostdlib -static -fuse-ld=lld
- * Dead/live functions for xstrip detection tests. */
+ * Dead/live functions for trim detection tests. */
 
 __attribute__((noinline, used))
 static int dead_compute(int a, int b) {

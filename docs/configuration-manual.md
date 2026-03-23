@@ -2,7 +2,7 @@
 
 ## Runtime Configuration
 
-xstrip is configured entirely via CLI arguments. There are no environment
+trim is configured entirely via CLI arguments. There are no environment
 variables, config files, or runtime settings.
 
 ### CLI Options
@@ -40,7 +40,7 @@ Binary output goes to stdout or the named output file.
 | export  | `scratch`                      | —       | Binary extraction stage           |
 | runtime | `scratch`                      | —       | Minimal: static binary only       |
 
-The production image is `scratch` (empty) because xstrip is a fully
+The production image is `scratch` (empty) because trim is a fully
 static musl binary with zero runtime dependencies. This is the highest
 priority per §8.3 (smaller than distroless).
 
@@ -71,7 +71,7 @@ Use `--user $(id -u):$(id -g)` to match the host user identity.
 
 ### Health Check
 
-The image defines a HEALTHCHECK that runs `xstrip --help`. This is
+The image defines a HEALTHCHECK that runs `trim --help`. This is
 primarily for orchestration systems that monitor container health.
 
 ## Multi-arch Support
@@ -82,8 +82,8 @@ cross-compiles to the target (`$TARGETPLATFORM`).
 
 | Target Platform | Rust Target                    | Archive                         |
 |-----------------|--------------------------------|---------------------------------|
-| `linux/amd64`   | `x86_64-unknown-linux-musl`    | `xstrip-linux-amd64.tar.gz`   |
-| `linux/arm64`   | `aarch64-unknown-linux-musl`   | `xstrip-linux-arm64.tar.gz`   |
+| `linux/amd64`   | `x86_64-unknown-linux-musl`    | `trim-linux-amd64.tar.gz`   |
+| `linux/arm64`   | `aarch64-unknown-linux-musl`   | `trim-linux-arm64.tar.gz`   |
 
 Binary stripping is handled by Cargo's `strip = true` in `[profile.release]`,
 which uses Rust's bundled LLVM strip. No external `strip` binary is needed.

@@ -17,7 +17,7 @@ fail() {
     printf '[FAIL] %s: %s\n' "$1" "$2"
 }
 
-printf '=== xstrip test suite ===\n'
+printf '=== trim test suite ===\n'
 
 export PATH=/usr/lib/llvm19/bin:$PATH
 
@@ -110,7 +110,7 @@ printf 'Built: hello-x86-32 (%d bytes, ELF x86-32)\n' \
 # =============================================
 printf '\n--- Dead code detection: ELF dynamic ---\n'
 cp /work/hello-dyn /work/test-dyn
-output=$(xstrip --dry-run /work/test-dyn 2>&1)
+output=$(trim --dry-run /work/test-dyn 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -152,7 +152,7 @@ echo "$output" | grep -q '  main' && \
 printf '\n--- Patching: ELF dynamic ---\n'
 cp /work/hello-dyn /work/test-patch
 orig_size=$(stat -c%s /work/test-patch)
-xstrip --in-place /work/test-patch
+trim --in-place /work/test-patch
 new_size=$(stat -c%s /work/test-patch)
 echo "---"
 printf 'Size: %d -> %d bytes\n' "$orig_size" "$new_size"
@@ -177,7 +177,7 @@ echo "$output" | grep -q 'result:' && \
 # =============================================
 printf '\n--- Dead code detection: ELF static ---\n'
 cp /work/hello-static /work/test-static
-output=$(xstrip --dry-run /work/test-static 2>&1)
+output=$(trim --dry-run /work/test-static 2>&1)
 
 echo "$output" | grep -q 'dead_compute' && \
     pass "ELF static: detected dead_compute" || \
@@ -197,7 +197,7 @@ echo "$output" | grep -q '  main' && \
 printf '\n--- Patching: ELF static ---\n'
 cp /work/hello-static /work/test-static-patch
 orig_sz_static=$(stat -c%s /work/test-static-patch)
-xstrip --in-place /work/test-static-patch
+trim --in-place /work/test-static-patch
 new_sz_static=$(stat -c%s /work/test-static-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_static" "$new_sz_static"
 
@@ -214,7 +214,7 @@ printf 'Size: %d -> %d bytes\n' "$orig_sz_static" "$new_sz_static"
 # =============================================
 printf '\n--- Dead code detection: ELF shared library ---\n'
 cp /work/lib.so /work/test-lib.so
-output=$(xstrip --dry-run /work/test-lib.so 2>&1)
+output=$(trim --dry-run /work/test-lib.so 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_factorial' && \
@@ -240,7 +240,7 @@ echo "$output" | grep -q '  multiply' && \
 printf '\n--- --dry-run: no modification ---\n'
 cp /work/hello-dyn /work/test-readonly-check
 before=$(md5sum /work/test-readonly-check | cut -d' ' -f1)
-xstrip --dry-run /work/test-readonly-check > /dev/null 2>&1
+trim --dry-run /work/test-readonly-check > /dev/null 2>&1
 after=$(md5sum /work/test-readonly-check | cut -d' ' -f1)
 [ "$before" = "$after" ] && \
     pass "--dry-run: file not modified" || \
@@ -252,7 +252,7 @@ after=$(md5sum /work/test-readonly-check | cut -d' ' -f1)
 printf '\n--- Multiple files ---\n'
 gcc -g -O0 -fno-inline -o /work/multi1 /tests/hello.c
 gcc -g -O0 -fno-inline -o /work/multi2 /tests/hello.c
-output=$(xstrip --dry-run --in-place /work/multi1 /work/multi2 2>&1)
+output=$(trim --dry-run --in-place /work/multi1 /work/multi2 2>&1)
 count=$(echo "$output" | grep -c 'analyzing:' || true)
 [ "$count" -ge 2 ] && \
     pass "Multiple files analyzed ($count)" || \
@@ -264,7 +264,7 @@ count=$(echo "$output" | grep -c 'analyzing:' || true)
 printf '\n--- Error handling ---\n'
 
 set +e
-output=$(xstrip 2>&1)
+output=$(trim 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'Usage' && \
@@ -275,7 +275,7 @@ echo "$output" | grep -q 'Usage' && \
     fail "No args: exit code" "expected 1, got $rc"
 
 set +e
-output=$(xstrip /work/nonexistent 2>&1)
+output=$(trim /work/nonexistent 2>&1)
 set -e
 echo "$output" | grep -q 'not found' && \
     pass "Non-existent: error" || \
@@ -284,7 +284,7 @@ echo "$output" | grep -q 'not found' && \
 cp /work/hello-dyn /work/test-ro
 chmod 444 /work/test-ro
 set +e
-output=$(xstrip --in-place /work/test-ro 2>&1)
+output=$(trim --in-place /work/test-ro 2>&1)
 set -e
 echo "$output" | grep -q 'not writable' && \
     pass "Non-writable: error" || \
@@ -297,7 +297,7 @@ chmod 644 /work/test-ro
 printf '\n--- Security tests ---\n'
 
 set +e
-output=$(xstrip --in-place '/work/../etc/passwd' 2>&1)
+output=$(trim --in-place '/work/../etc/passwd' 2>&1)
 set -e
 echo "$output" | grep -q 'Error\|not found\|skipped' && \
     pass "[SEC] Path traversal rejected" || \
@@ -306,7 +306,7 @@ echo "$output" | grep -q 'Error\|not found\|skipped' && \
 ln -sf /etc/hostname /work/test-symlink 2>/dev/null || true
 if [ -L /work/test-symlink ]; then
     set +e
-    output=$(xstrip --in-place /work/test-symlink 2>&1)
+    output=$(trim --in-place /work/test-symlink 2>&1)
     set -e
     echo "$output" | grep -q 'Error\|symlink' && \
         pass "[SEC] Symlink escape rejected" || \
@@ -316,7 +316,7 @@ fi
 
 printf 'not an executable\n' > /work/test-corrupt
 set +e
-output=$(xstrip --in-place /work/test-corrupt 2>&1)
+output=$(trim --in-place /work/test-corrupt 2>&1)
 set -e
 echo "$output" | grep -q 'skipped\|no function' && \
     pass "[SEC] Corrupted file handled" || \
@@ -331,7 +331,7 @@ llvm-strip /work/test-stripped-dyn
 printf 'Stripped: test-stripped-dyn (%d bytes)\n' \
     "$(stat -c%s /work/test-stripped-dyn)"
 
-output=$(xstrip --dry-run /work/test-stripped-dyn 2>&1)
+output=$(trim --dry-run /work/test-stripped-dyn 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead' && \
@@ -345,7 +345,7 @@ echo "$output" | grep -q 'found [0-9]' && \
 # Patch stripped dynamic binary and verify execution
 cp /work/hello-dyn /work/test-stripped-dyn-patch
 llvm-strip /work/test-stripped-dyn-patch
-xstrip --in-place /work/test-stripped-dyn-patch
+trim --in-place /work/test-stripped-dyn-patch
 /work/test-stripped-dyn-patch > /dev/null 2>&1 && \
     pass "Stripped dyn: patched binary executes" || \
     fail "Stripped dyn: execution" "crashed"
@@ -364,7 +364,7 @@ llvm-strip /work/test-stripped-static
 printf 'Stripped: test-stripped-static (%d bytes)\n' \
     "$(stat -c%s /work/test-stripped-static)"
 
-output=$(xstrip --dry-run /work/test-stripped-static 2>&1)
+output=$(trim --dry-run /work/test-stripped-static 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead\|found [0-9]' && \
@@ -374,7 +374,7 @@ echo "$output" | grep -q 'dead\|found [0-9]' && \
 # Patch stripped static binary and verify execution
 cp /work/hello-static /work/test-stripped-static-patch
 llvm-strip /work/test-stripped-static-patch
-xstrip --in-place /work/test-stripped-static-patch
+trim --in-place /work/test-stripped-static-patch
 /work/test-stripped-static-patch > /dev/null 2>&1 && \
     pass "Stripped static: patched binary executes" || \
     fail "Stripped static: execution" "crashed"
@@ -388,7 +388,7 @@ llvm-strip /work/test-stripped-lib.so
 printf 'Stripped: test-stripped-lib.so (%d bytes)\n' \
     "$(stat -c%s /work/test-stripped-lib.so)"
 
-output=$(xstrip --dry-run /work/test-stripped-lib.so 2>&1)
+output=$(trim --dry-run /work/test-stripped-lib.so 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead\|found [0-9]' && \
@@ -412,13 +412,13 @@ gcc -g -O0 -fno-inline -o /work/test-zero /tests/tail-dead.c
 orig_sz_zero=$(stat -c%s /work/test-zero)
 printf 'Built: test-zero (%d bytes)\n' "$orig_sz_zero"
 
-output=$(xstrip --dry-run /work/test-zero 2>&1)
+output=$(trim --dry-run /work/test-zero 2>&1)
 echo "$output"
 echo "$output" | grep -q 'dead_big\|dead_also' && \
     pass "Minify: detected dead code" || \
     fail "Minify: dead code" "not found"
 
-output=$(xstrip --in-place /work/test-zero 2>&1)
+output=$(trim --in-place /work/test-zero 2>&1)
 echo "$output" | grep -q 'freed' && \
     pass "Minify: reports freed bytes" || \
     fail "Minify: report" "no freed message"
@@ -447,13 +447,13 @@ gcc -g -O0 -fno-inline -o /work/test-big /tests/big-dead.c
 orig_sz_big=$(stat -c%s /work/test-big)
 printf 'Built: test-big (%d bytes)\n' "$orig_sz_big"
 
-output=$(xstrip --dry-run /work/test-big 2>&1)
+output=$(trim --dry-run /work/test-big 2>&1)
 echo "$output"
 echo "$output" | grep -q 'dead_f01' && \
     pass "BigDead: detected dead functions" || \
     fail "BigDead: detection" "dead_f01 not found"
 
-xstrip --in-place /work/test-big
+trim --in-place /work/test-big
 new_sz_big=$(stat -c%s /work/test-big)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_big" "$new_sz_big"
 
@@ -475,7 +475,7 @@ echo "$output" | grep -q 'result: 25' && \
 # =============================================
 printf '\n--- Stream mode: output file ---\n'
 cp /work/hello-dyn /work/test-stream-in
-xstrip /work/test-stream-in /work/test-stream-out 2>/dev/null
+trim /work/test-stream-in /work/test-stream-out 2>/dev/null
 chmod +x /work/test-stream-out
 /work/test-stream-out > /dev/null 2>&1 && \
     pass "Stream output file: patched binary executes" || \
@@ -499,7 +499,7 @@ orig=$(md5sum /work/test-stream-orig | cut -d' ' -f1)
 # =============================================
 printf '\n--- Stream mode: stdout ---\n'
 cp /work/hello-dyn /work/test-stdout-in
-xstrip /work/test-stdout-in > /work/test-stdout-out 2>/dev/null
+trim /work/test-stdout-in > /work/test-stdout-out 2>/dev/null
 chmod +x /work/test-stdout-out
 /work/test-stdout-out > /dev/null 2>&1 && \
     pass "Stream stdout: patched binary executes" || \
@@ -515,7 +515,7 @@ echo "$output" | grep -q 'result:' && \
 # =============================================
 printf '\n--- Pipe mode: stdin to stdout ---\n'
 cp /work/hello-dyn /work/test-pipe-src
-cat /work/test-pipe-src | xstrip - > /work/test-pipe-out 2>/dev/null
+cat /work/test-pipe-src | trim - > /work/test-pipe-out 2>/dev/null
 chmod +x /work/test-pipe-out
 /work/test-pipe-out > /dev/null 2>&1 && \
     pass "Pipe mode: patched binary executes" || \
@@ -531,7 +531,7 @@ echo "$output" | grep -q 'result:' && \
 # =============================================
 printf '\n--- Pipe mode: dry-run from stdin ---\n'
 cp /work/hello-dyn /work/test-pipe-dry-src
-report=$(cat /work/test-pipe-dry-src | xstrip --dry-run - 2>&1)
+report=$(cat /work/test-pipe-dry-src | trim --dry-run - 2>&1)
 echo "$report" | grep -q 'dead_compute' && \
     pass "Pipe dry-run: detected dead_compute" || \
     fail "Pipe dry-run: dead_compute" "not found"
@@ -545,7 +545,7 @@ echo "$report" | grep -q 'analyzing:' && \
 # =============================================
 printf '\n--- [SEC] Corrupted data on stdin ---\n'
 set +e
-printf 'not an executable\n' | xstrip - > /dev/null 2>/work/test-sec-pipe
+printf 'not an executable\n' | trim - > /dev/null 2>/work/test-sec-pipe
 rc=$?
 set -e
 [ "$rc" -eq 0 ] && \
@@ -560,7 +560,7 @@ printf '\n--- [SEC] Malformed format-specific inputs ---\n'
 # Truncated Java: valid magic but truncated constant pool
 printf '\xCA\xFE\xBA\xBE\x00\x00\x00\x34\xFF\xFF' > /work/test-bad-java
 set +e
-output=$(xstrip --dry-run /work/test-bad-java 2>&1)
+output=$(trim --dry-run /work/test-bad-java 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
@@ -570,7 +570,7 @@ echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
 # Truncated Wasm: valid magic but truncated body
 printf '\x00\x61\x73\x6D\x01\x00\x00\x00\x0A' > /work/test-bad-wasm
 set +e
-output=$(xstrip --dry-run /work/test-bad-wasm 2>&1)
+output=$(trim --dry-run /work/test-bad-wasm 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
@@ -581,7 +581,7 @@ echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
 printf 'MZ' > /work/test-bad-dotnet
 dd if=/dev/zero bs=1 count=254 >> /work/test-bad-dotnet 2>/dev/null
 set +e
-output=$(xstrip --dry-run /work/test-bad-dotnet 2>&1)
+output=$(trim --dry-run /work/test-bad-dotnet 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
@@ -591,7 +591,7 @@ echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
 # Empty file (0 bytes)
 : > /work/test-empty
 set +e
-output=$(xstrip --dry-run /work/test-empty 2>&1)
+output=$(trim --dry-run /work/test-empty 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|Error' && \
@@ -601,7 +601,7 @@ echo "$output" | grep -q 'skipped\|no function\|Error' && \
 # Java with huge constant pool count but no data
 printf '\xCA\xFE\xBA\xBE\x00\x00\x00\x34\xFF\xFE' > /work/test-huge-cp
 set +e
-output=$(xstrip --dry-run /work/test-huge-cp 2>&1)
+output=$(trim --dry-run /work/test-huge-cp 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
@@ -611,7 +611,7 @@ echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
 # 4 bytes only (every format's minimum magic)
 printf '\x7FELF' > /work/test-4byte
 set +e
-output=$(xstrip --dry-run /work/test-4byte 2>&1)
+output=$(trim --dry-run /work/test-4byte 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
@@ -623,7 +623,7 @@ echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
 # =============================================
 printf '\n--- Stream mode: output file executable ---\n'
 cp /work/hello-dyn /work/test-exec-in
-xstrip /work/test-exec-in /work/test-exec-out 2>/dev/null
+trim /work/test-exec-in /work/test-exec-out 2>/dev/null
 [ -x /work/test-exec-out ] && \
     pass "Stream output: file is executable" || \
     fail "Stream output: executable" "not executable"
@@ -636,10 +636,10 @@ xstrip /work/test-exec-in /work/test-exec-out 2>/dev/null
 # =============================================
 printf '\n--- --version flag ---\n'
 set +e
-output=$(xstrip --version 2>&1)
+output=$(trim --version 2>&1)
 rc=$?
 set -e
-echo "$output" | grep -q 'xstrip [0-9]' && \
+echo "$output" | grep -q 'trim [0-9]' && \
     pass "--version: shows version" || \
     fail "--version" "no version: $output"
 [ "$rc" -eq 0 ] && \
@@ -647,10 +647,10 @@ echo "$output" | grep -q 'xstrip [0-9]' && \
     fail "--version: exit code" "expected 0, got $rc"
 
 set +e
-output=$(xstrip -v 2>&1)
+output=$(trim -v 2>&1)
 rc=$?
 set -e
-echo "$output" | grep -q 'xstrip [0-9]' && \
+echo "$output" | grep -q 'trim [0-9]' && \
     pass "-v: shows version" || \
     fail "-v" "no version: $output"
 [ "$rc" -eq 0 ] && \
@@ -662,7 +662,7 @@ echo "$output" | grep -q 'xstrip [0-9]' && \
 # =============================================
 printf '\n--- --license flag ---\n'
 set +e
-output=$(xstrip --license 2>&1)
+output=$(trim --license 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'MIT' && \
@@ -673,7 +673,7 @@ echo "$output" | grep -q 'MIT' && \
     fail "--license: exit code" "expected 0, got $rc"
 
 set +e
-output=$(xstrip -l 2>&1)
+output=$(trim -l 2>&1)
 rc=$?
 set -e
 echo "$output" | grep -q 'MIT' && \
@@ -688,9 +688,9 @@ echo "$output" | grep -q 'MIT' && \
 # =============================================
 printf '\n--- --help content ---\n'
 set +e
-output=$(xstrip --help 2>&1)
+output=$(trim --help 2>&1)
 set -e
-echo "$output" | grep -q 'xstrip [0-9]' && \
+echo "$output" | grep -q 'trim [0-9]' && \
     pass "--help: shows version" || \
     fail "--help: version" "not found"
 echo "$output" | grep -q 'Author:' && \
@@ -705,7 +705,7 @@ echo "$output" | grep -q 'DISCLAIMER' && \
 # =============================================
 printf '\n--- Dead code detection: PE executable ---\n'
 cp /work/hello.exe /work/test-pe
-output=$(xstrip --dry-run /work/test-pe 2>&1)
+output=$(trim --dry-run /work/test-pe 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -726,7 +726,7 @@ echo "$output" | grep -q '  main' && \
 printf '\n--- Patching: PE executable ---\n'
 cp /work/hello.exe /work/test-pe-patch
 orig_sz_pe=$(stat -c%s /work/test-pe-patch)
-xstrip --in-place /work/test-pe-patch
+trim --in-place /work/test-pe-patch
 new_sz_pe=$(stat -c%s /work/test-pe-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_pe" "$new_sz_pe"
 
@@ -748,7 +748,7 @@ clang-19 --target=x86_64-w64-mingw32 -g -O0 -fno-inline -shared \
 printf 'Built: lib.dll (%d bytes, PE DLL)\n' \
     "$(stat -c%s /work/lib.dll)"
 
-output=$(xstrip --dry-run /work/lib.dll 2>&1)
+output=$(trim --dry-run /work/lib.dll 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -771,7 +771,7 @@ echo "$output" | grep -q '  multiply' && \
 # Dead code detection: Mach-O object
 # =============================================
 printf '\n--- Dead code detection: Mach-O object ---\n'
-output=$(xstrip --dry-run /work/lib-macho.o 2>&1)
+output=$(trim --dry-run /work/lib-macho.o 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -799,7 +799,7 @@ echo "$output" | grep -q '    compute:' && \
 # =============================================
 printf '\n--- Patching: Mach-O object ---\n'
 cp /work/lib-macho.o /work/test-macho-patch
-output=$(xstrip /work/test-macho-patch 2>&1)
+output=$(trim /work/test-macho-patch 2>&1)
 echo "$output"
 macho_sz_before=$(stat -c%s /work/lib-macho.o)
 macho_sz_after=$(stat -c%s /work/test-macho-patch)
@@ -815,7 +815,7 @@ file /work/test-macho-patch | grep -qi 'mach-o' && \
 # Dead code detection: .NET managed assembly
 # =============================================
 printf '\n--- Dead code detection: .NET managed ---\n'
-output=$(xstrip --dry-run /work/hello-dotnet.exe 2>&1)
+output=$(trim --dry-run /work/hello-dotnet.exe 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -847,7 +847,7 @@ echo "$output" | grep -q '    LiveHelper:' && \
 # =============================================
 printf '\n--- Patching: .NET managed ---\n'
 cp /work/hello-dotnet.exe /work/test-dotnet-patch
-output=$(xstrip /work/test-dotnet-patch 2>&1)
+output=$(trim /work/test-dotnet-patch 2>&1)
 echo "$output"
 dn_sz_before=$(stat -c%s /work/hello-dotnet.exe)
 dn_sz_after=$(stat -c%s /work/test-dotnet-patch)
@@ -863,7 +863,7 @@ file /work/test-dotnet-patch | grep -qi 'pe' && \
 # .NET IL dead branch detection
 # =============================================
 printf '\n--- .NET IL dead branch detection ---\n'
-output=$(xstrip --dry-run /work/hello-dotnet.exe 2>&1)
+output=$(trim --dry-run /work/hello-dotnet.exe 2>&1)
 echo "$output"
 echo "$output" | grep -q 'dead branch' && \
     pass ".NET: detected dead branches" || \
@@ -878,7 +878,7 @@ gcc -g -O0 -fno-inline -fno-builtin -o /work/test-dead-branch \
 printf 'Built: test-dead-branch (%d bytes)\n' \
     "$(stat -c%s /work/test-dead-branch)"
 
-output=$(xstrip --dry-run /work/test-dead-branch 2>&1)
+output=$(trim --dry-run /work/test-dead-branch 2>&1)
 echo "$output"
 
 # Must detect dead branch after exit() in noreturn_dead
@@ -903,7 +903,7 @@ echo "$output" | grep -q '    main:' && \
 
 # Patch and verify execution + compaction
 cp /work/test-dead-branch /work/test-dead-branch-patch
-patch_out=$(xstrip --in-place /work/test-dead-branch-patch 2>&1)
+patch_out=$(trim --in-place /work/test-dead-branch-patch 2>&1)
 echo "$patch_out"
 /work/test-dead-branch-patch 5 > /dev/null 2>&1 && \
     pass "DeadBranch: patched binary executes" || \
@@ -928,7 +928,7 @@ gcc -g -O0 -fno-inline -fno-builtin -o /work/test-combined \
 printf 'Built: test-combined (%d bytes)\n' \
     "$(stat -c%s /work/test-combined)"
 
-output=$(xstrip --dry-run /work/test-combined 2>&1)
+output=$(trim --dry-run /work/test-combined 2>&1)
 echo "$output"
 
 # Must detect dead functions
@@ -960,7 +960,7 @@ echo "$output" | grep -q '    main:' && \
 
 # Patch and verify execution + compaction
 cp /work/test-combined /work/test-combined-patch
-patch_out=$(xstrip --in-place /work/test-combined-patch 2>&1)
+patch_out=$(trim --in-place /work/test-combined-patch 2>&1)
 echo "$patch_out"
 /work/test-combined-patch 5 > /dev/null 2>&1 && \
     pass "Combined: patched binary executes" || \
@@ -987,7 +987,7 @@ printf '\n--- PE metadata validation ---\n'
 clang-19 --target=x86_64-w64-mingw32 -g -O0 -fno-inline -shared \
     -fuse-ld=lld -o /work/test-pe-meta.dll /tests/lib.c 2>/dev/null
 orig_sz_pe_meta=$(stat -c%s /work/test-pe-meta.dll)
-xstrip --in-place /work/test-pe-meta.dll 2>/dev/null
+trim --in-place /work/test-pe-meta.dll 2>/dev/null
 new_sz_pe_meta=$(stat -c%s /work/test-pe-meta.dll)
 
 [ "$new_sz_pe_meta" -le "$orig_sz_pe_meta" ] && \
@@ -1006,7 +1006,7 @@ printf '\n--- Mach-O metadata validation ---\n'
 clang-19 -c --target=arm64-apple-macosx -g -O0 -fno-inline \
     -o /work/test-macho-meta /tests/big-dead.c
 orig_sz_macho_meta=$(stat -c%s /work/test-macho-meta)
-xstrip --in-place /work/test-macho-meta 2>/dev/null
+trim --in-place /work/test-macho-meta 2>/dev/null
 new_sz_macho_meta=$(stat -c%s /work/test-macho-meta)
 
 [ "$new_sz_macho_meta" -le "$orig_sz_macho_meta" ] && \
@@ -1022,7 +1022,7 @@ echo "$file_info" | grep -qi 'mach-o' && \
 # Dead code detection: AArch64
 # =============================================
 printf '\n--- Dead code detection: AArch64 ---\n'
-output=$(xstrip --dry-run /work/hello-aarch64 2>&1)
+output=$(trim --dry-run /work/hello-aarch64 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1056,7 +1056,7 @@ echo "$file_info" | grep -q 'ELF.*ARM aarch64' && \
 printf '\n--- Patching: AArch64 ---\n'
 cp /work/hello-aarch64 /work/test-aarch64-patch
 orig_sz_a64=$(stat -c%s /work/test-aarch64-patch)
-patch_out_a64=$(xstrip --in-place /work/test-aarch64-patch 2>&1)
+patch_out_a64=$(trim --in-place /work/test-aarch64-patch 2>&1)
 echo "$patch_out_a64"
 new_sz_a64=$(stat -c%s /work/test-aarch64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_a64" "$new_sz_a64"
@@ -1078,7 +1078,7 @@ echo "$patch_out_a64" | grep -q 'dead functions removed' && \
 # Dead code detection: ARM32
 # =============================================
 printf '\n--- Dead code detection: ARM32 ---\n'
-output=$(xstrip --dry-run /work/hello-arm32 2>&1)
+output=$(trim --dry-run /work/hello-arm32 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1112,7 +1112,7 @@ echo "$file_info" | grep -q 'ELF.*ARM' && \
 printf '\n--- Patching: ARM32 ---\n'
 cp /work/hello-arm32 /work/test-arm32-patch
 orig_sz_arm32=$(stat -c%s /work/test-arm32-patch)
-patch_out_arm32=$(xstrip --in-place /work/test-arm32-patch 2>&1)
+patch_out_arm32=$(trim --in-place /work/test-arm32-patch 2>&1)
 echo "$patch_out_arm32"
 new_sz_arm32=$(stat -c%s /work/test-arm32-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_arm32" "$new_sz_arm32"
@@ -1134,7 +1134,7 @@ echo "$patch_out_arm32" | grep -q 'dead functions removed' && \
 # Dead code detection: RISC-V 64
 # =============================================
 printf '\n--- Dead code detection: RISC-V 64 ---\n'
-output=$(xstrip --dry-run /work/hello-riscv64 2>&1)
+output=$(trim --dry-run /work/hello-riscv64 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1168,7 +1168,7 @@ echo "$file_info" | grep -q 'ELF.*RISC-V' && \
 printf '\n--- Patching: RISC-V 64 ---\n'
 cp /work/hello-riscv64 /work/test-riscv64-patch
 orig_sz_rv=$(stat -c%s /work/test-riscv64-patch)
-patch_out_rv=$(xstrip --in-place /work/test-riscv64-patch 2>&1)
+patch_out_rv=$(trim --in-place /work/test-riscv64-patch 2>&1)
 echo "$patch_out_rv"
 new_sz_rv=$(stat -c%s /work/test-riscv64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_rv" "$new_sz_rv"
@@ -1194,7 +1194,7 @@ echo "$patch_out_rv" | grep -q 'dead functions removed' && \
 # Dead code detection: MIPS (big-endian)
 # =============================================
 printf '\n--- Dead code detection: MIPS ---\n'
-output=$(xstrip --dry-run /work/hello-mips 2>&1)
+output=$(trim --dry-run /work/hello-mips 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1228,7 +1228,7 @@ echo "$file_info" | grep -q 'ELF.*MIPS' && \
 printf '\n--- Patching: MIPS ---\n'
 cp /work/hello-mips /work/test-mips-patch
 orig_sz_mips=$(stat -c%s /work/test-mips-patch)
-patch_out_mips=$(xstrip --in-place /work/test-mips-patch 2>&1)
+patch_out_mips=$(trim --in-place /work/test-mips-patch 2>&1)
 echo "$patch_out_mips"
 new_sz_mips=$(stat -c%s /work/test-mips-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_mips" "$new_sz_mips"
@@ -1254,7 +1254,7 @@ echo "$patch_out_mips" | grep -q 'dead functions removed' && \
 # Dead code detection: s390x
 # =============================================
 printf '\n--- Dead code detection: s390x ---\n'
-output=$(xstrip --dry-run /work/hello-s390x 2>&1)
+output=$(trim --dry-run /work/hello-s390x 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1288,7 +1288,7 @@ echo "$file_info" | grep -q 'ELF.*S/390' && \
 printf '\n--- Patching: s390x ---\n'
 cp /work/hello-s390x /work/test-s390x-patch
 orig_sz_s390=$(stat -c%s /work/test-s390x-patch)
-patch_out_s390=$(xstrip --in-place /work/test-s390x-patch 2>&1)
+patch_out_s390=$(trim --in-place /work/test-s390x-patch 2>&1)
 echo "$patch_out_s390"
 new_sz_s390=$(stat -c%s /work/test-s390x-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_s390" "$new_sz_s390"
@@ -1314,7 +1314,7 @@ echo "$patch_out_s390" | grep -q 'dead functions removed' && \
 # Dead code detection: LoongArch64
 # =============================================
 printf '\n--- Dead code detection: LoongArch64 ---\n'
-output=$(xstrip --dry-run /work/hello-loongarch64 2>&1)
+output=$(trim --dry-run /work/hello-loongarch64 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1348,7 +1348,7 @@ echo "$file_info" | grep -q 'ELF.*LoongArch' && \
 printf '\n--- Patching: LoongArch64 ---\n'
 cp /work/hello-loongarch64 /work/test-loongarch64-patch
 orig_sz_la=$(stat -c%s /work/test-loongarch64-patch)
-patch_out_la=$(xstrip --in-place /work/test-loongarch64-patch 2>&1)
+patch_out_la=$(trim --in-place /work/test-loongarch64-patch 2>&1)
 echo "$patch_out_la"
 new_sz_la=$(stat -c%s /work/test-loongarch64-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_la" "$new_sz_la"
@@ -1374,7 +1374,7 @@ echo "$patch_out_la" | grep -q 'dead functions removed' && \
 # Dead code detection: x86-32
 # =============================================
 printf '\n--- Dead code detection: x86-32 ---\n'
-output=$(xstrip --dry-run /work/hello-x86-32 2>&1)
+output=$(trim --dry-run /work/hello-x86-32 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'dead_compute' && \
@@ -1408,7 +1408,7 @@ echo "$file_info" | grep -q 'ELF.*32-bit\|ELF.*386\|ELF.*i386' && \
 printf '\n--- Patching: x86-32 ---\n'
 cp /work/hello-x86-32 /work/test-x86-32-patch
 orig_sz_x32=$(stat -c%s /work/test-x86-32-patch)
-patch_out_x32=$(xstrip --in-place /work/test-x86-32-patch 2>&1)
+patch_out_x32=$(trim --in-place /work/test-x86-32-patch 2>&1)
 echo "$patch_out_x32"
 new_sz_x32=$(stat -c%s /work/test-x86-32-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_x32" "$new_sz_x32"
@@ -1430,7 +1430,7 @@ echo "$patch_out_x32" | grep -q 'dead functions removed' && \
 # Dead code detection: WebAssembly
 # =============================================
 printf '\n--- Dead code detection: WebAssembly ---\n'
-output=$(xstrip --dry-run /work/lib.wasm 2>&1)
+output=$(trim --dry-run /work/lib.wasm 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -1457,7 +1457,7 @@ echo "$output" | grep -q '  compute' && \
 # Wasm dead branch detection
 # =============================================
 printf '\n--- Wasm dead branch detection ---\n'
-output=$(xstrip --dry-run /work/lib.wasm 2>&1)
+output=$(trim --dry-run /work/lib.wasm 2>&1)
 echo "$output"
 echo "$output" | grep -q 'dead branch' && \
     pass "Wasm: detected dead branches" || \
@@ -1469,7 +1469,7 @@ echo "$output" | grep -q 'dead branch' && \
 printf '\n--- Patching: WebAssembly ---\n'
 cp /work/lib.wasm /work/test-wasm-patch
 orig_sz_wasm=$(stat -c%s /work/test-wasm-patch)
-patch_out_wasm=$(xstrip --in-place /work/test-wasm-patch 2>&1)
+patch_out_wasm=$(trim --in-place /work/test-wasm-patch 2>&1)
 echo "$patch_out_wasm"
 new_sz_wasm=$(stat -c%s /work/test-wasm-patch)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_wasm" "$new_sz_wasm"
@@ -1497,7 +1497,7 @@ echo "$patch_out_wasm" | grep -q 'dead branches removed' && \
 # Dead code detection: Java .class
 # =============================================
 printf '\n--- Dead code detection: Java .class ---\n'
-output=$(xstrip --dry-run /work/hello-java.class 2>&1)
+output=$(trim --dry-run /work/hello-java.class 2>&1)
 echo "$output"
 
 echo "$output" | grep -q 'analyzing:' && \
@@ -1546,7 +1546,7 @@ echo "$output" | grep -q '    liveWithSMT:' && \
 printf '\n--- Patching: Java .class ---\n'
 cp /work/hello-java.class /work/test-java-patch.class
 orig_sz_java=$(stat -c%s /work/test-java-patch.class)
-patch_out_java=$(xstrip --in-place /work/test-java-patch.class 2>&1)
+patch_out_java=$(trim --in-place /work/test-java-patch.class 2>&1)
 echo "$patch_out_java"
 new_sz_java=$(stat -c%s /work/test-java-patch.class)
 printf 'Size: %d -> %d bytes\n' "$orig_sz_java" "$new_sz_java"

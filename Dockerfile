@@ -12,7 +12,7 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
 ARG TARGETPLATFORM
 RUN xx-apk add --no-cache musl-dev
 
-ARG XSTRIP_VERSION
+ARG TRIM_VERSION
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
@@ -20,22 +20,22 @@ COPY LICENSE ./
 COPY src src
 
 RUN TRIPLE="$(xx-info march)-unknown-linux-musl" \
-    && if [ -n "$XSTRIP_VERSION" ]; then export XSTRIP_VERSION; fi \
+    && if [ -n "$TRIM_VERSION" ]; then export TRIM_VERSION; fi \
     && xx-cargo build --release \
-    && xx-verify "target/${TRIPLE}/release/xstrip" \
-    && cp "target/${TRIPLE}/release/xstrip" /xstrip
+    && xx-verify "target/${TRIPLE}/release/trim" \
+    && cp "target/${TRIPLE}/release/trim" /trim
 
 FROM scratch AS export
-COPY --from=builder /xstrip /xstrip
+COPY --from=builder /trim /trim
 
 FROM scratch
 
-COPY --from=builder /xstrip /usr/local/bin/xstrip
+COPY --from=builder /trim /usr/local/bin/trim
 
 WORKDIR /work
 USER 10000:10000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=1 \
-    CMD ["/usr/local/bin/xstrip", "--help"]
+    CMD ["/usr/local/bin/trim", "--help"]
 
-ENTRYPOINT ["/usr/local/bin/xstrip"]
+ENTRYPOINT ["/usr/local/bin/trim"]

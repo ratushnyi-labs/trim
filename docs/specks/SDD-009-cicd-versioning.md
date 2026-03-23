@@ -5,16 +5,16 @@
 
 ## Scope
 
-- Add `--version` / `-v` flag: prints `xstrip <version>` to stdout, exit 0
+- Add `--version` / `-v` flag: prints `trim <version>` to stdout, exit 0
 - Add `--license` / `-l` flag: prints MIT license to stdout, exit 0
 - Show version, author, and legal disclaimer in `--help` output
-- Embed version at compile time via `XSTRIP_VERSION` env var (fallback to
+- Embed version at compile time via `TRIM_VERSION` env var (fallback to
   `CARGO_PKG_VERSION`)
 - Create MIT LICENSE file
 - Add GitHub CI workflow (test via Docker, native cargo build on push/PR)
 - Add GitHub release workflow (test via Docker, native cargo-zigbuild
   cross-compilation for amd64+arm64 on tag push)
-- Pass `XSTRIP_VERSION` build arg through Dockerfile and dist.sh
+- Pass `TRIM_VERSION` build arg through Dockerfile and dist.sh
 - Stream mode output file is automatically executable (chmod +x)
 
 ## Non-goals
@@ -25,16 +25,16 @@
 
 ## Acceptance Criteria
 
-- AC-1: `xstrip --version` prints `xstrip <version>` to stdout, exit 0
-- AC-2: `xstrip -v` behaves identically to `--version`
-- AC-3: `xstrip --license` prints MIT license text to stdout, exit 0
-- AC-4: `xstrip -l` behaves identically to `--license`
-- AC-5: `xstrip --help` shows version in header, author line, legal disclaimer
-- AC-6: Version defaults to Cargo.toml version when `XSTRIP_VERSION` is unset
-- AC-7: Version uses `XSTRIP_VERSION` env var when set at compile time
+- AC-1: `trim --version` prints `trim <version>` to stdout, exit 0
+- AC-2: `trim -v` behaves identically to `--version`
+- AC-3: `trim --license` prints MIT license text to stdout, exit 0
+- AC-4: `trim -l` behaves identically to `--license`
+- AC-5: `trim --help` shows version in header, author line, legal disclaimer
+- AC-6: Version defaults to Cargo.toml version when `TRIM_VERSION` is unset
+- AC-7: Version uses `TRIM_VERSION` env var when set at compile time
 - AC-8: CI workflow runs tests and builds on push to main and PRs
 - AC-9: Release workflow builds and publishes binaries on tag push
-- AC-10: `dist.sh` passes `XSTRIP_VERSION` build arg to Docker
+- AC-10: `dist.sh` passes `TRIM_VERSION` build arg to Docker
 - AC-11: LICENSE file exists at repo root with MIT text
 - AC-12: Stream mode output file has executable permission set
 
@@ -50,8 +50,8 @@
 
 | Condition             | Output (stderr/stdout)      | Exit |
 |-----------------------|-----------------------------|------|
-| `--version`           | stdout: `xstrip <ver>`      | 0    |
-| `-v`                  | stdout: `xstrip <ver>`      | 0    |
+| `--version`           | stdout: `trim <ver>`      | 0    |
+| `-v`                  | stdout: `trim <ver>`      | 0    |
 | `--license`           | stdout: MIT license text    | 0    |
 | `-l`                  | stdout: MIT license text    | 0    |
 

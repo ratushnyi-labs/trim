@@ -3,7 +3,7 @@
 
 /* ============================================================
  * DEAD CODE: these functions are never called from anywhere.
- * xstrip should detect and patch them out.
+ * trim should detect and patch them out.
  * ============================================================ */
 
 static int dead_compute(int a, int b) {
@@ -53,7 +53,7 @@ static void dead_fill_buffer(char *buf, int len) {
 
 /* ============================================================
  * LIVE CODE: called directly or indirectly from main.
- * xstrip must NOT touch these.
+ * trim must NOT touch these.
  * ============================================================ */
 
 static int live_add(int a, int b) {

@@ -1,4 +1,4 @@
-# SDD-005 -- xstrip Docker Image for Cross-Format Executable Stripping
+# SDD-005 -- trim Docker Image for Cross-Format Executable Stripping
 
 **Impacted UCs:** UC-001, UC-002, UC-003
 **Impacted BR/WF:** BR-001 through BR-006, WF-001

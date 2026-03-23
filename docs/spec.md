@@ -1,10 +1,10 @@
-# xstrip -- Specification
+# trim -- Specification
 
 **Version:** 0.1.0
 
 ## 1. What the System Does
 
-xstrip is a dead code analyzer and remover for compiled binaries. It
+trim is a dead code analyzer and remover for compiled binaries. It
 supports ELF, PE/COFF, Mach-O, .NET managed assemblies, WebAssembly
 modules, and Java .class files. It finds unreachable functions using
 address-based call graph analysis (or IL call graph for .NET / Wasm call
@@ -13,7 +13,7 @@ shrinks binaries by removing dead code regions, patching instruction
 offsets, and updating format metadata. It works directly on compiled
 binaries — no source code or recompilation needed.
 
-xstrip is a static musl binary (Rust) with zero runtime dependencies,
+trim is a static musl binary (Rust) with zero runtime dependencies,
 distributed as a scratch-based Docker image or standalone binary for
 x86_64 and aarch64 Linux.
 
@@ -55,7 +55,7 @@ x86_64 and aarch64 Linux.
             |
             v
 +----------------------------+
-| xstrip validates:          |
+| trim validates:          |
 |   - file exists            |
 |   - file is writable       |
 |   - file is not symlink    |
@@ -106,8 +106,8 @@ Supported platforms: `linux/amd64` (`x86_64-unknown-linux-musl`),
 **Summary:** User finds and removes dead code from one executable,
 writing the patched binary to an output file or stdout.
 
-**Description:** The user runs xstrip with an input path and optional
-output path. xstrip reads the input file, analyzes the call graph,
+**Description:** The user runs trim with an input path and optional
+output path. trim reads the input file, analyzes the call graph,
 identifies dead functions, patches them out, and writes the result to
 the output file or stdout. The input file is never modified. All
 diagnostic output goes to stderr.
@@ -118,7 +118,7 @@ diagnostic output goes to stderr.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip INPUT OUTPUT] --> B{INPUT exists?}
+  A[User runs: trim INPUT OUTPUT] --> B{INPUT exists?}
   B -- No --> C["Print error to stderr, exit 1"]
   B -- Yes --> D[Read INPUT bytes]
   D --> E[Analyze call graph]
@@ -157,7 +157,7 @@ to stderr.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip -i file1 file2] --> B[For each file]
+  A[User runs: trim -i file1 file2] --> B[For each file]
   B --> C{Validate file}
   C -- Invalid --> D["Print error to stderr, set exit=1"]
   C -- Valid --> E[Analyze and patch file in-place]
@@ -183,7 +183,7 @@ flowchart TD
 
 **Summary:** User analyzes dead code without modifying the binary.
 
-**Description:** With the `--dry-run` flag, xstrip performs full
+**Description:** With the `--dry-run` flag, trim performs full
 call graph analysis and reports dead functions but does not patch or
 modify the file. Useful for auditing before committing to changes.
 
@@ -193,7 +193,7 @@ modify the file. Useful for auditing before committing to changes.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip --dry-run file] --> B[Parse --dry-run flag]
+  A[User runs: trim --dry-run file] --> B[Parse --dry-run flag]
   B --> C[Validate file]
   C --> D[Analyze call graph]
   D --> E["Report dead functions, exit 0"]
@@ -207,9 +207,9 @@ flowchart TD
 
 ### UC-004: Pipe Mode (stdin to stdout)
 
-**Summary:** User pipes a binary through xstrip via stdin/stdout.
+**Summary:** User pipes a binary through trim via stdin/stdout.
 
-**Description:** The user passes `-` as the input argument. xstrip reads
+**Description:** The user passes `-` as the input argument. trim reads
 the binary from stdin, analyzes the call graph, patches dead code, and
 writes the patched binary to stdout. All diagnostic output goes to stderr.
 Can be combined with `--dry-run` to analyze only.
@@ -220,7 +220,7 @@ Can be combined with `--dry-run` to analyze only.
 
 ```mermaid
 flowchart TD
-  A["User runs: cat binary | xstrip -"] --> B[Read all of stdin]
+  A["User runs: cat binary | trim -"] --> B[Read all of stdin]
   B --> C[Analyze call graph]
   C --> D[Report dead functions to stderr]
   D --> E{--dry-run?}
@@ -243,13 +243,13 @@ flowchart TD
 
 ### BR-001: Stream-First Output
 
-By default, xstrip reads an input file and writes the patched binary to
+By default, trim reads an input file and writes the patched binary to
 an output file or stdout. In-place modification requires the explicit
 `--in-place` / `-i` flag. All diagnostic output goes to stderr.
 
 ### BR-002: Format Auto-Detection
 
-xstrip auto-detects the binary format from magic bytes. No format flag
+trim auto-detects the binary format from magic bytes. No format flag
 is needed from the user. Detection order: ELF (`\x7fELF`), .NET (MZ +
 CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/
 cffa_edfe), Wasm (`\x00asm`), Java (`0xCAFEBABE`).
@@ -277,11 +277,11 @@ all modes: stream, pipe, and in-place.
 
 ### BR-006: Non-Root Execution
 
-The container MUST run as a non-root user (uid 10000, user `xstrip`).
+The container MUST run as a non-root user (uid 10000, user `trim`).
 
 ### BR-007: Dead Branch Detection (SDD-011)
 
-In addition to whole dead functions, xstrip detects dead branches within
+In addition to whole dead functions, trim detects dead branches within
 live functions. Three levels of analysis:
 
 1. **CFG-based** (Phase A — implemented): unreachable basic blocks — code
@@ -304,7 +304,7 @@ Dead blocks are compacted through the same pipeline as dead functions.
 
 ### BR-008: Physical Compaction (SDD-013)
 
-For native binary formats (ELF, PE, Mach-O), xstrip physically removes
+For native binary formats (ELF, PE, Mach-O), trim physically removes
 dead code from the .text section and patches all affected metadata:
 
 - **ELF:** All architectures. Patches entry point, section/program
@@ -324,7 +324,7 @@ recalculation for all supported architectures.
 
 ### BR-009: Wasm, .NET & Java Dead Branch Detection (SDD-013, SDD-014)
 
-In addition to dead function detection, xstrip detects dead branches
+In addition to dead function detection, trim detects dead branches
 within live function/method bodies for bytecode formats:
 
 - **WebAssembly:** Detects unreachable code after `unreachable` (0x00),

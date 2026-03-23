@@ -11,15 +11,15 @@ mkdir -p dist
 
 for plat in linux/amd64 linux/arm64; do
     suffix="${plat#linux/}"
-    printf '=== Building xstrip for %s ===\n' "$plat"
+    printf '=== Building trim for %s ===\n' "$plat"
     docker buildx build \
         --platform "$plat" \
         --target export \
-        --build-arg "XSTRIP_VERSION=${XSTRIP_VERSION:-}" \
+        --build-arg "TRIM_VERSION=${TRIM_VERSION:-}" \
         --output "type=local,dest=dist/${suffix}" \
         .
-    tar -czf "dist/xstrip-linux-${suffix}.tar.gz" \
-        --mode='a+x' -C "dist/${suffix}" xstrip
+    tar -czf "dist/trim-linux-${suffix}.tar.gz" \
+        --mode='a+x' -C "dist/${suffix}" trim
     rm -rf "dist/${suffix}"
 done
 

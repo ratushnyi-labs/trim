@@ -34,11 +34,11 @@ jobs:
       - name: Build and package
         run: |
           cargo zigbuild --release --target ${{ matrix.target }}
-          chmod +x "target/${{ matrix.target }}/release/xstrip"
-          tar -czf "xstrip-linux-${{ matrix.suffix }}.tar.gz" \
-              -C "target/${{ matrix.target }}/release" xstrip
+          chmod +x "target/${{ matrix.target }}/release/trim"
+          tar -czf "trim-linux-${{ matrix.suffix }}.tar.gz" \
+              -C "target/${{ matrix.target }}/release" trim
       - uses: actions/upload-artifact@v4
         with:
-          name: xstrip-linux-${{ matrix.suffix }}
-          path: xstrip-linux-${{ matrix.suffix }}.tar.gz
+          name: trim-linux-${{ matrix.suffix }}
+          path: trim-linux-${{ matrix.suffix }}.tar.gz
           retention-days: 30

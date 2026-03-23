@@ -12,8 +12,8 @@ If distributable binaries have been built with `dist.sh`:
 
 ```bash
 # Extract the binary for your architecture
-tar -xzf dist/xstrip-linux-amd64.tar.gz -C /usr/local/bin/   # x86_64
-tar -xzf dist/xstrip-linux-arm64.tar.gz -C /usr/local/bin/   # aarch64
+tar -xzf dist/trim-linux-amd64.tar.gz -C /usr/local/bin/   # x86_64
+tar -xzf dist/trim-linux-arm64.tar.gz -C /usr/local/bin/   # aarch64
 ```
 
 These are fully static musl binaries with zero runtime dependencies.
@@ -25,8 +25,8 @@ They run on any Linux distribution.
 sh dist.sh
 ```
 
-Produces `dist/xstrip-linux-amd64.tar.gz` and `dist/xstrip-linux-arm64.tar.gz`.
-Each archive contains a single `xstrip` binary with executable permissions.
+Produces `dist/trim-linux-amd64.tar.gz` and `dist/trim-linux-arm64.tar.gz`.
+Each archive contains a single `trim` binary with executable permissions.
 
 ## Option 2: Docker Image
 
@@ -34,14 +34,14 @@ Each archive contains a single `xstrip` binary with executable permissions.
 
 ```bash
 git clone <repo-url>
-cd xstrip
+cd trim
 docker compose build strip
 ```
 
 ### Build for a specific platform
 
 ```bash
-docker buildx build --platform linux/arm64 -t xstrip .
+docker buildx build --platform linux/arm64 -t trim .
 ```
 
 ## Usage
@@ -49,41 +49,41 @@ docker buildx build --platform linux/arm64 -t xstrip .
 ### Analyze dead code (read-only, report to stderr)
 
 ```bash
-xstrip --dry-run /path/to/binary
+trim --dry-run /path/to/binary
 ```
 
 ### Stream: write patched binary to output file
 
 ```bash
-xstrip /path/to/binary /path/to/output
+trim /path/to/binary /path/to/output
 ```
 
 ### Stream: write patched binary to stdout
 
 ```bash
-xstrip /path/to/binary > /path/to/output
+trim /path/to/binary > /path/to/output
 ```
 
 ### Pipe: read stdin, write to stdout
 
 ```bash
-cat /path/to/binary | xstrip - > /path/to/output
+cat /path/to/binary | trim - > /path/to/output
 ```
 
 ### In-place modification
 
 ```bash
-xstrip -i /path/to/binary
-xstrip -i /path/to/app1 /path/to/app2
+trim -i /path/to/binary
+trim -i /path/to/app1 /path/to/app2
 ```
 
 ### Via Docker
 
 ```bash
-docker run --rm -v $(pwd)/myapp:/work/myapp xstrip-strip -i /work/myapp
-docker run --rm -v $(pwd)/myapp:/work/myapp xstrip-strip \
+docker run --rm -v $(pwd)/myapp:/work/myapp trim-strip -i /work/myapp
+docker run --rm -v $(pwd)/myapp:/work/myapp trim-strip \
     --dry-run /work/myapp
-docker run --rm -i xstrip-strip - < myapp > myapp.patched
+docker run --rm -i trim-strip - < myapp > myapp.patched
 ```
 
 ### Via docker compose
@@ -133,8 +133,8 @@ Patch mode removes dead code and reports freed bytes:
 
 | Platform       | Archive                         | Target Triple                  |
 |----------------|---------------------------------|--------------------------------|
-| `linux/amd64`  | `xstrip-linux-amd64.tar.gz`    | `x86_64-unknown-linux-musl`    |
-| `linux/arm64`  | `xstrip-linux-arm64.tar.gz`    | `aarch64-unknown-linux-musl`   |
+| `linux/amd64`  | `trim-linux-amd64.tar.gz`    | `x86_64-unknown-linux-musl`    |
+| `linux/arm64`  | `trim-linux-arm64.tar.gz`    | `aarch64-unknown-linux-musl`   |
 
 ## Troubleshooting
 
@@ -147,5 +147,5 @@ Patch mode removes dead code and reports freed bytes:
 
 ## Reverse Proxy Support
 
-N/A -- xstrip is a CLI tool, not a network service. No proxy configuration
+N/A -- trim is a CLI tool, not a network service. No proxy configuration
 is needed.
