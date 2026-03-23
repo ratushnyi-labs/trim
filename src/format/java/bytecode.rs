@@ -3,38 +3,6 @@ use super::classfile::{cp_utf8, ClassFile, CpEntry};
 use crate::analysis::cfg::DeadBlock;
 use std::collections::{HashMap, HashSet};
 
-/// Build call graph: method_index -> set of called method_indices.
-/// Only tracks calls to methods within the same class.
-pub fn build_call_graph(
-    cf: &ClassFile,
-) -> HashMap<usize, HashSet<usize>> {
-    let mut graph: HashMap<usize, HashSet<usize>> =
-        HashMap::new();
-    for (idx, m) in cf.methods.iter().enumerate() {
-        let callees = scan_calls(cf, m.code_offset, m.code_length);
-        graph.insert(idx, callees);
-    }
-    graph
-}
-
-fn scan_calls(
-    cf: &ClassFile,
-    code_offset: Option<usize>,
-    code_length: usize,
-) -> HashSet<usize> {
-    let callees = HashSet::new();
-    let (off, len) = match code_offset {
-        Some(o) => (o, code_length),
-        None => return callees,
-    };
-    // We need to read from the classfile data, but we
-    // only have the parsed structure. Instead, resolve
-    // by matching method names via the constant pool.
-    // This is set up in the caller via the ClassFile.
-    let _ = (cf, off, len);
-    callees
-}
-
 /// Scan bytecode for invoke* instructions, returning
 /// indices of called internal methods.
 pub fn scan_bytecode_calls(
@@ -431,10 +399,11 @@ pub fn compact_method_code(
     data: &[u8],
     m: &super::classfile::MethodInfo,
     dead_ranges: &[(usize, usize)],
+    pool: &[CpEntry],
 ) -> Option<Vec<u8>> {
     let code_off = m.code_offset?;
     let code_len = m.code_length;
-    let code_attr_off = m.code_attr_offset?;
+    let _code_attr_off = m.code_attr_offset?;
     if code_len == 0 || dead_ranges.is_empty() {
         return None;
     }
@@ -445,7 +414,7 @@ pub fn compact_method_code(
         return None;
     }
     // Safety: bail if StackMapTable attribute exists
-    if has_stack_map(data, code_off, code_len, m) {
+    if has_stack_map(data, code_off, code_len, m, pool) {
         return None;
     }
     // Convert to code-relative ranges
@@ -497,59 +466,38 @@ fn has_stack_map(
     code_off: usize,
     code_len: usize,
     m: &super::classfile::MethodInfo,
+    pool: &[CpEntry],
 ) -> bool {
-    let cf_data = data;
-    let ca_off = match m.code_attr_offset {
+    let _ca_off = match m.code_attr_offset {
         Some(o) => o,
         None => return false,
     };
-    // Code attr: u2 name + u4 length + u2 max_stack + u2 max_locals
-    // + u4 code_length + code + u2 exc_table_len + exc_entries
-    // + u2 attrs_count + attrs
+    // Code attr layout after code bytes:
+    // u2 exc_table_len + exc_entries + u2 attrs_count + attrs
     let et_off = code_off + code_len;
-    if et_off + 2 > cf_data.len() { return false; }
-    let et_len = read_u16_be(cf_data, et_off) as usize;
+    if et_off + 2 > data.len() { return false; }
+    let et_len = read_u16_be(data, et_off) as usize;
     let attrs_off =
         et_off + 2 + et_len.saturating_mul(8);
-    if attrs_off + 2 > cf_data.len() { return false; }
+    if attrs_off + 2 > data.len() { return false; }
     let attr_count =
-        read_u16_be(cf_data, attrs_off) as usize;
+        read_u16_be(data, attrs_off) as usize;
     let mut pos = attrs_off + 2;
-    let ca_data_start = ca_off + 6; // past name+length
-    let ca_len = if ca_off + 6 <= cf_data.len() {
-        u32::from_be_bytes(
-            cf_data[ca_off + 2..ca_off + 6]
-                .try_into()
-                .unwrap_or([0; 4]),
-        ) as usize
-    } else {
-        return false;
-    };
-    let ca_end = ca_data_start + ca_len;
     for _ in 0..attr_count {
-        if pos + 6 > ca_end || pos + 6 > cf_data.len() {
-            break;
-        }
-        let name_idx = read_u16_be(cf_data, pos) as usize;
+        if pos + 6 > data.len() { break; }
+        let name_idx = read_u16_be(data, pos) as usize;
         let a_len = u32::from_be_bytes(
-            cf_data[pos + 2..pos + 6]
+            data[pos + 2..pos + 6]
                 .try_into()
                 .unwrap_or([0; 4]),
         ) as usize;
-        // Check if name is "StackMapTable"
-        if let Some(super::classfile::CpEntry::Utf8(ref s)) =
-            m.code_offset
-                .and_then(|_| {
-                    // Use classfile's constant pool indirectly
-                    None::<&super::classfile::CpEntry>
-                })
-        {
-            if s == "StackMapTable" { return true; }
+        if name_idx < pool.len() {
+            if let CpEntry::Utf8(ref s) = pool[name_idx] {
+                if s == "StackMapTable" {
+                    return true;
+                }
+            }
         }
-        // Direct string check from constant pool not available
-        // here, so we skip StackMapTable detection for now.
-        // The gen_java.py test files don't have StackMapTable.
-        let _ = name_idx;
         pos += 6 + a_len;
     }
     false

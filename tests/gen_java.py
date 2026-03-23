@@ -33,22 +33,24 @@ def nat_entry(name_idx, desc_idx):
     return u1(12) + u2(name_idx) + u2(desc_idx)
 
 
-def code_attr(code_idx, max_stack, max_locals, bytecode):
+def code_attr(code_idx, max_stack, max_locals, bytecode,
+              exc_table=b"", sub_attrs=b"", sub_attr_count=0):
     """Build a Code attribute."""
     code_len = len(bytecode)
-    # Code attribute body: max_stack(2) + max_locals(2) + code_length(4)
-    #   + code + exception_table_length(2) + attributes_count(2)
+    exc_count = len(exc_table) // 8
     body = u2(max_stack) + u2(max_locals) + u4(code_len)
     body += bytecode
-    body += u2(0)  # exception_table_length
-    body += u2(0)  # attributes_count
+    body += u2(exc_count) + exc_table
+    body += u2(sub_attr_count) + sub_attrs
     return u2(code_idx) + u4(len(body)) + body
 
 
 def method_info(access_flags, name_idx, desc_idx, code_idx,
-                max_stack, max_locals, bytecode):
+                max_stack, max_locals, bytecode,
+                exc_table=b"", sub_attrs=b"", sub_attr_count=0):
     """Build a method_info structure."""
-    attr = code_attr(code_idx, max_stack, max_locals, bytecode)
+    attr = code_attr(code_idx, max_stack, max_locals, bytecode,
+                     exc_table, sub_attrs, sub_attr_count)
     return u2(access_flags) + u2(name_idx) + u2(desc_idx) + u2(1) + attr
 
 
@@ -91,8 +93,12 @@ def main():
     pool += nat_entry(15, 9)               # 16: <init>:()V
     pool += methodref_entry(4, 16)         # 17: Object.<init>
     pool += utf8_entry("liveBranch")      # 18
+    pool += utf8_entry("deadWithExc")     # 19
+    pool += utf8_entry("deadWithSwitch")  # 20
+    pool += utf8_entry("StackMapTable")   # 21
+    pool += utf8_entry("liveWithSMT")     # 22
 
-    cp_count = 19  # 18 entries + 1 (0-based offset)
+    cp_count = 23  # 22 entries + 1 (0-based offset)
 
     # Methods
     ACC_PUBLIC = 0x0001
@@ -204,8 +210,60 @@ def main():
     m_branch = method_info(ACC_PUBLIC | ACC_STATIC, 18, 14, 7,
                            2, 3, branch_code)
 
-    methods = m_init + m_main + m_live + m_branch + m_dead1 + m_dead2
-    methods_count = 6
+    # deadWithExc: private static, has exception handler table
+    # Exercises: if m.exception_table_len > 0 { return None; }
+    exc_code = (
+        b"\x03"                 # iconst_0
+        + b"\x3C"               # istore_1
+        + b"\x1B"               # iload_1
+        + b"\xAC"               # ireturn
+    )
+    # Exception table: start_pc(2) + end_pc(2) + handler_pc(2) + catch_type(2)
+    exc_table = u2(0) + u2(2) + u2(2) + u2(0)  # catch all in [0,2) -> 2
+    m_dead_exc = method_info(ACC_PRIVATE | ACC_STATIC, 19, 14, 7,
+                             1, 2, exc_code, exc_table=exc_table)
+
+    # deadWithSwitch: private static, has tableswitch opcode
+    # Exercises: if has_switch(data, code_off, code_len) { return None; }
+    # tableswitch: opcode(1) + pad(0) + default(4) + low(4) + high(4) + offset(4)
+    switch_code = (
+        b"\x1B"                 # iload_1
+        # tableswitch at PC 1, pad to align to 4-byte boundary: (4-(1+1)%4)%4 = 2
+        + b"\xAA"               # tableswitch
+        + b"\x00\x00"           # 2 bytes padding
+        + b"\x00\x00\x00\x0E"  # default: +14 (-> PC 15)
+        + b"\x00\x00\x00\x00"  # low: 0
+        + b"\x00\x00\x00\x00"  # high: 0
+        + b"\x00\x00\x00\x0E"  # offset[0]: +14 (-> PC 15)
+        + b"\xAC"               # ireturn (at PC 15)
+    )
+    m_dead_switch = method_info(ACC_PRIVATE | ACC_STATIC, 20, 14, 7,
+                                1, 2, switch_code)
+
+    # liveWithSMT: public static int liveWithSMT()
+    # Live method with dead branch AND a StackMapTable attribute.
+    # Exercises: if has_stack_map(...) { return None; }
+    smt_code = (
+        b"\x03"                 # iconst_0
+        + b"\xAC"               # ireturn
+        # Dead code (8 bytes unreachable):
+        + b"\x10\x0A"          # bipush 10
+        + b"\x3C"               # istore_1
+        + b"\x10\x14"          # bipush 20
+        + b"\x3D"               # istore_2
+        + b"\x1B"               # iload_1
+        + b"\xAC"               # ireturn
+    )
+    # StackMapTable attribute: name_idx(2) + length(4) + number_of_entries(2)
+    smt_attr = u2(21) + u4(2) + u2(0)  # empty StackMapTable
+    m_live_smt = method_info(ACC_PUBLIC | ACC_STATIC, 22, 14, 7,
+                             1, 3, smt_code,
+                             sub_attrs=smt_attr, sub_attr_count=1)
+
+    methods = (m_init + m_main + m_live + m_branch
+               + m_live_smt + m_dead1 + m_dead2
+               + m_dead_exc + m_dead_switch)
+    methods_count = 9
 
     # Assemble class file
     out = b""

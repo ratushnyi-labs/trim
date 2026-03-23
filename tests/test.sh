@@ -99,6 +99,12 @@ clang-19 --target=loongarch64-linux-gnu -nostdlib -static -g -O0 \
 printf 'Built: hello-loongarch64 (%d bytes, ELF LoongArch64)\n' \
     "$(stat -c%s /work/hello-loongarch64)"
 
+clang-19 --target=i686-linux-gnu -nostdlib -static -g -O0 \
+    -fno-inline -fuse-ld=lld -o /work/hello-x86-32 \
+    /tests/x86-32-hello.c 2>/dev/null
+printf 'Built: hello-x86-32 (%d bytes, ELF x86-32)\n' \
+    "$(stat -c%s /work/hello-x86-32)"
+
 # =============================================
 # Dead code detection: ELF dynamic
 # =============================================
@@ -1365,6 +1371,62 @@ echo "$patch_out_la" | grep -q 'dead functions removed' && \
     fail "LoongArch64: compaction" "not reported"
 
 # =============================================
+# Dead code detection: x86-32
+# =============================================
+printf '\n--- Dead code detection: x86-32 ---\n'
+output=$(xstrip --dry-run /work/hello-x86-32 2>&1)
+echo "$output"
+
+echo "$output" | grep -q 'dead_compute' && \
+    pass "x86-32: detected dead_compute" || \
+    fail "x86-32: dead_compute" "not found"
+
+echo "$output" | grep -q 'dead_factorial' && \
+    pass "x86-32: detected dead_factorial" || \
+    fail "x86-32: dead_factorial" "not found"
+
+echo "$output" | grep -q '  _start' && \
+    fail "x86-32: false positive" "_start flagged" || \
+    pass "x86-32: _start correctly kept"
+
+echo "$output" | grep -q 'live_add' && \
+    fail "x86-32: false positive" "live_add flagged" || \
+    pass "x86-32: live_add correctly kept"
+
+echo "$output" | grep -q 'live_multiply' && \
+    fail "x86-32: false positive" "live_multiply flagged" || \
+    pass "x86-32: live_multiply correctly kept"
+
+file_info=$(file /work/hello-x86-32)
+echo "$file_info" | grep -q 'ELF.*32-bit\|ELF.*386\|ELF.*i386' && \
+    pass "x86-32: correct ELF type" || \
+    fail "x86-32: ELF type" "got: $file_info"
+
+# =============================================
+# Patching: x86-32
+# =============================================
+printf '\n--- Patching: x86-32 ---\n'
+cp /work/hello-x86-32 /work/test-x86-32-patch
+orig_sz_x32=$(stat -c%s /work/test-x86-32-patch)
+patch_out_x32=$(xstrip --in-place /work/test-x86-32-patch 2>&1)
+echo "$patch_out_x32"
+new_sz_x32=$(stat -c%s /work/test-x86-32-patch)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_x32" "$new_sz_x32"
+
+[ "$new_sz_x32" -le "$orig_sz_x32" ] && \
+    pass "x86-32: patched file valid" || \
+    fail "x86-32: patched file" "size grew"
+
+file_info=$(file /work/test-x86-32-patch)
+echo "$file_info" | grep -q 'ELF' && \
+    pass "x86-32: patched file still ELF" || \
+    fail "x86-32: patched type" "got: $file_info"
+
+echo "$patch_out_x32" | grep -q 'dead functions removed' && \
+    pass "x86-32: compaction reported" || \
+    fail "x86-32: compaction" "not reported"
+
+# =============================================
 # Dead code detection: WebAssembly
 # =============================================
 printf '\n--- Dead code detection: WebAssembly ---\n'
@@ -1465,6 +1527,18 @@ echo "$output" | grep -q '    liveHelper:' && \
 echo "$output" | grep -q '    <init>:' && \
     fail "Java: false positive" "<init> flagged" || \
     pass "Java: <init> correctly kept"
+
+echo "$output" | grep -q 'deadWithExc' && \
+    pass "Java: detected deadWithExc (exc handler)" || \
+    fail "Java: deadWithExc" "not found"
+
+echo "$output" | grep -q 'deadWithSwitch' && \
+    pass "Java: detected deadWithSwitch (tableswitch)" || \
+    fail "Java: deadWithSwitch" "not found"
+
+echo "$output" | grep -q '    liveWithSMT:' && \
+    fail "Java: false positive" "liveWithSMT flagged" || \
+    pass "Java: liveWithSMT correctly kept (StackMapTable)"
 
 # =============================================
 # Patching: Java .class

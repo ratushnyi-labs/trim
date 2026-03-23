@@ -86,7 +86,7 @@ pub fn reassemble_java(
         if let Some(ranges) = method_dead_blocks.get(&idx) {
             if let Some(compacted) =
                 bytecode::compact_method_code(
-                    data, m, ranges,
+                    data, m, ranges, pool,
                 )
             {
                 method_bytes.extend_from_slice(&compacted);
