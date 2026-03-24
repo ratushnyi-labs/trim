@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 use std::process;
 
-const VERSION: &str = match option_env!("XSTRIP_VERSION") {
+const VERSION: &str = match option_env!("TRIM_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
@@ -23,18 +23,20 @@ fn main() {
             process::exit(0);
         }
         Action::Version => {
-            println!("xstrip {}", VERSION);
+            println!("trim {}", VERSION);
             process::exit(0);
         }
         Action::License => {
             println!("{}", LICENSE);
             process::exit(0);
         }
-        Action::InPlace { dry_run, files } => {
-            process::exit(run_in_place(&files, dry_run));
+        Action::InPlace { dry_run, files, max_sccp } => {
+            process::exit(run_in_place(&files, dry_run, max_sccp));
         }
-        Action::Stream { dry_run, input, output } => {
-            process::exit(run_stream(&input, output.as_deref(), dry_run));
+        Action::Stream { dry_run, input, output, max_sccp } => {
+            process::exit(run_stream(
+                &input, output.as_deref(), dry_run, max_sccp,
+            ));
         }
     }
 }
@@ -43,8 +45,8 @@ enum Action {
     Help,
     Version,
     License,
-    InPlace { dry_run: bool, files: Vec<String> },
-    Stream { dry_run: bool, input: String, output: Option<String> },
+    InPlace { dry_run: bool, files: Vec<String>, max_sccp: usize },
+    Stream { dry_run: bool, input: String, output: Option<String>, max_sccp: usize },
 }
 
 fn parse_args(args: &[String]) -> Result<Action, String> {
@@ -54,25 +56,38 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let mut in_place = false;
     let mut dry_run = false;
+    let mut max_sccp = trim::analysis::sccp::DEFAULT_MAX_INSTRS;
     let mut positional = Vec::new();
-    for arg in args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--help" | "-h" => return Ok(Action::Help),
             "--version" | "-v" => return Ok(Action::Version),
             "--license" | "-l" => return Ok(Action::License),
             "--in-place" | "-i" => in_place = true,
             "--dry-run" => dry_run = true,
+            "--max-sccp-instrs" => {
+                i += 1;
+                max_sccp = parse_max_sccp(&args, i)?;
+            }
+            s if s.starts_with("--max-sccp-instrs=") => {
+                let val = &s["--max-sccp-instrs=".len()..];
+                max_sccp = val.parse::<usize>().map_err(|_| {
+                    format!("invalid --max-sccp-instrs value: {}", val)
+                })?;
+            }
             s if s.starts_with('-') && s != "-" => {
                 return Err(format!("unknown option: {}", s));
             }
-            _ => positional.push(arg.clone()),
+            _ => positional.push(args[i].clone()),
         }
+        i += 1;
     }
     if in_place {
         if positional.is_empty() {
             return Err("--in-place requires at least one file".into());
         }
-        return Ok(Action::InPlace { dry_run, files: positional });
+        return Ok(Action::InPlace { dry_run, files: positional, max_sccp });
     }
     if positional.is_empty() {
         eprint_usage();
@@ -83,13 +98,29 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let input = positional[0].clone();
     let output = positional.get(1).cloned();
-    Ok(Action::Stream { dry_run, input, output })
+    Ok(Action::Stream { dry_run, input, output, max_sccp })
 }
 
-fn run_in_place(files: &[String], dry_run: bool) -> i32 {
+fn parse_max_sccp(
+    args: &[String],
+    i: usize,
+) -> Result<usize, String> {
+    if i >= args.len() {
+        return Err("--max-sccp-instrs requires a value".into());
+    }
+    args[i].parse::<usize>().map_err(|_| {
+        format!("invalid --max-sccp-instrs value: {}", args[i])
+    })
+}
+
+fn run_in_place(
+    files: &[String],
+    dry_run: bool,
+    max_sccp: usize,
+) -> i32 {
     let mut rc = 0;
     for path in files {
-        match xstrip::process_file(path, dry_run) {
+        match trim::process_file(path, dry_run, max_sccp) {
             Ok(result) => {
                 if result != 0 {
                     rc = result;
@@ -127,13 +158,20 @@ fn write_output(path: &str, data: &[u8]) -> i32 {
     0
 }
 
-fn run_stream(input: &str, output: Option<&str>, dry_run: bool) -> i32 {
+fn run_stream(
+    input: &str,
+    output: Option<&str>,
+    dry_run: bool,
+    max_sccp: usize,
+) -> i32 {
     let data = match read_input(input) {
         Ok(d) => d,
         Err(rc) => return rc,
     };
     let label = if input == "-" { "<stdin>" } else { input };
-    let result = match xstrip::process_bytes(&data, label, dry_run) {
+    let result = match trim::process_bytes(
+        &data, label, dry_run, max_sccp,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -180,27 +218,29 @@ fn read_stdin() -> io::Result<Vec<u8>> {
 
 fn eprint_usage() {
     eprintln!(
-        "xstrip {VERSION}\n\
+        "trim {VERSION}\n\
          Author: Pavlo Ratushnyi\n\
          \n\
-         Usage: xstrip [OPTIONS] <INPUT> [OUTPUT]\n\
+         Usage: trim [OPTIONS] <INPUT> [OUTPUT]\n\
          \n\
          Find and remove dead code from executables.\n\
-         Supports: ELF\n\
+         Supports: ELF, PE/COFF, Mach-O, .NET\n\
          \n\
          Modes:\n\
-         \x20 xstrip INPUT OUTPUT       Write patched binary to OUTPUT\n\
-         \x20 xstrip INPUT              Write patched binary to stdout\n\
-         \x20 xstrip -                  Read stdin, write to stdout\n\
-         \x20 xstrip -i FILE [FILE...]  Modify files in-place\n\
-         \x20 xstrip --dry-run INPUT    Analyze only, report to stderr\n\
+         \x20 trim INPUT OUTPUT       Write patched binary to OUTPUT\n\
+         \x20 trim INPUT              Write patched binary to stdout\n\
+         \x20 trim -                  Read stdin, write to stdout\n\
+         \x20 trim -i FILE [FILE...]  Modify files in-place\n\
+         \x20 trim --dry-run INPUT    Analyze only, report to stderr\n\
          \n\
          Options:\n\
-         \x20 --in-place, -i   Modify files in-place\n\
-         \x20 --dry-run        Report dead code without producing output\n\
-         \x20 --version, -v    Show version\n\
-         \x20 --license, -l    Show license\n\
-         \x20 --help, -h       Show this help message\n\
+         \x20 --in-place, -i          Modify files in-place\n\
+         \x20 --dry-run               Report dead code without producing output\n\
+         \x20 --max-sccp-instrs N     Max instructions per function for SCCP\n\
+         \x20                         analysis (default: 10000)\n\
+         \x20 --version, -v           Show version\n\
+         \x20 --license, -l           Show license\n\
+         \x20 --help, -h              Show this help message\n\
          \n\
          DISCLAIMER: This software performs disassembly and binary\n\
          modification of executable files. Processing software you do\n\

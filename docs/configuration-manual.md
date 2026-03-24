@@ -2,7 +2,7 @@
 
 ## Runtime Configuration
 
-xstrip is configured entirely via CLI arguments. There are no environment
+trim is configured entirely via CLI arguments. There are no environment
 variables, config files, or runtime settings.
 
 ### CLI Options
@@ -40,7 +40,7 @@ Binary output goes to stdout or the named output file.
 | export  | `scratch`                      | —       | Binary extraction stage           |
 | runtime | `scratch`                      | —       | Minimal: static binary only       |
 
-The production image is `scratch` (empty) because xstrip is a fully
+The production image is `scratch` (empty) because trim is a fully
 static musl binary with zero runtime dependencies. This is the highest
 priority per §8.3 (smaller than distroless).
 
@@ -71,7 +71,7 @@ Use `--user $(id -u):$(id -g)` to match the host user identity.
 
 ### Health Check
 
-The image defines a HEALTHCHECK that runs `xstrip --help`. This is
+The image defines a HEALTHCHECK that runs `trim --help`. This is
 primarily for orchestration systems that monitor container health.
 
 ## Multi-arch Support
@@ -82,8 +82,8 @@ cross-compiles to the target (`$TARGETPLATFORM`).
 
 | Target Platform | Rust Target                    | Archive                         |
 |-----------------|--------------------------------|---------------------------------|
-| `linux/amd64`   | `x86_64-unknown-linux-musl`    | `xstrip-linux-amd64.tar.gz`   |
-| `linux/arm64`   | `aarch64-unknown-linux-musl`   | `xstrip-linux-arm64.tar.gz`   |
+| `linux/amd64`   | `x86_64-unknown-linux-musl`    | `trim-linux-amd64.tar.gz`   |
+| `linux/arm64`   | `aarch64-unknown-linux-musl`   | `trim-linux-arm64.tar.gz`   |
 
 Binary stripping is handled by Cargo's `strip = true` in `[profile.release]`,
 which uses Rust's bundled LLVM strip. No external `strip` binary is needed.
@@ -113,12 +113,13 @@ To use a different CA certificate, replace `zscaler.crt` before building.
 The test image (`Dockerfile.test`) uses the same `xx`-based builder as
 production. The test runtime stage is Alpine 3.23 with additional packages:
 
-| Package         | Purpose                              |
-|-----------------|--------------------------------------|
-| gcc             | Compile ELF test binaries            |
-| musl-dev        | C library headers for gcc            |
-| clang19         | Cross-compile PE, Wasm, Mach-O tests |
-| lld19           | LLVM linker for clang19              |
-| llvm19          | llvm-strip for pre-stripped tests    |
-| mingw-w64-gcc   | Cross-compile Windows PE binaries    |
-| file            | Detect binary format in tests        |
+| Package         | Purpose                                    |
+|-----------------|--------------------------------------------|
+| gcc             | Compile ELF test binaries                  |
+| musl-dev        | C library headers for gcc                  |
+| clang19         | Cross-compile PE, Wasm, Mach-O, ARM tests  |
+| lld19           | LLVM linker for clang19                    |
+| llvm19          | llvm-strip for pre-stripped tests           |
+| mingw-w64-gcc   | Cross-compile Windows PE binaries          |
+| python3         | Generate .NET and Java test fixtures       |
+| file            | Detect binary format in tests              |

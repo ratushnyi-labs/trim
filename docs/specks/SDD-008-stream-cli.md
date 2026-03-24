@@ -18,15 +18,15 @@
 
 ## Acceptance Criteria
 
-- AC-1: `xstrip INPUT OUTPUT` reads INPUT, writes patched binary to OUTPUT
-- AC-2: `xstrip INPUT` reads INPUT, writes patched binary to stdout
-- AC-3: `xstrip -` reads stdin, writes patched binary to stdout
-- AC-4: `xstrip -i FILE [FILE...]` modifies files in-place (old default)
-- AC-5: `xstrip --dry-run INPUT` analyzes only, reports to stderr, exit 0
-- AC-6: `xstrip --dry-run -` reads stdin, analyzes only, reports to stderr
+- AC-1: `trim INPUT OUTPUT` reads INPUT, writes patched binary to OUTPUT
+- AC-2: `trim INPUT` reads INPUT, writes patched binary to stdout
+- AC-3: `trim -` reads stdin, writes patched binary to stdout
+- AC-4: `trim -i FILE [FILE...]` modifies files in-place (old default)
+- AC-5: `trim --dry-run INPUT` analyzes only, reports to stderr, exit 0
+- AC-6: `trim --dry-run -` reads stdin, analyzes only, reports to stderr
 - AC-7: All diagnostic output (analysis reports, errors) goes to stderr
 - AC-8: Binary output is clean (no text mixed in)
-- AC-9: `xstrip.sh` wrapper passes `--in-place` automatically
+- AC-9: `trim.sh` wrapper passes `--in-place` automatically
 
 ## Security Acceptance Criteria (mandatory)
 

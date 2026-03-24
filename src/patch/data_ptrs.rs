@@ -1,5 +1,5 @@
 use crate::patch::relocs::{shift_at, total_shift};
-use crate::types::Section;
+use crate::types::{Endian, Section};
 
 /// Pointer-only section names (every entry is an address).
 const PTR_SECTIONS: &[&str] = &[
@@ -25,8 +25,9 @@ pub fn patch_data_ptrs(
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
+    is64: bool,
+    endian: Endian,
 ) {
-    let is64 = data.len() > 4 && data[4] == 2;
     let psz: usize = if is64 { 8 } else { 4 };
     for sec in sections {
         let name = sec.name.as_str();
@@ -35,43 +36,45 @@ pub fn patch_data_ptrs(
         if !use_total && !use_text {
             continue;
         }
-        let end = (sec.offset as usize + sec.size as usize)
-            .min(data.len());
-        let mut i = sec.offset as usize;
-        while i + psz <= end {
-            let val = read_ptr(data, i, is64);
-            let shift = if use_total {
-                total_shift(val, intervals, ts, te)
-            } else if ts <= val && val < te {
-                shift_at(val, intervals)
-            } else {
-                0
-            };
-            if shift > 0 {
-                write_ptr(data, i, val - shift, is64);
-            }
-            i += psz;
+        patch_one_data_sec(
+            data, sec, psz, is64, endian, intervals, ts, te,
+            use_total,
+        );
+    }
+}
+
+fn patch_one_data_sec(
+    data: &mut [u8],
+    sec: &Section,
+    psz: usize,
+    is64: bool,
+    endian: Endian,
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+    use_total: bool,
+) {
+    let end = (sec.offset as usize + sec.size as usize)
+        .min(data.len());
+    let mut i = sec.offset as usize;
+    while i + psz <= end {
+        let val = crate::types::read_ptr(data, i, is64, endian);
+        let shift = if use_total {
+            total_shift(val, intervals, ts, te)
+        } else if ts <= val && val < te {
+            shift_at(val, intervals)
+        } else {
+            0
+        };
+        if shift > 0 {
+            crate::types::write_ptr(
+                data,
+                i,
+                val - shift,
+                is64,
+                endian,
+            );
         }
-    }
-}
-
-fn read_ptr(data: &[u8], i: usize, is64: bool) -> u64 {
-    if is64 {
-        u64::from_le_bytes(
-            data[i..i + 8].try_into().unwrap_or([0; 8]),
-        )
-    } else {
-        u32::from_le_bytes(
-            data[i..i + 4].try_into().unwrap_or([0; 4]),
-        ) as u64
-    }
-}
-
-fn write_ptr(data: &mut [u8], i: usize, val: u64, is64: bool) {
-    if is64 {
-        data[i..i + 8].copy_from_slice(&val.to_le_bytes());
-    } else {
-        data[i..i + 4]
-            .copy_from_slice(&(val as u32).to_le_bytes());
+        i += psz;
     }
 }

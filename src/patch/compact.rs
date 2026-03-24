@@ -16,9 +16,25 @@ pub fn compact_text(
     let off = text.offset as usize;
     let size = text.size as usize;
     let vma = text.vaddr;
+    let new_text = build_live_text(data, intervals, off, size, vma);
+    let saved = size - new_text.len();
+    if saved == 0 {
+        return 0;
+    }
+    apply_compact(data, off, size, &new_text, intervals);
+    saved as u64
+}
+
+fn build_live_text(
+    data: &[u8],
+    intervals: &[(u64, u64)],
+    off: usize,
+    size: usize,
+    vma: u64,
+) -> Vec<u8> {
     let dead_file: Vec<(usize, usize)> = intervals
         .iter()
-        .filter(|&&(s, e)| vma <= s && e <= vma + text.size)
+        .filter(|&&(s, e)| vma <= s && e <= vma + size as u64)
         .map(|&(s, e)| {
             (off + (s - vma) as usize, off + (e - vma) as usize)
         })
@@ -35,13 +51,20 @@ pub fn compact_text(
     if pos < text_end {
         new_text.extend_from_slice(&data[pos..text_end]);
     }
-    let saved = size - new_text.len();
-    if saved == 0 {
-        return 0;
-    }
+    new_text
+}
+
+fn apply_compact(
+    data: &mut Vec<u8>,
+    off: usize,
+    size: usize,
+    new_text: &[u8],
+    intervals: &[(u64, u64)],
+) {
     let ps = page_shrink(intervals) as usize;
     let live_len = new_text.len();
-    data[off..off + live_len].copy_from_slice(&new_text);
+    let text_end = off + size;
+    data[off..off + live_len].copy_from_slice(new_text);
     if ps > 0 {
         let pad_end = off + size - ps;
         data[off + live_len..pad_end].fill(0x00);
@@ -49,5 +72,4 @@ pub fn compact_text(
     } else {
         data[off + live_len..text_end].fill(0x00);
     }
-    saved as u64
 }

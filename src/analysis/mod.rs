@@ -1,2 +1,9 @@
+pub mod cfg;
+pub mod dominance;
+pub mod lattice;
+pub mod noreturn;
 pub mod reachability;
+pub mod regstate;
 pub mod roots;
+pub mod sccp;
+pub mod ssa;

@@ -1,16 +1,19 @@
-# xstrip -- Specification
+# trim -- Specification
 
 **Version:** 0.1.0
 
 ## 1. What the System Does
 
-xstrip is a dead code analyzer and remover for ELF binaries. It finds
-unreachable functions using address-based call graph analysis, patches
-them with INT3 (`0xCC`) fills, and physically shrinks the binary by
-removing dead code regions and updating ELF metadata. It works directly
-on compiled binaries — no source code or recompilation needed.
+trim is a dead code analyzer and remover for compiled binaries. It
+supports ELF, PE/COFF, Mach-O, .NET managed assemblies, WebAssembly
+modules, and Java .class files. It finds unreachable functions using
+address-based call graph analysis (or IL call graph for .NET / Wasm call
+graph / bytecode call graph for Java), patches dead code, and physically
+shrinks binaries by removing dead code regions, patching instruction
+offsets, and updating format metadata. It works directly on compiled
+binaries — no source code or recompilation needed.
 
-xstrip is a static musl binary (Rust) with zero runtime dependencies,
+trim is a static musl binary (Rust) with zero runtime dependencies,
 distributed as a scratch-based Docker image or standalone binary for
 x86_64 and aarch64 Linux.
 
@@ -18,12 +21,18 @@ x86_64 and aarch64 Linux.
 
 - **Dead code removal:** Finds and removes unreachable functions from
   compiled binaries, reducing attack surface and binary size.
-- **No source needed:** Works on any ELF binary — no recompilation,
+- **Multi-format:** Supports ELF (Linux), PE/COFF (Windows), Mach-O
+  (macOS), .NET managed assemblies, WebAssembly modules, and Java
+  .class files.
+- **Multi-architecture:** Analyzes x86-64, x86-32, AArch64, ARM32,
+  RISC-V, MIPS, s390x, and LoongArch64 instruction sets across all
+  supported formats, plus WebAssembly function-level analysis.
+- **No source needed:** Works on any supported binary — no recompilation,
   no build system integration required.
 - **No host dependencies:** Available as a static binary or scratch Docker
   image (~2 MiB). No LLVM, Python, or shared libraries needed at runtime.
 - **CI/CD integration:** Can be used as a build step in any pipeline.
-- **Multi-arch:** Runs on x86_64 and aarch64 Linux.
+- **Multi-arch host:** Runs on x86_64 and aarch64 Linux.
 
 ## 3. How the System Does It (Architecture)
 
@@ -46,7 +55,7 @@ x86_64 and aarch64 Linux.
             |
             v
 +----------------------------+
-| xstrip validates:          |
+| trim validates:          |
 |   - file exists            |
 |   - file is writable       |
 |   - file is not symlink    |
@@ -55,16 +64,16 @@ x86_64 and aarch64 Linux.
             |
             v
 +----------------------------+
-| Analyze: parse ELF, build  |
+| Analyze: detect format,    |
+| decode instructions, build |
 | call graph, BFS from roots |
-| to find dead functions     |
 +----------------------------+
             |
             v
 +----------------------------+
-| Patch: INT3-fill dead code |
-| Shrink: remove dead bytes, |
-| update ELF headers         |
+| Patch: compact dead code,  |
+| patch instruction offsets, |
+| update format metadata     |
 +----------------------------+
             |
             v
@@ -97,8 +106,8 @@ Supported platforms: `linux/amd64` (`x86_64-unknown-linux-musl`),
 **Summary:** User finds and removes dead code from one executable,
 writing the patched binary to an output file or stdout.
 
-**Description:** The user runs xstrip with an input path and optional
-output path. xstrip reads the input file, analyzes the call graph,
+**Description:** The user runs trim with an input path and optional
+output path. trim reads the input file, analyzes the call graph,
 identifies dead functions, patches them out, and writes the result to
 the output file or stdout. The input file is never modified. All
 diagnostic output goes to stderr.
@@ -109,7 +118,7 @@ diagnostic output goes to stderr.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip INPUT OUTPUT] --> B{INPUT exists?}
+  A[User runs: trim INPUT OUTPUT] --> B{INPUT exists?}
   B -- No --> C["Print error to stderr, exit 1"]
   B -- Yes --> D[Read INPUT bytes]
   D --> E[Analyze call graph]
@@ -148,7 +157,7 @@ to stderr.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip -i file1 file2] --> B[For each file]
+  A[User runs: trim -i file1 file2] --> B[For each file]
   B --> C{Validate file}
   C -- Invalid --> D["Print error to stderr, set exit=1"]
   C -- Valid --> E[Analyze and patch file in-place]
@@ -174,7 +183,7 @@ flowchart TD
 
 **Summary:** User analyzes dead code without modifying the binary.
 
-**Description:** With the `--dry-run` flag, xstrip performs full
+**Description:** With the `--dry-run` flag, trim performs full
 call graph analysis and reports dead functions but does not patch or
 modify the file. Useful for auditing before committing to changes.
 
@@ -184,7 +193,7 @@ modify the file. Useful for auditing before committing to changes.
 
 ```mermaid
 flowchart TD
-  A[User runs: xstrip --dry-run file] --> B[Parse --dry-run flag]
+  A[User runs: trim --dry-run file] --> B[Parse --dry-run flag]
   B --> C[Validate file]
   C --> D[Analyze call graph]
   D --> E["Report dead functions, exit 0"]
@@ -198,9 +207,9 @@ flowchart TD
 
 ### UC-004: Pipe Mode (stdin to stdout)
 
-**Summary:** User pipes a binary through xstrip via stdin/stdout.
+**Summary:** User pipes a binary through trim via stdin/stdout.
 
-**Description:** The user passes `-` as the input argument. xstrip reads
+**Description:** The user passes `-` as the input argument. trim reads
 the binary from stdin, analyzes the call graph, patches dead code, and
 writes the patched binary to stdout. All diagnostic output goes to stderr.
 Can be combined with `--dry-run` to analyze only.
@@ -211,7 +220,7 @@ Can be combined with `--dry-run` to analyze only.
 
 ```mermaid
 flowchart TD
-  A["User runs: cat binary | xstrip -"] --> B[Read all of stdin]
+  A["User runs: cat binary | trim -"] --> B[Read all of stdin]
   B --> C[Analyze call graph]
   C --> D[Report dead functions to stderr]
   D --> E{--dry-run?}
@@ -234,19 +243,26 @@ flowchart TD
 
 ### BR-001: Stream-First Output
 
-By default, xstrip reads an input file and writes the patched binary to
+By default, trim reads an input file and writes the patched binary to
 an output file or stdout. In-place modification requires the explicit
 `--in-place` / `-i` flag. All diagnostic output goes to stderr.
 
 ### BR-002: Format Auto-Detection
 
-xstrip auto-detects the binary format from ELF headers. No format flag
-is needed from the user.
+trim auto-detects the binary format from magic bytes. No format flag
+is needed from the user. Detection order: ELF (`\x7fELF`), .NET (MZ +
+CLI header), PE/COFF (MZ), Mach-O (feed_face/feed_facf/cefa_edfe/
+cffa_edfe), Wasm (`\x00asm`), Java (`0xCAFEBABE`).
 
 ### BR-003: Supported Formats
 
-The tool currently supports ELF (Linux) for dead code analysis and
-patching. PE/COFF (Windows) and Mach-O (macOS) support is planned.
+The tool supports ELF (Linux), PE/COFF (Windows), Mach-O (macOS),
+.NET managed assemblies, WebAssembly modules, and Java .class files.
+Architecture support includes x86-64, x86-32, AArch64, ARM32, RISC-V
+(RV32/RV64), MIPS (32/64, big/little-endian), s390x, and LoongArch64
+across all native formats. .NET uses IL-level analysis independent of
+CPU architecture. WebAssembly uses function-level call graph analysis.
+Java uses bytecode call graph analysis (invoke* opcodes).
 
 ### BR-004: Independent File Processing
 
@@ -261,7 +277,84 @@ all modes: stream, pipe, and in-place.
 
 ### BR-006: Non-Root Execution
 
-The container MUST run as a non-root user (uid 10000, user `xstrip`).
+The container MUST run as a non-root user (uid 10000, user `trim`).
+
+### BR-007: Dead Branch Detection (SDD-011)
+
+In addition to whole dead functions, trim detects dead branches within
+live functions. Three levels of analysis:
+
+1. **CFG-based** (Phase A — implemented): unreachable basic blocks — code
+   after calls to noreturn functions (`exit`, `abort`, `__stack_chk_fail`)
+   resolved via both symbol table and PLT/IAT import names.
+2. **Intra-function compaction** (Phase B — implemented): dead blocks
+   within functions are fed into the compaction pipeline alongside dead
+   functions. Live code is shifted, all branch offsets and references are
+   patched, freed tail bytes are reclaimed.
+3. **Data-flow provable** (Phase C — implemented): SSA construction +
+   register-based constant propagation proves branches that can never be
+   taken based on constant analysis of register values. Conservative:
+   memory treated as unknown at all times, caller-saved registers
+   clobbered at call sites, indirect branches assume all targets live.
+   Works on all native architectures (x86-64, x86-32, AArch64, ARM32,
+   RISC-V, MIPS, s390x, LoongArch64).
+
+Dead branches are reported alongside dead functions in analysis output.
+Dead blocks are compacted through the same pipeline as dead functions.
+
+### BR-008: Physical Compaction (SDD-013)
+
+For native binary formats (ELF, PE, Mach-O), trim physically removes
+dead code from the .text section and patches all affected metadata:
+
+- **ELF:** All architectures. Patches entry point, section/program
+  headers, .rela.dyn/.rela.plt relocations, .symtab/.dynsym symbols,
+  .dynamic section addresses, data pointers (.got, .init_array, etc.).
+  Big-endian aware for s390x and MIPS.
+- **PE:** All architectures. Patches AddressOfEntryPoint, section
+  headers (VirtualSize, SizeOfRawData, PointerToRawData), SizeOfCode,
+  SizeOfImage, COFF symbols, export address table (EAT), base
+  relocations (.reloc HIGHLOW/DIR64), and .pdata exception entries.
+- **Mach-O:** All architectures. Patches LC_MAIN/LC_UNIXTHREAD entry
+  point, LC_SEGMENT_64/LC_SEGMENT load commands (vmaddr, vmsize,
+  fileoff, filesize), section headers, and LC_SYMTAB nlist entries.
+
+Per-architecture instruction offset patching handles branch/call
+recalculation for all supported architectures.
+
+### BR-009: Wasm, .NET & Java Dead Branch Detection (SDD-013, SDD-014)
+
+In addition to dead function detection, trim detects dead branches
+within live function/method bodies for bytecode formats:
+
+- **WebAssembly:** Detects unreachable code after `unreachable` (0x00),
+  `return` (0x0F), and unconditional `br` (0x0C) opcodes until the
+  next control flow boundary (`end`/`else`).
+- **.NET IL:** Detects unreachable code after `throw` (0x7A), `ret`
+  (0x2A), unconditional `br` (0x38/0x2B), and `rethrow` (0xFE 0x1A)
+  until the next branch target.
+- **Java:** Detects unreachable code after `ireturn` (0xAC), `lreturn`
+  (0xAD), `freturn` (0xAE), `dreturn` (0xAF), `areturn` (0xB0),
+  `return` (0xB1), `athrow` (0xBF), `goto` (0xA7), and `goto_w`
+  (0xC8) until the next branch target.
+
+### BR-010: Wasm, .NET & Java Physical Compaction (SDD-014, SDD-015)
+
+All binary formats are physically compacted, not just native formats:
+
+- **WebAssembly:** The Code section is rebuilt with dead function bodies
+  replaced by minimal 3-byte stubs. Dead branches within live functions
+  are physically excised from function bodies (Wasm uses structural
+  labels, not byte offsets, so removal is safe).
+- **.NET:** Dead method bodies are compacted via the PE pipeline. Dead
+  branches within live methods are physically removed with branch offset
+  repatching (covers br.s, br, conditional branches, switch). Methods
+  with exception handlers (MoreSects flag) fall back to nop-fill.
+- **Java:** Dead methods are physically removed by rebuilding the
+  methods table. Dead branches within live methods are physically
+  removed with branch offset repatching. Methods with exception
+  handlers, tableswitch/lookupswitch, or StackMapTable fall back to
+  nop-fill.
 
 ---
 
@@ -280,13 +373,17 @@ The container MUST run as a non-root user (uid 10000, user `xstrip`).
    - Two positional args → stream mode: write to output file (UC-001)
 5. Read input data (file or stdin)
 6. Analyze:
-   a. Parse ELF headers and symbol tables
-   b. Disassemble .text section (x86-64 decoder)
-   c. Build address-based call graph from branch/call targets
-   d. BFS reachability from roots (entry, globals, data refs)
-   e. Report dead functions found (to stderr)
+   a. Detect format (ELF/PE/Mach-O/.NET/Wasm/Java) from magic bytes
+   b. Parse headers and symbol tables
+   c. Decode instructions (x86/ARM) or IL (.NET)
+   d. Build call graph from branch/call targets or IL opcodes
+   e. BFS reachability from roots (entry, globals, data refs)
+   f. Report dead functions found (to stderr)
 7. If `--dry-run`: exit 0 (no binary output)
-8. Patch dead code with INT3, shrink binary
+8. Patch dead code (all formats: compact dead code + update metadata;
+   ELF/PE/Mach-O: remove dead regions + patch offsets; Wasm: rebuild
+   Code section; .NET: compact via PE pipeline; Java: rebuild methods
+   table)
 9. Write output:
    - In-place mode: overwrite each file
    - Stream mode: write to output file or stdout

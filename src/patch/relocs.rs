@@ -1,5 +1,5 @@
-use crate::elf::sections::vaddr_to_offset;
-use crate::types::{DecodedInstr, Section};
+use crate::analysis::cfg::DeadBlock;
+use crate::types::Section;
 use std::collections::HashMap;
 
 /// Sorted dead intervals [(start_vaddr, end_vaddr)].
@@ -10,6 +10,32 @@ pub fn dead_intervals(
         dead.values().map(|&(a, s)| (a, a + s)).collect();
     v.sort();
     v
+}
+
+/// Convert dead blocks to sorted intervals.
+pub fn block_intervals(
+    blocks: &[DeadBlock],
+) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = blocks
+        .iter()
+        .map(|b| (b.addr, b.addr + b.size))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Merge two sorted interval lists into one sorted,
+/// non-overlapping list.
+pub fn combine_intervals(
+    a: &[(u64, u64)],
+    b: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    let mut all: Vec<(u64, u64)> = Vec::with_capacity(
+        a.len() + b.len(),
+    );
+    all.extend_from_slice(a);
+    all.extend_from_slice(b);
+    merge_intervals(&mut all)
 }
 
 /// Total dead bytes before a given address.
@@ -47,7 +73,7 @@ pub fn page_shrink(intervals: &[(u64, u64)]) -> u64 {
 }
 
 /// Unified shift: within .text uses per-interval shift,
-/// at or after .text end returns page-aligned shrink amount.
+/// at or after .text end returns page-aligned shrink.
 pub fn total_shift(
     addr: u64,
     intervals: &[(u64, u64)],
@@ -63,53 +89,17 @@ pub fn total_shift(
     }
 }
 
-/// Patch relative call/jmp offsets for compacted addresses.
-pub fn patch_call_jmp(
-    data: &mut [u8],
-    instrs: &[DecodedInstr],
-    intervals: &[(u64, u64)],
-    sections: &[Section],
-    ts: u64,
-    te: u64,
-) {
-    for instr in instrs {
-        if in_dead_range(instr.addr, intervals) {
-            continue;
-        }
-        if let Some((doff, dsz, old_rel)) =
-            decode_rel_ref(&instr.raw)
-        {
-            let target =
-                (instr.addr as i64 + instr.len as i64 + old_rel)
-                    as u64;
-            let delta = total_shift(instr.addr, intervals, ts, te)
-                as i64
-                - total_shift(target, intervals, ts, te) as i64;
-            if delta == 0 {
-                continue;
-            }
-            let new_rel = old_rel + delta;
-            if let Some(foff) =
-                vaddr_to_offset(instr.addr, sections)
-            {
-                let pos = foff as usize + doff;
-                if dsz == 4 && pos + 4 <= data.len() {
-                    let bytes = (new_rel as i32).to_le_bytes();
-                    data[pos..pos + 4].copy_from_slice(&bytes);
-                } else if dsz == 1 && pos + 1 <= data.len() {
-                    data[pos] = new_rel as i8 as u8;
-                }
-            }
-        }
-    }
-}
-
-/// Extend dead intervals to absorb adjacent NOP/INT3 alignment
-/// padding, then merge overlapping intervals.
+/// Extend dead intervals to absorb adjacent padding bytes,
+/// then merge overlapping intervals.
+/// The `align` parameter ensures each interval's size stays
+/// a multiple of the architecture's instruction alignment,
+/// preventing misalignment of code after compaction.
 pub fn defrag_intervals(
     intervals: &[(u64, u64)],
     data: &[u8],
     sections: &[Section],
+    is_padding: fn(u8) -> bool,
+    align: u64,
 ) -> Vec<(u64, u64)> {
     let text = match sections.iter().find(|s| s.name == ".text") {
         Some(s) => s,
@@ -120,8 +110,34 @@ pub fn defrag_intervals(
     let mut expanded: Vec<(u64, u64)> =
         Vec::with_capacity(intervals.len());
     for &(start, end) in intervals {
-        let mut lo = start;
-        let mut hi = end;
+        let (lo, hi) = expand_one(
+            data, text, ts, te, start, end, is_padding,
+            align,
+        );
+        expanded.push((lo, hi));
+    }
+    merge_intervals(&mut expanded)
+}
+
+fn expand_one(
+    data: &[u8],
+    text: &Section,
+    ts: u64,
+    te: u64,
+    start: u64,
+    end: u64,
+    is_padding: fn(u8) -> bool,
+    align: u64,
+) -> (u64, u64) {
+    let step = if align > 1 { align } else { 1 };
+    let mut lo = start;
+    let mut hi = end;
+    // Expand backward only for byte-aligned architectures
+    // (x86). For RISC architectures, zero padding bytes are
+    // indistinguishable from zero bytes inside instructions
+    // (e.g. ecall = 0x00000073), so backward expansion is
+    // unsafe.
+    if step == 1 {
         while lo > ts {
             let off = (text.offset + lo - 1 - ts) as usize;
             if off >= data.len() || !is_padding(data[off]) {
@@ -129,20 +145,19 @@ pub fn defrag_intervals(
             }
             lo -= 1;
         }
-        while hi < te {
-            let off = (text.offset + hi - ts) as usize;
-            if off >= data.len() || !is_padding(data[off]) {
-                break;
-            }
-            hi += 1;
-        }
-        expanded.push((lo, hi));
     }
-    merge_intervals(&mut expanded)
-}
-
-fn is_padding(b: u8) -> bool {
-    b == 0xCC || b == 0x90
+    // Expand forward in instruction-aligned steps.
+    'fwd: while hi + step <= te {
+        for k in 0..step {
+            let off =
+                (text.offset + hi + k - ts) as usize;
+            if off >= data.len() || !is_padding(data[off]) {
+                break 'fwd;
+            }
+        }
+        hi += step;
+    }
+    (lo, hi)
 }
 
 fn merge_intervals(
@@ -162,40 +177,4 @@ fn merge_intervals(
         }
     }
     merged
-}
-
-/// Decode call/jmp displacement: (offset_in_instr, size, old_rel).
-fn decode_rel_ref(raw: &[u8]) -> Option<(usize, usize, i64)> {
-    if raw.is_empty() {
-        return None;
-    }
-    let op = raw[0];
-    // E8 call rel32, E9 jmp rel32
-    if (op == 0xE8 || op == 0xE9) && raw.len() >= 5 {
-        let rel = i32::from_le_bytes(
-            raw[1..5].try_into().ok()?,
-        ) as i64;
-        return Some((1, 4, rel));
-    }
-    // EB jmp rel8
-    if op == 0xEB && raw.len() >= 2 {
-        let rel = raw[1] as i8 as i64;
-        return Some((1, 1, rel));
-    }
-    // 0F 80..8F jcc rel32
-    if op == 0x0F
-        && raw.len() >= 6
-        && (0x80..=0x8F).contains(&raw[1])
-    {
-        let rel = i32::from_le_bytes(
-            raw[2..6].try_into().ok()?,
-        ) as i64;
-        return Some((2, 4, rel));
-    }
-    // 70..7F jcc rel8
-    if (0x70..=0x7F).contains(&op) && raw.len() >= 2 {
-        let rel = raw[1] as i8 as i64;
-        return Some((1, 1, rel));
-    }
-    None
 }
