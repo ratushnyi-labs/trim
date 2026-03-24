@@ -1,6 +1,17 @@
+//! Compile-time constants for the dead-code analysis pipeline.
+//!
+//! Contains the set of runtime/startup function names that must
+//! always be kept alive regardless of reachability analysis.
+//! These include C runtime entry points, linker-generated symbols,
+//! and platform-specific initializers for Linux, musl, Windows PE,
+//! MIPS, and ARM.
+
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+/// Set of function names that must always be treated as live roots.
+/// These are runtime/startup symbols that the linker or OS loader
+/// calls directly, bypassing normal call-graph edges.
 pub static RUNTIME_KEEP: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| {
         [

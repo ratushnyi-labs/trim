@@ -1,3 +1,10 @@
+//! LoongArch64 branch and PC-relative offset patching after dead code compaction.
+//!
+//! Rewrites B/BL (26-bit split), BEQ/BNE/BLT/BGE/BLTU/BGEU (16-bit),
+//! BEQZ/BNEZ (21-bit split) branch immediates and PCALA/PCADDU12I/
+//! PCADDU18I (20-bit) PC-relative immediates to account for address shifts.
+//! LoongArch64 is always little-endian with fixed 32-bit instructions.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -25,6 +32,7 @@ pub fn patch_branches(
     }
 }
 
+/// Dispatch branch vs PC-relative patching for a single instruction.
 fn patch_one(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -64,6 +72,7 @@ fn patch_one(
     }
 }
 
+/// Patch a LoongArch branch immediate (B/BL, BEQ-family, BEQZ/BNEZ).
 fn patch_branch(
     data: &mut [u8],
     foff: usize,
@@ -131,6 +140,7 @@ fn patch_branch(
     data[foff..foff + 4].copy_from_slice(&bytes);
 }
 
+/// Patch a LoongArch PC-relative immediate (PCALA, PCADDU).
 fn patch_pc_rel(
     data: &mut [u8],
     foff: usize,

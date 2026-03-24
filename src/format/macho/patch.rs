@@ -1,3 +1,9 @@
+//! Mach-O metadata patching after dead code compaction.
+//!
+//! Updates all Mach-O structures affected by __text compaction: entry point
+//! (LC_MAIN / LC_UNIXTHREAD), load commands (LC_SEGMENT_64 / LC_SEGMENT),
+//! section descriptors within segments, and nlist symbol values (LC_SYMTAB).
+
 use crate::patch::relocs::{page_shrink, total_shift};
 use crate::types::Section;
 
@@ -13,6 +19,7 @@ const LC_UNIXTHREAD: u32 = 0x05;
 
 // ---- LE read/write helpers --------------------------------------
 
+/// Read a little-endian u32 at `off`.
 fn read_u32(data: &[u8], off: usize) -> u32 {
     if off + 4 > data.len() {
         return 0;
@@ -22,12 +29,14 @@ fn read_u32(data: &[u8], off: usize) -> u32 {
     )
 }
 
+/// Write a little-endian u32 at `off`.
 fn write_u32(data: &mut [u8], off: usize, val: u32) {
     if off + 4 <= data.len() {
         data[off..off + 4].copy_from_slice(&val.to_le_bytes());
     }
 }
 
+/// Read a little-endian u64 at `off`.
 fn read_u64(data: &[u8], off: usize) -> u64 {
     if off + 8 > data.len() {
         return 0;
@@ -37,6 +46,7 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
     )
 }
 
+/// Write a little-endian u64 at `off`.
 fn write_u64(data: &mut [u8], off: usize, val: u64) {
     if off + 8 <= data.len() {
         data[off..off + 8].copy_from_slice(&val.to_le_bytes());
@@ -45,6 +55,7 @@ fn write_u64(data: &mut [u8], off: usize, val: u64) {
 
 // ---- Mach-O header parsing --------------------------------------
 
+/// Return true if the Mach-O binary is 64-bit.
 fn macho_is64(data: &[u8]) -> bool {
     if data.len() < 4 {
         return false;
@@ -52,6 +63,7 @@ fn macho_is64(data: &[u8]) -> bool {
     read_u32(data, 0) == MH_MAGIC_64
 }
 
+/// Return true if the data starts with a valid Mach-O magic number.
 fn macho_valid(data: &[u8]) -> bool {
     if data.len() < 4 {
         return false;
@@ -175,6 +187,7 @@ pub fn patch_load_commands(
     }
 }
 
+/// Read the 16-byte segment name from a load command at `pos`.
 fn seg_name_at(data: &[u8], pos: usize) -> [u8; 16] {
     let off = pos + 8;
     if off + 16 > data.len() {
@@ -185,11 +198,14 @@ fn seg_name_at(data: &[u8], pos: usize) -> [u8; 16] {
     name
 }
 
+/// Check if a raw 16-byte segment name matches `name` (null-padded).
 fn is_seg_name(raw: &[u8; 16], name: &[u8]) -> bool {
     raw.starts_with(name)
         && raw[name.len()..].iter().all(|&b| b == 0)
 }
 
+/// Patch a 64-bit LC_SEGMENT_64: shrink __TEXT, shift vmaddr/fileoff,
+/// and recursively patch contained section descriptors.
 fn patch_segment64(
     data: &mut [u8],
     pos: usize,
@@ -252,6 +268,7 @@ fn patch_segment64(
     }
 }
 
+/// Patch a single 64-bit section descriptor within a segment.
 fn patch_section64(
     data: &mut [u8],
     soff: usize,
@@ -287,6 +304,8 @@ fn patch_section64(
     }
 }
 
+/// Patch a 32-bit LC_SEGMENT: shrink __TEXT, shift vmaddr/fileoff,
+/// and recursively patch contained section descriptors.
 fn patch_segment32(
     data: &mut [u8],
     pos: usize,
@@ -347,6 +366,7 @@ fn patch_segment32(
     }
 }
 
+/// Patch a single 32-bit section descriptor within a segment.
 fn patch_section32(
     data: &mut [u8],
     soff: usize,
@@ -430,6 +450,7 @@ pub fn patch_symtab(
     }
 }
 
+/// Patch n_value in nlist entries that fall within shifted ranges.
 fn patch_nlist(
     data: &mut [u8],
     symoff: usize,
@@ -468,6 +489,7 @@ fn patch_nlist(
     }
 }
 
+/// Placeholder for shifting symoff/stroff in LC_SYMTAB (currently a no-op).
 fn shift_symtab_offsets(
     data: &mut [u8],
     pos: usize,

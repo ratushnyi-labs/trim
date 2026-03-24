@@ -1,7 +1,13 @@
+//! PE/COFF symbol and export table parsing.
+//!
+//! Extracts function entries from the COFF symbol table (for object
+//! files and debug builds) and the PE export directory (for DLLs),
+//! converting them into the crate's `FuncMap` type.
+
 use crate::types::{FuncInfo, FuncMap};
 use goblin::pe::PE;
 
-/// Extract functions from COFF symbol table, if present.
+/// Extract functions from the COFF symbol table, if present.
 pub fn get_coff_functions(data: &[u8], pe: &PE) -> FuncMap {
     let ptr =
         pe.header.coff_header.pointer_to_symbol_table as usize;
@@ -28,6 +34,7 @@ pub fn get_coff_functions(data: &[u8], pe: &PE) -> FuncMap {
     funcs
 }
 
+/// Parse a single COFF symbol entry, adding it to `funcs` if it is a function.
 fn parse_one_sym(
     data: &[u8],
     pe: &PE,
@@ -66,6 +73,7 @@ fn parse_one_sym(
     );
 }
 
+/// Compute the RVA of a COFF symbol by adding its value to the section base.
 fn section_rva(pe: &PE, sec_num: i16, value: u32) -> u64 {
     let idx = (sec_num - 1) as usize;
     if idx < pe.sections.len() {
@@ -75,6 +83,7 @@ fn section_rva(pe: &PE, sec_num: i16, value: u32) -> u64 {
     }
 }
 
+/// Extract the name of a COFF symbol (inline or from the string table).
 fn coff_sym_name(
     data: &[u8],
     sym_off: usize,
@@ -88,6 +97,7 @@ fn coff_sym_name(
     String::from_utf8_lossy(&nb[..end]).to_string()
 }
 
+/// Look up a symbol name from the COFF string table.
 fn str_table_name(
     data: &[u8],
     nb: &[u8],
@@ -117,6 +127,7 @@ pub fn get_exports(pe: &PE) -> FuncMap {
     funcs
 }
 
+/// Add a single PE export to the function map if it has a name and RVA.
 fn add_export(funcs: &mut FuncMap, exp: &goblin::pe::export::Export) {
     let name = match exp.name {
         Some(n) if !n.is_empty() => n.to_string(),

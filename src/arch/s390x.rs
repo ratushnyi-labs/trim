@@ -1,3 +1,11 @@
+//! s390x (z/Architecture) instruction decoder for dead code analysis.
+//!
+//! Decodes variable-length big-endian instructions (2/4/6 bytes, length
+//! determined by the first 2 bits of the opcode byte). Extracts BCR/BASR
+//! register branches, BRC/BRAS 16-bit relative branches, and BRCL/BRASL
+//! 32-bit relative branches. Follows the z/Architecture calling convention
+//! (R14 = link register, R15 = stack pointer).
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode s390x (z/Architecture) instructions.
@@ -36,6 +44,7 @@ pub fn decode_text_s390x(
     instrs
 }
 
+/// Determine s390x instruction length from the first byte (2, 4, or 6).
 fn instr_len(first_byte: u8) -> usize {
     match first_byte >> 6 {
         0b00 => 2,
@@ -44,6 +53,7 @@ fn instr_len(first_byte: u8) -> usize {
     }
 }
 
+/// Decode a single s390x instruction by length dispatch.
 fn decode_s390x_instr(
     addr: u64,
     raw: &[u8],

@@ -1,0 +1,20 @@
+# Default owners for all files
+* @paveldhq
+
+# Format-specific modules
+src/format/elf/     @paveldhq
+src/format/pe/      @paveldhq
+src/format/macho/   @paveldhq
+src/format/dotnet/  @paveldhq
+src/format/wasm/    @paveldhq
+src/format/java/    @paveldhq
+
+# Architecture decoders
+src/arch/           @paveldhq
+
+# Analysis engine
+src/analysis/       @paveldhq
+
+# CI/CD
+.github/            @paveldhq
+Dockerfile*         @paveldhq

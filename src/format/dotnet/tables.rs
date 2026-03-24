@@ -1,3 +1,23 @@
+//! .NET metadata table parsing (MethodDef, TypeDef, and supporting tables).
+//!
+//! Reads the `#~` (or `#-`) table stream header to determine heap-size
+//! flags and per-table row counts, then walks tables in ECMA-335 order
+//! to compute row offsets. Currently extracts two tables in detail:
+//!
+//! - **MethodDef** (table 0x06) -- RVA, flags, and `#Strings` name index
+//!   for every method in the assembly.
+//! - **TypeDef** (table 0x02) -- flags, name index, and `method_list`
+//!   (first owned MethodDef row) for every type.
+//!
+//! Row sizes are computed dynamically based on heap-size flags and coded-
+//! index widths so the parser handles both small (2-byte) and wide
+//! (4-byte) indices.
+//!
+//! Key types:
+//! - `TableStream` -- parsed table stream header with row counts.
+//! - `MethodDef` -- single row from the MethodDef table.
+//! - `TypeDef` -- single row from the TypeDef table.
+
 use crate::format::dotnet::metadata::{
     read_u16, read_u32, MetadataRoot,
 };
@@ -7,21 +27,22 @@ const TID_TYPEDEF: usize = 0x02;
 const TID_METHODDEF: usize = 0x06;
 const TID_MEMBERREF: usize = 0x0A;
 
-/// Parsed MethodDef row.
+/// Parsed MethodDef row from ECMA-335 table 0x06.
 pub struct MethodDef {
     pub rva: u32,
     pub flags: u16,
     pub name_idx: u32,
 }
 
-/// Parsed TypeDef row.
+/// Parsed TypeDef row from ECMA-335 table 0x02.
 pub struct TypeDef {
     pub flags: u32,
     pub name_idx: u32,
     pub method_list: u32,
 }
 
-/// Table stream header + row counts.
+/// Parsed `#~` table stream header: heap-size flags, per-table row
+/// counts, and the file offset where actual row data begins.
 pub struct TableStream {
     pub heap_sizes: u8,
     pub row_counts: [u32; 64],
@@ -82,6 +103,7 @@ pub fn read_method_defs(
     methods
 }
 
+/// Parse a single MethodDef row at file offset `r`.
 fn parse_method_row(
     data: &[u8],
     r: usize,
@@ -119,6 +141,8 @@ pub fn read_type_defs(
     types
 }
 
+/// Determine column widths for TypeDef rows based on heap sizes and
+/// coded-index thresholds.
 fn typedef_widths(
     ts: &TableStream,
 ) -> (bool, bool, bool, bool) {
@@ -132,6 +156,7 @@ fn typedef_widths(
     (sw, ew, fw, mw)
 }
 
+/// Parse a single TypeDef row at file offset `r`.
 fn parse_typedef_row(
     data: &[u8],
     r: usize,
@@ -200,6 +225,7 @@ fn coded_idx_wide(
     max >= (1u32 << (16 - bits))
 }
 
+/// Number of tag bits needed for a coded index over `n` candidate tables.
 fn coded_tag_bits(n: usize) -> u32 {
     match n {
         0..=2 => 1,
@@ -210,6 +236,7 @@ fn coded_tag_bits(n: usize) -> u32 {
     }
 }
 
+/// Read a heap index (2 or 4 bytes) depending on the `wide` flag.
 fn read_heap_idx(
     data: &[u8],
     off: usize,
@@ -222,6 +249,8 @@ fn read_heap_idx(
     }
 }
 
+/// Compute MethodDef row size: 4 (RVA) + 2 (ImplFlags) + 2 (Flags)
+/// + string_idx + blob_idx + param_idx.
 fn method_def_row_size(
     str_wide: bool,
     blob_wide: bool,
@@ -233,6 +262,8 @@ fn method_def_row_size(
         + if param_wide { 4 } else { 2 }
 }
 
+/// Compute TypeDef row size: 4 (Flags) + name + namespace + extends +
+/// field_list + method_list.
 fn typedef_row_size(
     str_wide: bool,
     extends_wide: bool,
@@ -270,6 +301,7 @@ fn row_size_for_table(
     }
 }
 
+/// Row size for tables 0x08 (Param) and 0x09 (InterfaceImpl).
 fn row_size_misc(tid: usize, sw: bool) -> usize {
     match tid {
         0x08 => 2 + hs(sw),
@@ -278,6 +310,7 @@ fn row_size_misc(tid: usize, sw: bool) -> usize {
     }
 }
 
+/// Row size for tables 0x0A and above (MemberRef, Constant, etc.).
 fn row_size_upper(
     tid: usize,
     sw: bool,
@@ -305,14 +338,17 @@ fn row_size_upper(
     }
 }
 
+/// Heap/simple index size: 4 if wide, 2 otherwise.
 fn hs(wide: bool) -> usize {
     if wide { 4 } else { 2 }
 }
 
+/// Coded-index column size: 2 bytes if tag bits fit, 4 otherwise.
 fn coded_sz(tag_bits: usize) -> usize {
     if tag_bits <= 2 { 2 } else { 4 }
 }
 
+/// Column size for the MemberRefParent coded index.
 fn member_ref_parent_sz(counts: &[u32; 64]) -> usize {
     let tables = [TID_TYPEDEF, 0x01, TID_METHODDEF, 0x1A, 0x1B];
     if coded_idx_wide(&tables, counts) { 4 } else { 2 }
@@ -332,6 +368,7 @@ pub fn method_def_table_info(
     (off, rsz, count)
 }
 
+/// Read a little-endian `u64` from `data` at `off`.
 fn read_u64(data: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(
         data[off..off + 8].try_into().unwrap_or([0; 8]),

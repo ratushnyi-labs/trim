@@ -1,3 +1,9 @@
+//! ARM32 branch offset patching after dead code compaction.
+//!
+//! Rewrites BLX immediate (24-bit + H bit) and B/BL conditional
+//! (24-bit signed) branch offsets to account for address shifts
+//! caused by dead code removal. ARM32 branches use PC+8 as base.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -29,6 +35,7 @@ fn sign_extend(val: i32, bits: u32) -> i32 {
     (val << shift) >> shift
 }
 
+/// Patch a single ARM32 instruction's branch offset.
 fn patch_one(
     data: &mut [u8],
     instr: &DecodedInstr,

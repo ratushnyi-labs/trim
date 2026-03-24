@@ -1,3 +1,11 @@
+//! Call graph construction from decoded instructions.
+//!
+//! Builds a directed reference graph mapping each function to the set of
+//! functions it calls. Supports both a simple O(n*m) builder and an
+//! optimized O(n log m) builder using sorted address indices. Also
+//! tracks orphan references — calls from outside any known function —
+//! which are treated as additional roots for reachability analysis.
+
 use crate::types::{DecodedInstr, FuncMap, RefGraph};
 use std::collections::HashSet;
 

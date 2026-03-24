@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/ratushnyi-labs/trim#documentation
+    about: Check the user manuals (available in 6 languages) before opening an issue.

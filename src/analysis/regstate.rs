@@ -1,3 +1,11 @@
+//! Register state tracking and instruction effect extraction for SCCP.
+//!
+//! Maps architecture-specific instructions to abstract SSA effects
+//! (register moves, constants, binary ops, comparisons, clobbers).
+//! Supports x86-64, AArch64, ARM32, RISC-V, MIPS, s390x, and
+//! LoongArch. Each architecture has a dedicated effect extractor
+//! and caller-saved register set used by the SCCP worklist solver.
+
 use crate::analysis::lattice::{BinOp, CondCode};
 use crate::types::Arch;
 
@@ -55,6 +63,7 @@ pub fn x86_effects(raw: &[u8], addr: u64) -> Vec<SsaEffect> {
     extract_x86_effects(&instr)
 }
 
+/// Dispatch x86 instruction to the appropriate effect extractor.
 fn extract_x86_effects(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -73,6 +82,7 @@ fn extract_x86_effects(
     }
 }
 
+/// Extract SSA effects from a MOV instruction.
 fn extract_mov(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -112,6 +122,7 @@ fn extract_mov(
     }
 }
 
+/// Extract SSA effects from a LEA instruction (clobber destination).
 fn extract_lea(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -122,6 +133,7 @@ fn extract_lea(
     vec![SsaEffect::Clobber(dst)]
 }
 
+/// Extract SSA effects from ALU instructions (ADD, SUB, AND, OR, XOR).
 fn extract_alu(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -170,6 +182,7 @@ fn extract_alu(
     effects
 }
 
+/// Extract SSA effects from shift instructions (SHL, SHR, SAR).
 fn extract_shift(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -183,6 +196,7 @@ fn extract_shift(
     ]
 }
 
+/// Extract SSA effects from IMUL (clobber destination and flags).
 fn extract_imul(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -196,6 +210,7 @@ fn extract_imul(
     ]
 }
 
+/// Extract SSA effects from CMP (sets FLAGS from subtraction).
 fn extract_cmp(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -235,6 +250,7 @@ fn extract_cmp(
     }
 }
 
+/// Extract SSA effects from TEST (sets FLAGS from bitwise AND).
 fn extract_test(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -273,6 +289,7 @@ fn extract_test(
     }
 }
 
+/// Check if an XOR instruction is a self-XOR (register zeroing idiom).
 fn is_self_xor(instr: &iced_x86::Instruction) -> bool {
     instr.op_count() >= 2
         && instr.op_kind(0) == iced_x86::OpKind::Register
@@ -280,6 +297,7 @@ fn is_self_xor(instr: &iced_x86::Instruction) -> bool {
         && instr.op_register(0) == instr.op_register(1)
 }
 
+/// Self-XOR produces MovConst(reg, 0) and clobbers FLAGS.
 fn extract_self_xor(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -292,6 +310,7 @@ fn extract_self_xor(
     }
 }
 
+/// Clobber all registers written by an unrecognized instruction.
 fn extract_clobbers(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
@@ -384,6 +403,7 @@ pub fn x86_branch_cond(raw: &[u8]) -> Option<BranchCond> {
     Some(BranchCond { cc })
 }
 
+/// Decode the 0x0F-prefixed Jcc condition byte to a CondCode.
 fn decode_0f_condition(byte: u8) -> Option<CondCode> {
     match byte {
         0x84 => Some(CondCode::Eq),
@@ -445,6 +465,7 @@ pub const AARCH64_CALLER_SAVED: &[RegId] = &[
     FLAGS_REG,
 ];
 
+/// Map AArch64 register number to abstract register ID (0..15 tracked).
 fn aarch64_reg_id(reg: u32) -> Option<RegId> {
     if reg <= 15 {
         Some(reg as RegId)
@@ -453,6 +474,7 @@ fn aarch64_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw AArch64 instruction word.
 fn aarch64_effects(raw: &[u8]) -> Vec<SsaEffect> {
     if raw.len() < 4 {
         return vec![SsaEffect::Nop];
@@ -479,6 +501,7 @@ fn aarch64_effects(raw: &[u8]) -> Vec<SsaEffect> {
     vec![SsaEffect::Nop]
 }
 
+/// AArch64 MOVZ/MOVN wide immediate effect.
 fn a64_movwide(w: u32) -> Vec<SsaEffect> {
     let opc = (w >> 29) & 0x3;
     let hw = (w >> 21) & 0x3;
@@ -502,6 +525,7 @@ fn a64_movwide(w: u32) -> Vec<SsaEffect> {
     }
 }
 
+/// AArch64 ADD/SUB immediate effect (includes CMP when Rd=XZR).
 fn a64_addsub_imm(w: u32) -> Vec<SsaEffect> {
     let op = (w >> 30) & 1;
     let s_flag = (w >> 29) & 1;
@@ -544,6 +568,7 @@ fn a64_addsub_imm(w: u32) -> Vec<SsaEffect> {
     effects
 }
 
+/// AArch64 ADD/SUB shifted register effect.
 fn a64_addsub_reg(w: u32) -> Vec<SsaEffect> {
     let op = (w >> 30) & 1;
     let s_flag = (w >> 29) & 1;
@@ -584,6 +609,7 @@ fn a64_addsub_reg(w: u32) -> Vec<SsaEffect> {
     effects
 }
 
+/// AArch64 logical shifted register effect (AND, ORR, EOR, ANDS).
 fn a64_logical_reg(w: u32) -> Vec<SsaEffect> {
     let opc = (w >> 29) & 0x3;
     let n_bit = (w >> 21) & 1;
@@ -656,6 +682,7 @@ fn a64_logical_reg(w: u32) -> Vec<SsaEffect> {
 pub const ARM32_CALLER_SAVED: &[RegId] =
     &[0, 1, 2, 3, 12, 14, FLAGS_REG];
 
+/// Map ARM32 register number to abstract register ID (R0..R15 tracked).
 fn arm32_reg_id(reg: u32) -> Option<RegId> {
     if reg <= 15 {
         Some(reg as RegId)
@@ -664,6 +691,7 @@ fn arm32_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw ARM32 instruction word.
 fn arm32_effects(raw: &[u8]) -> Vec<SsaEffect> {
     if raw.len() < 4 {
         return vec![SsaEffect::Nop];
@@ -687,6 +715,7 @@ fn arm32_effects(raw: &[u8]) -> Vec<SsaEffect> {
     arm32_dp(w, i_bit, opcode, s_flag, rn, rd)
 }
 
+/// Decode ARM32 data-processing instruction effects.
 fn arm32_dp(
     w: u32,
     i_bit: u32,
@@ -733,6 +762,7 @@ fn arm32_dp(
     }
 }
 
+/// ARM32 MOV/MOVS effect.
 fn arm32_mov(
     rd: u32,
     s_flag: u32,
@@ -757,6 +787,7 @@ fn arm32_mov(
     effects
 }
 
+/// ARM32 MVN (bitwise NOT) effect.
 fn arm32_mvn(
     rd: u32,
     s_flag: u32,
@@ -778,6 +809,7 @@ fn arm32_mvn(
     effects
 }
 
+/// ARM32 ADD/SUB effect.
 fn arm32_addsub(
     op: BinOp,
     rd: u32,
@@ -817,6 +849,7 @@ fn arm32_addsub(
     effects
 }
 
+/// ARM32 AND/ORR/EOR/BIC logic effect.
 fn arm32_logic(
     op: BinOp,
     rd: u32,
@@ -856,6 +889,7 @@ fn arm32_logic(
     effects
 }
 
+/// ARM32 CMP/CMN effect (sets FLAGS).
 fn arm32_cmp(
     rn: u32,
     op2_val: Option<i64>,
@@ -872,6 +906,7 @@ fn arm32_cmp(
     vec![SsaEffect::Clobber(FLAGS_REG)]
 }
 
+/// ARM32 TST/TEQ effect (sets FLAGS via AND/EOR).
 fn arm32_tst(
     rn: u32,
     op2_val: Option<i64>,
@@ -896,6 +931,7 @@ pub const RISCV_CALLER_SAVED: &[RegId] =
     &[1, 5, 6, 7, 10, 11, 12, 13, 14, 15, FLAGS_REG];
 
 /// Map RISC-V register to RegId. x0 (zero) returns None.
+/// Map RISC-V register number to abstract register ID (x0..x15 tracked).
 fn riscv_reg_id(reg: u32) -> Option<RegId> {
     if reg >= 1 && reg <= 15 {
         Some(reg as RegId)
@@ -904,6 +940,7 @@ fn riscv_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw RISC-V instruction (32-bit or 16-bit compressed).
 fn riscv_effects(raw: &[u8]) -> Vec<SsaEffect> {
     if raw.len() < 2 {
         return vec![SsaEffect::Nop];
@@ -1190,6 +1227,7 @@ pub const MIPS_CALLER_SAVED: &[RegId] = &[
 ];
 
 /// Map MIPS register to RegId. $0 (zero) returns None.
+/// Map MIPS register number to abstract register ID ($0..$15 tracked).
 fn mips_reg_id(reg: u32) -> Option<RegId> {
     if reg >= 1 && reg <= 15 {
         Some(reg as RegId)
@@ -1198,6 +1236,7 @@ fn mips_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw MIPS instruction word.
 fn mips_effects(
     raw: &[u8],
     big_endian: bool,
@@ -1410,6 +1449,7 @@ fn mips_branch(w: u32) -> Vec<SsaEffect> {
 pub const S390X_CALLER_SAVED: &[RegId] =
     &[0, 1, 2, 3, 4, 5, 14, FLAGS_REG];
 
+/// Map s390x general register number to abstract register ID (R0..R15 tracked).
 fn s390x_reg_id(reg: u8) -> Option<RegId> {
     if reg <= 15 {
         Some(reg as RegId)
@@ -1418,6 +1458,7 @@ fn s390x_reg_id(reg: u8) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw s390x instruction (2/4/6 bytes, big-endian).
 fn s390x_effects(raw: &[u8]) -> Vec<SsaEffect> {
     match raw.len() {
         2 => s390x_rr(raw),
@@ -1587,6 +1628,7 @@ pub const LOONGARCH_CALLER_SAVED: &[RegId] = &[
 ];
 
 /// Map LoongArch register to RegId. $r0 (zero) -> None.
+/// Map LoongArch register number to abstract register ID ($r0..$r15 tracked).
 fn loongarch_reg_id(reg: u32) -> Option<RegId> {
     if reg >= 1 && reg <= 15 {
         Some(reg as RegId)
@@ -1595,6 +1637,7 @@ fn loongarch_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
+/// Extract SSA effects from a raw LoongArch64 instruction word.
 fn loongarch_effects(raw: &[u8]) -> Vec<SsaEffect> {
     if raw.len() < 4 {
         return vec![SsaEffect::Nop];

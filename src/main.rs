@@ -1,3 +1,10 @@
+//! CLI entry point for the `trim` dead-code removal tool.
+//!
+//! Parses command-line arguments, reads binary input (file, stdin, or
+//! in-place), delegates to the core analysis/patch pipeline in `trim`,
+//! and writes the patched output. Supports ELF, PE/COFF, Mach-O,
+//! .NET, Wasm, and Java class files.
+
 use std::io::{self, Read, Write};
 use std::process;
 
@@ -8,6 +15,7 @@ const VERSION: &str = match option_env!("TRIM_VERSION") {
 
 const LICENSE: &str = include_str!("../LICENSE");
 
+/// Program entry: parse args and dispatch to the appropriate mode.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let parsed = match parse_args(&args[1..]) {
@@ -41,6 +49,7 @@ fn main() {
     }
 }
 
+/// Parsed CLI action to execute.
 enum Action {
     Help,
     Version,
@@ -49,6 +58,7 @@ enum Action {
     Stream { dry_run: bool, input: String, output: Option<String>, max_sccp: usize },
 }
 
+/// Parse CLI arguments into an `Action`. Returns an error message on failure.
 fn parse_args(args: &[String]) -> Result<Action, String> {
     if args.is_empty() {
         eprint_usage();
@@ -101,6 +111,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     Ok(Action::Stream { dry_run, input, output, max_sccp })
 }
 
+/// Parse the `--max-sccp-instrs` value from the argument list at index `i`.
 fn parse_max_sccp(
     args: &[String],
     i: usize,
@@ -113,6 +124,7 @@ fn parse_max_sccp(
     })
 }
 
+/// Process multiple files in-place, returning the worst exit code.
 fn run_in_place(
     files: &[String],
     dry_run: bool,
@@ -135,6 +147,7 @@ fn run_in_place(
     rc
 }
 
+/// Read binary input from a file path or stdin (if `input` is `"-"`).
 fn read_input(input: &str) -> Result<Vec<u8>, i32> {
     if input == "-" {
         read_stdin().map_err(|e| {
@@ -149,6 +162,7 @@ fn read_input(input: &str) -> Result<Vec<u8>, i32> {
     }
 }
 
+/// Write patched data to a file and set the executable bit (Unix).
 fn write_output(path: &str, data: &[u8]) -> i32 {
     if let Err(e) = std::fs::write(path, data) {
         eprintln!("Error: cannot write '{}': {}", path, e);
@@ -158,6 +172,7 @@ fn write_output(path: &str, data: &[u8]) -> i32 {
     0
 }
 
+/// Stream mode: read input, analyze/patch, write to output file or stdout.
 fn run_stream(
     input: &str,
     output: Option<&str>,
@@ -197,6 +212,7 @@ fn run_stream(
     0
 }
 
+/// Set the executable permission bits on a file (Unix only).
 #[cfg(unix)]
 fn set_executable(path: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -207,15 +223,18 @@ fn set_executable(path: &str) {
     }
 }
 
+/// No-op on non-Unix platforms.
 #[cfg(not(unix))]
 fn set_executable(_path: &str) {}
 
+/// Read all bytes from stdin into a buffer.
 fn read_stdin() -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     io::stdin().lock().read_to_end(&mut buf)?;
     Ok(buf)
 }
 
+/// Print usage/help text to stderr.
 fn eprint_usage() {
     eprintln!(
         "trim {VERSION}\n\

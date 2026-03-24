@@ -1,3 +1,11 @@
+//! Sparse Conditional Constant Propagation (SCCP) for dead branch detection.
+//!
+//! Performs a worklist-driven forward dataflow analysis over a function's
+//! CFG, tracking register values as lattice elements (Bot/Const/Top).
+//! When a conditional branch's flags register resolves to a constant,
+//! only the taken edge is propagated, leaving the other successor
+//! unreachable. Unreachable blocks are reported as dead branches.
+
 use crate::analysis::cfg::{DeadBlock, FuncCfg};
 use crate::analysis::dominance::compute_dom_tree;
 use crate::analysis::lattice::{eval_binop, Value};
@@ -48,6 +56,7 @@ pub fn sccp_dead_blocks(
     SccpResult { dead, skipped: false, instr_count: count }
 }
 
+/// Collect all instructions that fall within the function's address range.
 fn collect_func_instrs<'a>(
     cfg: &FuncCfg,
     instrs: &'a [DecodedInstr],
@@ -59,6 +68,7 @@ fn collect_func_instrs<'a>(
         .collect()
 }
 
+/// Build per-block SSA effects from decoded instructions and architecture.
 fn build_block_effects(
     cfg: &FuncCfg,
     instrs: &[&DecodedInstr],
@@ -86,6 +96,7 @@ fn build_block_effects(
         .collect()
 }
 
+/// Append effects for one instruction (call sites clobber caller-saved regs).
 fn add_instr_effects(
     effects: &mut Vec<SsaEffect>,
     instr: &DecodedInstr,
@@ -104,6 +115,7 @@ fn add_instr_effects(
     effects.extend(effs);
 }
 
+/// Internal state for the SCCP worklist solver.
 struct SccpState {
     reg_vals: Vec<Vec<Value>>,
     exec_edges: HashSet<(usize, usize)>,
@@ -111,6 +123,7 @@ struct SccpState {
 }
 
 impl SccpState {
+    /// Create initial state with all registers at Bot (unreachable).
     fn new(n: usize) -> Self {
         Self {
             reg_vals: vec![
@@ -121,15 +134,18 @@ impl SccpState {
         }
     }
 
+    /// Mark a block as executable (reachable).
     fn mark_edge_exec(&mut self, block: usize) {
         self.block_exec[block] = true;
     }
 
+    /// Check if a block has been marked executable.
     fn is_exec(&self, block: usize) -> bool {
         self.block_exec[block]
     }
 }
 
+/// Main SCCP worklist loop: propagate register values through the CFG.
 fn run_sccp(
     state: &mut SccpState,
     cfg: &FuncCfg,
@@ -158,12 +174,14 @@ fn run_sccp(
     }
 }
 
+/// Initialize entry block registers to Top (unknown incoming values).
 fn init_entry_regs(state: &mut SccpState, entry: usize) {
     for r in 0..REG_COUNT {
         state.reg_vals[entry][r] = Value::Top;
     }
 }
 
+/// Evaluate all effects in a block, producing output register values.
 fn eval_block(
     state: &SccpState,
     b: usize,
@@ -176,6 +194,7 @@ fn eval_block(
     vals
 }
 
+/// Apply a single SSA effect to the register value vector.
 fn apply_effect(vals: &mut [Value], eff: &SsaEffect) {
     match eff {
         SsaEffect::MovConst(d, c) => {
@@ -219,6 +238,7 @@ fn apply_effect(vals: &mut [Value], eff: &SsaEffect) {
     }
 }
 
+/// Set FLAGS to the difference of two register values (CMP semantics).
 fn apply_cmp_reg(
     vals: &mut [Value],
     a: u8,
@@ -236,6 +256,7 @@ fn apply_cmp_reg(
     vals[FLAGS_REG as usize] = result;
 }
 
+/// Set FLAGS to reg minus immediate (CMP reg, imm).
 fn apply_cmp_imm(vals: &mut [Value], a: u8, imm: i64) {
     let va = &vals[a as usize];
     let result = match va {
@@ -246,6 +267,7 @@ fn apply_cmp_imm(vals: &mut [Value], a: u8, imm: i64) {
     vals[FLAGS_REG as usize] = result;
 }
 
+/// Set FLAGS to the bitwise AND of two registers (TEST semantics).
 fn apply_test_reg(vals: &mut [Value], a: u8, b: u8) {
     let va = &vals[a as usize];
     let vb = &vals[b as usize];
@@ -259,6 +281,7 @@ fn apply_test_reg(vals: &mut [Value], a: u8, b: u8) {
     vals[FLAGS_REG as usize] = result;
 }
 
+/// Set FLAGS to reg AND immediate (TEST reg, imm).
 fn apply_test_imm(vals: &mut [Value], a: u8, imm: i64) {
     let va = &vals[a as usize];
     let result = match va {
@@ -269,6 +292,7 @@ fn apply_test_imm(vals: &mut [Value], a: u8, imm: i64) {
     vals[FLAGS_REG as usize] = result;
 }
 
+/// Propagate register values to successor blocks, respecting branch resolution.
 fn propagate_succs(
     state: &mut SccpState,
     cfg: &FuncCfg,
@@ -290,6 +314,7 @@ fn propagate_succs(
     }
 }
 
+/// Determine the terminator flow type for a block.
 fn block_terminator_flow(
     cfg: &FuncCfg,
     b: usize,
@@ -304,6 +329,7 @@ fn block_terminator_flow(
     Some(FlowType::ConditionalBranch)
 }
 
+/// Propagate along a conditional branch, resolving direction from FLAGS.
 fn propagate_cond(
     state: &mut SccpState,
     _cfg: &FuncCfg,
@@ -329,12 +355,14 @@ fn propagate_cond(
     }
 }
 
+/// Result of resolving a conditional branch from FLAGS value.
 enum BranchResult {
     AlwaysTaken,
     NeverTaken,
     Unknown,
 }
 
+/// Resolve branch direction from FLAGS: zero means not-taken, nonzero means taken.
 fn resolve_branch(flags: &Value) -> BranchResult {
     match flags {
         Value::Bot => BranchResult::Unknown,
@@ -349,6 +377,7 @@ fn resolve_branch(flags: &Value) -> BranchResult {
     }
 }
 
+/// Propagate values only to the taken branch target.
 fn propagate_taken(
     state: &mut SccpState,
     b: usize,
@@ -362,6 +391,7 @@ fn propagate_taken(
     }
 }
 
+/// Propagate values only to the fallthrough successor.
 fn propagate_fallthrough(
     state: &mut SccpState,
     b: usize,
@@ -375,6 +405,7 @@ fn propagate_fallthrough(
     }
 }
 
+/// Propagate values to all successors (unknown branch direction).
 fn propagate_all(
     state: &mut SccpState,
     b: usize,
@@ -387,6 +418,7 @@ fn propagate_all(
     }
 }
 
+/// Merge register values into a successor block and enqueue if changed.
 fn merge_and_enqueue(
     state: &mut SccpState,
     from: usize,
@@ -414,6 +446,7 @@ fn merge_and_enqueue(
     }
 }
 
+/// Collect blocks that were never marked executable as dead blocks.
 fn find_sccp_dead(
     cfg: &FuncCfg,
     state: &SccpState,

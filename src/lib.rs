@@ -1,3 +1,11 @@
+//! Core dispatch logic for the `trim` dead-code removal tool.
+//!
+//! Orchestrates the full pipeline: format detection, function discovery,
+//! call-graph reachability, CFG-based dead-block detection, SCCP analysis,
+//! and binary reassembly. Supports ELF, PE/COFF, Mach-O, .NET, Wasm,
+//! and Java class files across x86, AArch64, ARM32, RISC-V, MIPS,
+//! s390x, and LoongArch architectures.
+
 pub mod analysis;
 pub mod arch;
 pub mod constants;
@@ -52,6 +60,8 @@ pub fn analyze(
     }
 }
 
+/// Run SCCP (Sparse Conditional Constant Propagation) on all eligible
+/// live functions and collect dead blocks where branches resolve statically.
 fn run_sccp_analysis(
     funcs: &FuncMap,
     instrs: &[types::DecodedInstr],
@@ -87,6 +97,7 @@ fn run_sccp_analysis(
     (all_dead, skipped)
 }
 
+/// Detect dead blocks in format-specific bytecode (Wasm, .NET IL, Java).
 fn find_format_dead_blocks(
     data: &[u8],
     dead_funcs: &HashMap<String, (u64, u64)>,
@@ -107,6 +118,8 @@ fn find_format_dead_blocks(
     }
 }
 
+/// Find dead blocks in .NET IL method bodies by cross-referencing
+/// the dead function set with CIL method RVAs.
 fn find_dotnet_dead_blocks(
     data: &[u8],
     dead_funcs: &HashMap<String, (u64, u64)>,
@@ -153,11 +166,13 @@ fn find_dotnet_dead_blocks(
     )
 }
 
+/// Parsed .NET metadata needed for dead-block detection.
 struct DotnetParsed {
     root: format::dotnet::metadata::MetadataRoot,
     methods: Vec<format::dotnet::tables::MethodDef>,
 }
 
+/// Parse .NET PE metadata tables to extract method definitions.
 fn parse_dotnet_for_blocks(data: &[u8]) -> Option<DotnetParsed> {
     let cli_off =
         format::dotnet::metadata::cli_header_offset(data)?;
@@ -182,6 +197,7 @@ fn parse_dotnet_for_blocks(data: &[u8]) -> Option<DotnetParsed> {
     Some(DotnetParsed { root, methods })
 }
 
+/// Merge extra dead blocks into the base list, deduplicating by address.
 fn merge_dead_blocks(
     base: &mut Vec<analysis::cfg::DeadBlock>,
     extra: Vec<analysis::cfg::DeadBlock>,
@@ -195,6 +211,8 @@ fn merge_dead_blocks(
     }
 }
 
+/// Detect binary format and run format-specific analysis to discover
+/// functions, dead functions, sections, and import names.
 fn analyze_format(
     data: &[u8],
 ) -> (
@@ -240,6 +258,7 @@ fn analyze_format(
     }
 }
 
+/// Compute the set of function names that are alive (not in the dead set).
 fn compute_live_names(
     funcs: &FuncMap,
     dead: &HashMap<String, (u64, u64)>,
@@ -251,6 +270,7 @@ fn compute_live_names(
         .collect()
 }
 
+/// Decode the .text section instructions for CFG construction.
 fn decode_for_cfg(
     data: &[u8],
     sections: &[Section],
@@ -265,6 +285,7 @@ fn decode_for_cfg(
     )
 }
 
+/// Detect if the binary is big-endian from the ELF EI_DATA byte.
 fn detect_big_endian(data: &[u8]) -> bool {
     if data.len() >= 6 && &data[..4] == b"\x7fELF" {
         return data[5] == 2; // EI_DATA: 2 = big-endian
@@ -272,6 +293,7 @@ fn detect_big_endian(data: &[u8]) -> bool {
     false
 }
 
+/// Detect the CPU architecture from the binary header (ELF or PE).
 fn detect_arch_from_data(data: &[u8]) -> types::Arch {
     if data.len() >= 4 && &data[..4] == b"\x7fELF" {
         return detect_elf_arch(data);
@@ -282,6 +304,7 @@ fn detect_arch_from_data(data: &[u8]) -> types::Arch {
     types::Arch::X86_64
 }
 
+/// Read the ELF e_machine field to determine the CPU architecture.
 fn detect_elf_arch(data: &[u8]) -> types::Arch {
     if data.len() < 20 {
         return types::Arch::X86_64;
@@ -316,6 +339,7 @@ fn detect_elf_arch(data: &[u8]) -> types::Arch {
     }
 }
 
+/// Read the PE COFF machine field to determine the CPU architecture.
 fn detect_pe_arch(data: &[u8]) -> types::Arch {
     if data.len() < 64 {
         return types::Arch::X86_64;
@@ -351,6 +375,7 @@ pub fn reassemble(
     reassemble_format(data, dead, dead_blocks, sections)
 }
 
+/// Dispatch to the format-specific reassembler to patch the binary.
 fn reassemble_format(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
@@ -424,6 +449,7 @@ pub fn process_bytes(
     patch_binary(data, &result)
 }
 
+/// Print discovered dead functions to stderr, sorted by size descending.
 fn report_dead_funcs(
     dead: &HashMap<String, (u64, u64)>,
 ) {
@@ -446,6 +472,7 @@ fn report_dead_funcs(
     }
 }
 
+/// Print functions that were skipped by SCCP due to instruction count limits.
 fn report_sccp_skipped(skipped: &[(String, usize)]) {
     if skipped.is_empty() {
         return;
@@ -464,6 +491,7 @@ fn report_sccp_skipped(skipped: &[(String, usize)]) {
     }
 }
 
+/// Print discovered dead branches to stderr.
 fn report_dead_blocks(dead_blocks: &[DeadBlock]) {
     if dead_blocks.is_empty() {
         return;
@@ -482,6 +510,7 @@ fn report_dead_blocks(dead_blocks: &[DeadBlock]) {
     }
 }
 
+/// Apply dead-code patches to the binary data and report results.
 fn patch_binary(
     data: &[u8],
     result: &AnalysisResult,

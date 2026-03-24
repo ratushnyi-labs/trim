@@ -1,3 +1,11 @@
+//! LoongArch64 instruction decoder for dead code analysis.
+//!
+//! Decodes fixed-width 32-bit little-endian LoongArch instructions.
+//! Extracts B/BL 26-bit jump targets, BEQ/BNE/BLT/BGE/BLTU/BGEU
+//! 16-bit conditional branches, BEQZ/BNEZ 21-bit branches, JIRL
+//! indirect calls/returns, and PCALA/PCADDU PC-relative references.
+//! Follows the LoongArch LP64D calling convention.
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode LoongArch64 instructions (fixed 32-bit, little-endian).
@@ -34,6 +42,7 @@ pub fn decode_text_loongarch(
     instrs
 }
 
+/// Decode a single LoongArch instruction word by opcode dispatch.
 fn decode_la_word(
     addr: u64,
     w: u32,
@@ -150,6 +159,7 @@ fn decode_bnez(
     (vec![target], None, FlowType::ConditionalBranch)
 }
 
+/// Decode PC-relative and halt instructions (PCALA, PCADDU, BREAK).
 fn decode_la_other(
     addr: u64,
     w: u32,

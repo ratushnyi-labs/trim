@@ -1,3 +1,9 @@
+//! Abstract value lattice for constant propagation analysis.
+//!
+//! Defines a three-point lattice (Bot < Const < Top) for tracking
+//! register values during SCCP. Provides meet operations, binary
+//! arithmetic evaluation, and comparison evaluation over lattice values.
+
 /// Value lattice for constant propagation.
 /// Bot (unreachable) < Const(i64) < Top (unknown).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +29,12 @@ impl Value {
         }
     }
 
+    /// Returns true if this value is a known constant.
     pub fn is_const(&self) -> bool {
         matches!(self, Value::Const(_))
     }
 
+    /// Extract the constant value, or None if Bot/Top.
     pub fn as_const(&self) -> Option<i64> {
         match self {
             Value::Const(v) => Some(*v),
@@ -46,6 +54,7 @@ pub fn eval_binop(op: BinOp, a: &Value, b: &Value) -> Value {
     }
 }
 
+/// Evaluate a concrete binary operation using wrapping arithmetic.
 fn compute_binop(op: BinOp, x: i64, y: i64) -> Value {
     let result = match op {
         BinOp::Add => x.wrapping_add(y),
@@ -73,6 +82,7 @@ pub fn eval_cmp(cc: CondCode, a: &Value, b: &Value) -> Value {
     }
 }
 
+/// Evaluate a concrete comparison between two integer values.
 fn compare(x: i64, y: i64, cc: CondCode) -> bool {
     match cc {
         CondCode::Eq => x == y,

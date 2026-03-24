@@ -1,12 +1,20 @@
+//! ELF metadata patching after dead code compaction.
+//!
+//! Updates all ELF structures affected by .text compaction: entry point,
+//! relocations (.rela.dyn, .rela.plt), symbol tables (.symtab, .dynsym),
+//! .dynamic section, section headers, and program headers.
+
 use crate::patch::relocs::{page_shrink, total_shift};
 use crate::types::Section;
 
 // ---- Endian helpers -----------------------------------------------
 
+/// Return true if the ELF uses big-endian encoding (EI_DATA == 2).
 fn elf_be(data: &[u8]) -> bool {
     data.len() > 5 && data[5] == 2
 }
 
+/// Read a u16 at `off` with the given endianness.
 fn read_u16e(data: &[u8], off: usize, be: bool) -> u16 {
     if off + 2 > data.len() {
         return 0;
@@ -16,6 +24,7 @@ fn read_u16e(data: &[u8], off: usize, be: bool) -> u16 {
     if be { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }
 }
 
+/// Read a u32 at `off` with the given endianness.
 fn read_u32e(data: &[u8], off: usize, be: bool) -> u32 {
     if off + 4 > data.len() {
         return 0;
@@ -25,6 +34,7 @@ fn read_u32e(data: &[u8], off: usize, be: bool) -> u32 {
     if be { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) }
 }
 
+/// Read a u64 at `off` with the given endianness.
 fn read_u64e(data: &[u8], off: usize, be: bool) -> u64 {
     if off + 8 > data.len() {
         return 0;
@@ -34,6 +44,7 @@ fn read_u64e(data: &[u8], off: usize, be: bool) -> u64 {
     if be { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) }
 }
 
+/// Write a u32 at `off` with the given endianness.
 fn write_u32e(data: &mut [u8], off: usize, val: u32, be: bool) {
     if off + 4 <= data.len() {
         let b = if be {
@@ -45,6 +56,7 @@ fn write_u32e(data: &mut [u8], off: usize, val: u32, be: bool) {
     }
 }
 
+/// Write a u64 at `off` with the given endianness.
 fn write_u64e(data: &mut [u8], off: usize, val: u64, be: bool) {
     if off + 8 <= data.len() {
         let b = if be {
@@ -56,6 +68,7 @@ fn write_u64e(data: &mut [u8], off: usize, val: u64, be: bool) {
     }
 }
 
+/// Read a signed i64 at `off` with the given endianness.
 fn read_i64e(data: &[u8], off: usize, be: bool) -> i64 {
     if off + 8 > data.len() {
         return 0;
@@ -65,6 +78,7 @@ fn read_i64e(data: &[u8], off: usize, be: bool) -> i64 {
     if be { i64::from_be_bytes(b) } else { i64::from_le_bytes(b) }
 }
 
+/// Write a signed i64 at `off` with the given endianness.
 fn write_i64e(data: &mut [u8], off: usize, val: i64, be: bool) {
     if off + 8 <= data.len() {
         let b = if be {
@@ -102,6 +116,7 @@ pub fn patch_entry_point(
     }
 }
 
+/// Read the entry point value (32-bit or 64-bit) from the ELF header.
 fn read_entry(
     data: &[u8],
     off: usize,
@@ -115,6 +130,7 @@ fn read_entry(
     }
 }
 
+/// Write the entry point value (32-bit or 64-bit) to the ELF header.
 fn write_entry(
     data: &mut [u8],
     off: usize,
@@ -156,6 +172,7 @@ pub fn patch_rela_dyn(
     }
 }
 
+/// Patch a single Rela entry: shift r_offset and RELATIVE addend.
 fn patch_rela_entry(
     data: &mut [u8],
     i: usize,
@@ -201,6 +218,7 @@ pub fn patch_symbols(
     }
 }
 
+/// Iterate over entries in a single symbol table section and patch values.
 fn patch_symtab(
     data: &mut [u8],
     sec: &Section,
@@ -227,6 +245,7 @@ fn patch_symtab(
     }
 }
 
+/// Patch a single symbol's st_value if it falls within shifted ranges.
 fn patch_one_sym(
     data: &mut [u8],
     i: usize,
@@ -260,6 +279,7 @@ fn patch_one_sym(
 
 // ---- .dynamic ---------------------------------------------------
 
+/// DT_* tag values whose d_val fields hold addresses that need shifting.
 const ADDR_TAGS: &[u64] = &[
     3,          // DT_PLTGOT
     4,          // DT_HASH
@@ -306,6 +326,7 @@ pub fn patch_dynamic(
     }
 }
 
+/// Patch a single .dynamic d_val address entry.
 fn patch_dyn_val(
     data: &mut [u8],
     off: usize,
@@ -361,6 +382,7 @@ pub fn patch_headers(
     patch_elf_shoff(data, ps, text_file_end, be);
 }
 
+/// Iterate over all section headers and patch addresses/offsets.
 fn patch_shdrs(
     data: &mut [u8],
     intervals: &[(u64, u64)],
@@ -385,6 +407,8 @@ fn patch_shdrs(
     }
 }
 
+/// Patch a single section header: shift sh_addr, shrink .text size,
+/// and adjust sh_offset for sections after the .text file region.
 fn patch_one_shdr(
     data: &mut [u8],
     base: usize,
@@ -415,6 +439,7 @@ fn patch_one_shdr(
     }
 }
 
+/// Iterate over all program headers and patch addresses/sizes.
 fn patch_phdrs(
     data: &mut [u8],
     intervals: &[(u64, u64)],
@@ -439,6 +464,8 @@ fn patch_phdrs(
     }
 }
 
+/// Patch a single program header: shift vaddr/paddr, shrink file/mem
+/// sizes for the segment containing .text, and shift p_offset.
 fn patch_one_phdr(
     data: &mut [u8],
     base: usize,
@@ -473,6 +500,7 @@ fn patch_one_phdr(
     }
 }
 
+/// Shift e_shoff (section header table offset) if it lies after .text.
 fn patch_elf_shoff(
     data: &mut [u8],
     ps: u64,

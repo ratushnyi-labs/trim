@@ -1,3 +1,9 @@
+//! Binary format detection and dispatch.
+//!
+//! Identifies the binary format of an input file by inspecting magic bytes,
+//! then delegates to the appropriate format-specific module for analysis
+//! and compaction (ELF, PE/COFF, Mach-O, .NET, Wasm, Java).
+
 pub mod dotnet;
 pub mod elf;
 pub mod java;
@@ -8,15 +14,23 @@ pub mod wasm;
 /// Detected binary format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// Linux/Unix ELF binary.
     Elf,
+    /// Windows PE/COFF binary.
     Pe,
+    /// macOS/iOS Mach-O binary.
     MachO,
+    /// .NET (CLI) assembly.
     Dotnet,
+    /// WebAssembly module.
     Wasm,
+    /// Java .class file.
     Java,
 }
 
-/// Detect binary format from magic bytes.
+/// Detect binary format from the first few magic bytes of `data`.
+///
+/// Returns `None` if the format is unrecognized.
 pub fn detect_format(data: &[u8]) -> Option<Format> {
     if data.len() >= 4 && data[..4] == *b"\x7fELF" {
         return Some(Format::Elf);
@@ -39,6 +53,7 @@ pub fn detect_format(data: &[u8]) -> Option<Format> {
     None
 }
 
+/// Check for Java class file magic (0xCAFEBABE).
 fn is_java_magic(data: &[u8]) -> bool {
     data[0] == 0xCA
         && data[1] == 0xFE
@@ -46,6 +61,7 @@ fn is_java_magic(data: &[u8]) -> bool {
         && data[3] == 0xBE
 }
 
+/// Check for Mach-O magic (32-bit, 64-bit, or byte-swapped).
 fn is_macho_magic(data: &[u8]) -> bool {
     let m = u32::from_le_bytes(
         data[..4].try_into().unwrap_or([0; 4]),
@@ -53,6 +69,7 @@ fn is_macho_magic(data: &[u8]) -> bool {
     matches!(m, 0xFEED_FACE | 0xFEED_FACF | 0xCEFA_EDFE | 0xCFFA_EDFE)
 }
 
+/// Check for WebAssembly module magic (`\0asm`).
 fn is_wasm_magic(data: &[u8]) -> bool {
     data[0] == 0x00
         && data[1] == 0x61

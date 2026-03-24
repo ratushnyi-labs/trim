@@ -1,3 +1,11 @@
+//! Data section scanning for embedded function pointers.
+//!
+//! Scans data sections (.rodata, .got, .init_array, etc.) for pointer-sized
+//! values that reference known function addresses or fall within the .text
+//! range. These references anchor additional root functions for reachability
+//! analysis, preventing false positives on functions called only via
+//! function pointers or jump tables.
+
 use crate::types::{Endian, Section};
 use std::collections::HashSet;
 
@@ -35,6 +43,7 @@ pub fn scan_data_for_func_addrs(
     refs
 }
 
+/// Scan a single section for pointer-sized values matching known function addresses.
 fn scan_one_section(
     data: &[u8],
     sec: &Section,

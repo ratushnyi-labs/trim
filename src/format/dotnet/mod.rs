@@ -1,3 +1,25 @@
+//! .NET (CLI) managed assembly analysis and compaction entry point.
+//!
+//! Parses a PE/.NET assembly by locating the CLI header, metadata root,
+//! `#~` table stream, and MethodDef/TypeDef tables. Dead code is detected
+//! via a BFS reachability analysis starting from the assembly entry point
+//! and all methods belonging to public types. Unreachable methods are
+//! candidates for removal.
+//!
+//! Compaction proceeds in six steps:
+//! 1. Zero dead method bodies (replace with `ret` + zero-fill).
+//! 2. NOP-fill or physically compact dead branches in live methods.
+//! 3. Build dead intervals from function-level dead code.
+//! 4. Patch .NET metadata RVAs (MethodDef table, CLI header).
+//! 5. Patch PE headers (entry point, section headers).
+//! 6. Physical compaction of the `.text` section.
+//!
+//! Key types:
+//! - `ParsedDotnet` -- internal struct holding parsed CLI header, metadata
+//!   root, method defs, and type defs.
+//! - `ReassemblyInfo` -- offsets needed to patch the MethodDef table during
+//!   reassembly.
+
 pub mod il;
 pub mod metadata;
 pub mod patch;
@@ -9,6 +31,7 @@ use crate::patch::relocs::dead_intervals;
 use crate::types::{FuncInfo, FuncMap, Section};
 use std::collections::{HashMap, HashSet};
 
+/// Internal bundle of parsed .NET metadata used during analysis.
 struct ParsedDotnet {
     cli: metadata::CliHeader,
     root: metadata::MetadataRoot,
@@ -16,7 +39,11 @@ struct ParsedDotnet {
     types: Vec<tables::TypeDef>,
 }
 
-/// Analyze a .NET managed assembly.
+/// Analyze a .NET managed assembly for dead methods.
+///
+/// Parses PE/CLI metadata, builds a call graph from IL bodies, then
+/// performs BFS reachability from roots (entry point + public-type
+/// methods). Returns `(func_map, dead_map, sections)`.
 pub fn analyze_dotnet(
     data: &[u8],
 ) -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
@@ -34,6 +61,8 @@ pub fn analyze_dotnet(
     (funcs, dead, Vec::new())
 }
 
+/// Parse CLI header, metadata root, and table streams from a PE binary.
+/// Returns `None` if the file is not a valid .NET assembly.
 fn parse_dotnet_metadata(
     data: &[u8],
 ) -> Option<ParsedDotnet> {
@@ -53,6 +82,8 @@ fn parse_dotnet_metadata(
     Some(ParsedDotnet { cli, root, methods, types })
 }
 
+/// Build a function map from MethodDef rows, resolving names via the
+/// `#Strings` heap and estimating body sizes from method headers.
 fn build_func_map(
     methods: &[tables::MethodDef],
     root: &metadata::MetadataRoot,
@@ -81,6 +112,8 @@ fn build_func_map(
     funcs
 }
 
+/// Run the full dead-method analysis: build IL call graph, identify
+/// root methods, BFS for liveness, then collect dead methods.
 fn run_analysis(
     funcs: &FuncMap,
     methods: &[tables::MethodDef],
@@ -102,6 +135,8 @@ fn run_analysis(
     find_dead_methods(funcs, methods, &live, data, root)
 }
 
+/// Identify root method indices: the assembly entry point (if a
+/// MethodDef token) plus all methods owned by public types.
 fn find_roots(
     methods: &[tables::MethodDef],
     types: &[tables::TypeDef],
@@ -123,6 +158,7 @@ fn find_roots(
     roots
 }
 
+/// Add all methods belonging to publicly-visible types to the root set.
 fn mark_public_type_methods(
     roots: &mut HashSet<usize>,
     types: &[tables::TypeDef],
@@ -148,6 +184,8 @@ fn mark_public_type_methods(
     }
 }
 
+/// BFS from root method indices over the call graph, returning the
+/// set of reachable (live) method indices.
 fn bfs_live(
     roots: &HashSet<usize>,
     graph: &HashMap<usize, HashSet<u32>>,
@@ -175,6 +213,8 @@ fn bfs_live(
     live
 }
 
+/// Convert a metadata token to a zero-based method index.
+/// Returns `None` if the token is not a MethodDef (table 0x06).
 fn token_to_method_idx(
     token: u32,
     total: usize,
@@ -188,6 +228,7 @@ fn token_to_method_idx(
     }
 }
 
+/// Collect methods not in the live set as dead (name -> (RVA, size)).
 fn find_dead_methods(
     _funcs: &FuncMap,
     methods: &[tables::MethodDef],
@@ -210,6 +251,7 @@ fn find_dead_methods(
     dead
 }
 
+/// Estimate IL method body size from its header (tiny or fat).
 fn estimate_method_size(data: &[u8], rva: u32) -> u64 {
     let off = match pe_rva_to_offset(data, rva) {
         Some(o) => o,
@@ -243,6 +285,7 @@ pub fn pe_rva_to_offset_pub(
     pe_rva_to_offset(data, rva)
 }
 
+/// Convert a PE RVA to a file offset by walking section headers.
 fn pe_rva_to_offset(
     data: &[u8],
     rva: u32,
@@ -343,6 +386,7 @@ pub fn reassemble_dotnet(
     (fc, saved, blk_count, blk_saved)
 }
 
+/// Offsets and sizes needed to patch the MethodDef table during reassembly.
 struct ReassemblyInfo {
     cli_offset: usize,
     method_table_off: usize,
@@ -350,6 +394,7 @@ struct ReassemblyInfo {
     method_count: usize,
 }
 
+/// Re-parse metadata to obtain MethodDef table location for RVA patching.
 fn parse_for_reassembly(
     data: &[u8],
 ) -> Option<ReassemblyInfo> {
@@ -449,6 +494,7 @@ fn dotnet_sections(data: &[u8]) -> Vec<Section> {
     sections
 }
 
+/// Return empty analysis results (no functions, no dead code, no sections).
 fn empty()
 -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
     (FuncMap::new(), HashMap::new(), Vec::new())

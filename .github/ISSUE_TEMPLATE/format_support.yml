@@ -1,0 +1,42 @@
+name: Format / Architecture Support
+description: Request support for a new binary format or CPU architecture
+labels: ["enhancement", "format"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Request support for a binary format or architecture not yet handled by trim.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Request type
+      options:
+        - New binary format
+        - New CPU architecture
+        - Both
+    validations:
+      required: true
+
+  - type: input
+    id: format_name
+    attributes:
+      label: Format / architecture name
+      placeholder: "e.g., XCOFF, SPARC, Dalvik DEX"
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: |
+        Provide links to format specs, example binaries, or use cases.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample
+    attributes:
+      label: Sample binary
+      description: Link to or describe how to obtain a test binary in this format.

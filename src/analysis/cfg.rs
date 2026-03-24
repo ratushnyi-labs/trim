@@ -1,3 +1,10 @@
+//! Control flow graph construction and dead-block detection.
+//!
+//! Builds intra-procedural CFGs from decoded instructions, performs
+//! BFS reachability from the entry block, and identifies unreachable
+//! basic blocks as dead code. Also detects dead code after calls to
+//! known noreturn functions (e.g., `exit`, `abort`).
+
 use crate::analysis::noreturn::NORETURN_FUNCS;
 use crate::types::{DecodedInstr, FlowType, FuncInfo, FuncMap};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -53,6 +60,7 @@ pub fn find_dead_blocks(
     all_dead
 }
 
+/// Check if a function should be analyzed for dead blocks.
 fn should_analyze(
     name: &str,
     fi: &FuncInfo,
@@ -63,6 +71,7 @@ fn should_analyze(
         && !name.starts_with("sub_")
 }
 
+/// Find dead blocks within a single function's instruction range.
 fn find_dead_in_func(
     name: &str,
     fi: &FuncInfo,
@@ -243,6 +252,7 @@ pub fn find_dead_blocks_cfg(
     all_dead
 }
 
+/// Check if a function is safe for full CFG-based analysis (no indirect branches).
 fn should_analyze_cfg(
     name: &str,
     fi: &FuncInfo,
@@ -260,6 +270,8 @@ fn should_analyze_cfg(
     is_safe_for_cfg(&fi_instrs)
 }
 
+/// A function is safe for CFG analysis if it has no indirect branches
+/// and contains at least one return or halt instruction.
 fn is_safe_for_cfg(instrs: &[&DecodedInstr]) -> bool {
     let has_indirect = instrs.iter().any(|i| {
         matches!(
@@ -275,6 +287,7 @@ fn is_safe_for_cfg(instrs: &[&DecodedInstr]) -> bool {
     })
 }
 
+/// Build a complete CFG for a single function from its decoded instructions.
 pub fn build_func_cfg(
     name: &str,
     fi: &FuncInfo,
@@ -303,6 +316,7 @@ pub fn build_func_cfg(
     }
 }
 
+/// Identify basic block start addresses from branch targets and terminators.
 fn find_block_starts(
     instrs: &[&DecodedInstr],
     func_start: u64,
@@ -330,10 +344,12 @@ fn find_block_starts(
     sorted
 }
 
+/// Any non-Normal flow type terminates a basic block.
 fn is_block_terminator(flow: FlowType) -> bool {
     !matches!(flow, FlowType::Normal)
 }
 
+/// Create BasicBlock structs from sorted start addresses.
 fn create_blocks(
     starts: &[u64],
     func_end: u64,
@@ -357,6 +373,7 @@ fn create_blocks(
         .collect()
 }
 
+/// Add successor edges to each block based on the terminating instruction.
 fn add_edges(
     blocks: &mut [BasicBlock],
     instrs: &[&DecodedInstr],
@@ -384,6 +401,7 @@ fn add_edges(
     }
 }
 
+/// Find the last instruction within a block's address range.
 fn find_last_instr<'a>(
     instrs: &[&'a DecodedInstr],
     start: u64,
@@ -396,6 +414,7 @@ fn find_last_instr<'a>(
         .copied()
 }
 
+/// Compute successor block IDs based on the last instruction's flow type.
 fn compute_edges(
     last: &DecodedInstr,
     bid: usize,
@@ -434,10 +453,12 @@ fn compute_edges(
     }
 }
 
+/// Return the fallthrough successor (next block) if it exists.
 fn fallthrough_edge(bid: usize, n: usize) -> Vec<usize> {
     if bid + 1 < n { vec![bid + 1] } else { Vec::new() }
 }
 
+/// Map branch target addresses to block IDs.
 fn resolve_targets(
     last: &DecodedInstr,
     addr_to_block: &HashMap<u64, usize>,
@@ -448,6 +469,7 @@ fn resolve_targets(
         .collect()
 }
 
+/// Populate predecessor lists from successor edges.
 fn fill_predecessors(blocks: &mut [BasicBlock]) {
     let n = blocks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -463,6 +485,7 @@ fn fill_predecessors(blocks: &mut [BasicBlock]) {
     }
 }
 
+/// Collect blocks not reachable from the entry via BFS.
 fn find_unreachable_blocks(cfg: &FuncCfg) -> Vec<DeadBlock> {
     if cfg.blocks.is_empty() {
         return Vec::new();
@@ -480,6 +503,7 @@ fn find_unreachable_blocks(cfg: &FuncCfg) -> Vec<DeadBlock> {
         .collect()
 }
 
+/// BFS from entry block, returning all reachable block IDs.
 fn bfs_reachable(cfg: &FuncCfg) -> HashSet<usize> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -499,6 +523,7 @@ fn bfs_reachable(cfg: &FuncCfg) -> HashSet<usize> {
     visited
 }
 
+/// Find the block whose start address matches the function entry.
 fn find_entry_block(
     blocks: &[BasicBlock],
     addr: u64,

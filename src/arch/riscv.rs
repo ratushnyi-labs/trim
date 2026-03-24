@@ -1,3 +1,11 @@
+//! RISC-V instruction decoder for dead code analysis.
+//!
+//! Decodes RV32/RV64 base instructions (32-bit little-endian) and
+//! compressed (C extension) 16-bit instructions. Extracts JAL/JALR
+//! call targets, branch targets (BEQ/BNE/BLT/BGE/BLTU/BGEU),
+//! AUIPC PC-relative references, and ECALL/EBREAK halt detection.
+//! Follows the RISC-V standard calling convention.
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode RISC-V instructions (RV32/RV64 + C extension).
@@ -45,6 +53,7 @@ pub fn decode_text_riscv(
     instrs
 }
 
+/// Decode a single 32-bit RISC-V instruction word.
 fn decode_rv_word(addr: u64, w: u32) -> DecodedInstr {
     let opcode = w & 0x7F;
     let (targets, pc_rel, flow) = match opcode {
@@ -125,6 +134,7 @@ fn decode_system(
     (Vec::new(), None, flow)
 }
 
+/// Decode a 16-bit compressed RISC-V instruction.
 fn decode_compressed(addr: u64, hw: u16) -> DecodedInstr {
     let op = hw & 0x03;
     let funct3 = (hw >> 13) & 0x07;

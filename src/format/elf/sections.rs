@@ -1,7 +1,12 @@
+//! ELF section header parsing.
+//!
+//! Converts goblin ELF section headers into the crate's unified `Section`
+//! type and provides helpers for locating the .text section bounds.
+
 use crate::types::Section;
 use goblin::elf::Elf;
 
-/// Extract sections from a parsed ELF.
+/// Extract all non-empty sections from a parsed ELF into `Section` structs.
 pub fn get_sections(elf: &Elf) -> Vec<Section> {
     elf.section_headers
         .iter()

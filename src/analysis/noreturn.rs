@@ -1,3 +1,10 @@
+//! Noreturn function detection for dead-code-after-call analysis.
+//!
+//! Maintains a static set of function names known to never return
+//! to their caller (e.g., `exit`, `abort`, `longjmp`). When a call
+//! to one of these is detected, all subsequent code until the next
+//! branch target is marked as dead.
+
 use std::collections::HashSet;
 use std::sync::LazyLock;
 

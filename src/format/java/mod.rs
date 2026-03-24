@@ -1,3 +1,27 @@
+//! Java `.class` file public API: analysis, reassembly, and dead block
+//! detection.
+//!
+//! Parses a `.class` file via `classfile::parse_classfile`, builds a call
+//! graph by scanning bytecode for `invoke*` instructions, and performs BFS
+//! from root methods (`main`, `<init>`, `<clinit>`, and all public /
+//! protected methods) to determine liveness.
+//!
+//! Dead code is handled at two levels:
+//! 1. **Dead methods** -- entire methods unreachable from any root are
+//!    omitted when the class file is reassembled (the methods_count is
+//!    decremented and their raw bytes are dropped).
+//! 2. **Dead branches** -- unreachable bytecode regions within live
+//!    methods (after `return`, `athrow`, `goto`) are detected by
+//!    `bytecode::find_dead_branches` and can be physically compacted
+//!    (bails out if exception handlers, tableswitch/lookupswitch, or
+//!    StackMapTable attributes are present).
+//!
+//! Key functions:
+//! - `analyze_java` -- returns function map and dead method map.
+//! - `reassemble_java` -- rebuilds the class file without dead methods,
+//!   compacting dead branches in live methods.
+//! - `find_java_dead_blocks` -- returns `Vec<DeadBlock>` for live methods.
+
 pub mod bytecode;
 pub mod classfile;
 
@@ -155,6 +179,8 @@ pub fn find_java_dead_blocks(
     bytecode::find_dead_branches(data, &cf, &live_set)
 }
 
+/// Build a `FuncMap` from the parsed class file, resolving method names
+/// from the constant pool and marking public/protected methods as global.
 fn build_func_map(cf: &ClassFile) -> FuncMap {
     let pool = &cf.constant_pool;
     let mut funcs = FuncMap::new();
@@ -179,6 +205,7 @@ fn build_func_map(cf: &ClassFile) -> FuncMap {
     funcs
 }
 
+/// Collect methods not reached by BFS as dead (name -> (offset, size)).
 fn find_dead_methods(
     data: &[u8],
     cf: &ClassFile,
@@ -204,6 +231,8 @@ fn find_dead_methods(
     dead
 }
 
+/// BFS reachability from root methods over the bytecode call graph.
+/// Roots are `main`, `<init>`, `<clinit>`, and public/protected methods.
 fn bfs_live(data: &[u8], cf: &ClassFile) -> HashSet<usize> {
     let pool = &cf.constant_pool;
     // Roots: main, <init>, <clinit>, all public/protected methods
@@ -252,6 +281,7 @@ fn bfs_live(data: &[u8], cf: &ClassFile) -> HashSet<usize> {
     visited
 }
 
+/// Return empty analysis results.
 fn empty() -> (
     FuncMap,
     HashMap<String, (u64, u64)>,

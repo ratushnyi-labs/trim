@@ -1,6 +1,22 @@
+//! .NET MethodDef RVA and CLI header patching after physical compaction.
+//!
+//! After dead method bodies are removed and the `.text` section is
+//! compacted, all RVA-based references must be shifted downward to
+//! account for the removed bytes. This module handles:
+//!
+//! - **MethodDef RVA patching** -- iterates every row in the MethodDef
+//!   metadata table and subtracts the cumulative shift for each RVA that
+//!   falls within the compacted range.
+//! - **CLI header RVA patching** -- adjusts the seven RVA fields in the
+//!   CLI header (metadata, resources, strong-name, code-manager, vtable,
+//!   export-address, native-header).
+//! - **Dead method zeroing** -- replaces method IL bodies with a single
+//!   `ret` opcode (0x2A) followed by zero-fill before physical compaction.
+
 use crate::format::dotnet::metadata::read_u32;
 use crate::patch::relocs::total_shift;
 
+/// Write a little-endian `u32` into `data` at `off`. No-op if OOB.
 fn write_u32(data: &mut [u8], off: usize, val: u32) {
     if off + 4 <= data.len() {
         data[off..off + 4]
@@ -93,7 +109,8 @@ pub fn zero_dead_methods(
     (count, saved)
 }
 
-/// Zero a single method body, return bytes freed.
+/// Zero a single IL method body: write `ret` (0x2A) at the first code
+/// byte and fill the remainder with zeros. Returns bytes freed.
 fn zero_method_body(
     data: &mut Vec<u8>,
     offset: usize,
@@ -121,6 +138,7 @@ fn zero_method_body(
     (code_size - 1) as u64
 }
 
+/// Parse a fat method header to extract `(code_offset, code_size)`.
 fn parse_fat_size(
     data: &[u8],
     offset: usize,

@@ -1,3 +1,11 @@
+//! BFS reachability analysis over the function reference graph.
+//!
+//! Starting from root functions (entry points, globals, runtime-keep),
+//! performs breadth-first traversal of the call/reference graph to
+//! compute the live function set. Functions not in the live set are
+//! considered dead. Includes alias-aware fixpoint expansion to handle
+//! multiple symbols at the same address.
+
 use crate::types::{FuncMap, RefGraph};
 use std::collections::{HashMap, HashSet, VecDeque};
 

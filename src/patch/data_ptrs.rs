@@ -1,3 +1,9 @@
+//! Data pointer patching in non-code sections.
+//!
+//! Scans GOT, init/fini arrays, and read-only/data sections for absolute
+//! pointers into .text, then adjusts them according to the compaction
+//! shift map so they still point to the correct (shifted) addresses.
+
 use crate::patch::relocs::{shift_at, total_shift};
 use crate::types::{Endian, Section};
 
@@ -43,6 +49,7 @@ pub fn patch_data_ptrs(
     }
 }
 
+/// Scan a single data section and patch pointer-sized values that shifted.
 fn patch_one_data_sec(
     data: &mut [u8],
     sec: &Section,

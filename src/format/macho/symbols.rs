@@ -1,3 +1,9 @@
+//! Mach-O symbol table parsing.
+//!
+//! Extracts function entries from the Mach-O nlist symbol table,
+//! filtering for defined section symbols (N_SECT) and stripping
+//! the leading underscore convention used by the Mach-O C ABI.
+
 use crate::types::{FuncInfo, FuncMap};
 
 const N_EXT: u8 = 0x01;
@@ -17,6 +23,7 @@ pub fn get_functions(
     funcs
 }
 
+/// Add a single nlist entry to `funcs` if it is a defined section symbol.
 fn add_if_func(
     funcs: &mut FuncMap,
     name: &str,

@@ -1,3 +1,10 @@
+//! RISC-V branch and PC-relative offset patching after dead code compaction.
+//!
+//! Rewrites JAL (J-type 20-bit), BEQ/BNE/BLT/BGE/BLTU/BGEU (B-type 12-bit),
+//! C.J/C.JAL (11-bit compressed), C.BEQZ/C.BNEZ (8-bit compressed), and
+//! AUIPC+paired instruction (JALR/ADDI/LD/SD) PC-relative address pairs.
+//! Both 32-bit base and 16-bit compressed instruction formats are handled.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -143,6 +150,7 @@ fn c_branch_imm(hw: u16) -> i32 {
     sign_extend(raw as i32, 9)
 }
 
+/// Dispatch to 32-bit or 16-bit patcher based on instruction length.
 fn patch_one(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -163,6 +171,7 @@ fn patch_one(
     }
 }
 
+/// Patch a 32-bit RISC-V JAL or B-type branch offset.
 fn patch_one_32(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -230,6 +239,7 @@ fn patch_one_32(
     }
 }
 
+/// Patch a 16-bit compressed C.J/C.JAL or C.BEQZ/C.BNEZ offset.
 fn patch_one_16(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -407,6 +417,7 @@ fn find_auipc_pair(
     None
 }
 
+/// Recompute and write both AUIPC and its paired instruction's immediates.
 fn do_patch_auipc_pair(
     data: &mut [u8],
     auipc: &DecodedInstr,

@@ -1,3 +1,12 @@
+//! Architecture-specific instruction decoders and patch modules.
+//!
+//! Each architecture has a decoder module (e.g., `x86`, `aarch64`) that
+//! extracts call/branch targets and flow types from raw instruction bytes,
+//! and a patch module (e.g., `x86_patch`, `aarch64_patch`) that rewrites
+//! branch displacements after dead code compaction shifts addresses.
+//! Supported architectures: x86-64/32, AArch64, ARM32, RISC-V 64/32,
+//! MIPS 64/32, s390x, and LoongArch64.
+
 pub mod aarch64;
 pub mod aarch64_patch;
 pub mod arm32;
@@ -96,7 +105,7 @@ pub fn instr_align(arch: Arch) -> u64 {
     }
 }
 
-/// Detect MIPS endianness from ELF EI_DATA byte.
+/// Detect MIPS endianness from ELF EI_DATA byte. Returns true for big-endian.
 fn detect_mips_endian(data: &[u8]) -> bool {
     if data.len() > 5
         && data[0] == 0x7F

@@ -1,0 +1,83 @@
+name: Bug Report
+description: Report incorrect behavior, crashes, or broken output
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill in the details below so we can reproduce and fix it.
+
+  - type: input
+    id: version
+    attributes:
+      label: trim version
+      description: Output of `trim --version`
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS x86_64
+        - macOS Apple Silicon (arm64)
+        - Windows x64
+        - Windows x86
+        - Windows arm64
+        - Docker
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Binary format
+      options:
+        - ELF
+        - PE/COFF
+        - Mach-O
+        - .NET
+        - WebAssembly
+        - Java .class
+        - Unknown / multiple
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or command to trigger the bug.
+      placeholder: |
+        1. `trim --dry-run myapp`
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / error message
+      description: Paste the full terminal output.
+      render: text
+
+  - type: textarea
+    id: binary
+    attributes:
+      label: Sample binary
+      description: |
+        If possible, attach or link a minimal binary that reproduces the issue.
+        You can also provide the build command used to create it.

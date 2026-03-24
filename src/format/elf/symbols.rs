@@ -1,10 +1,15 @@
+//! ELF symbol table parsing.
+//!
+//! Extracts function entries from static (.symtab) and dynamic (.dynsym)
+//! symbol tables, and maps PLT stub addresses to imported symbol names.
+
 use crate::types::{FuncInfo, FuncMap, Section};
 use goblin::elf::section_header::SHN_UNDEF;
 use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC};
 use goblin::elf::Elf;
 use std::collections::HashMap;
 
-/// Extract defined text functions from the static symbol table.
+/// Extract defined text functions from the static symbol table (.symtab).
 pub fn get_functions_symtab(elf: &Elf) -> FuncMap {
     let mut funcs = FuncMap::new();
     for sym in &elf.syms {
@@ -44,7 +49,7 @@ pub fn get_functions_symtab(elf: &Elf) -> FuncMap {
     funcs
 }
 
-/// Extract defined functions from the dynamic symbol table.
+/// Extract defined functions from the dynamic symbol table (.dynsym).
 pub fn get_dynamic_symbols(elf: &Elf) -> FuncMap {
     let mut funcs = FuncMap::new();
     for sym in &elf.dynsyms {
@@ -111,6 +116,7 @@ pub fn get_plt_names(
     map
 }
 
+/// Find the PLT section, preferring .plt.sec over .plt.
 fn find_plt_section<'a>(
     sections: &'a [Section],
 ) -> Option<&'a Section> {
@@ -122,6 +128,7 @@ fn find_plt_section<'a>(
         })
 }
 
+/// Return the per-entry size of the given PLT section.
 fn plt_entry_size(sec: &Section) -> u64 {
     match sec.name.as_str() {
         ".plt" => 16,

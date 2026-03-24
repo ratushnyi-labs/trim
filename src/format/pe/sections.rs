@@ -1,7 +1,12 @@
+//! PE section header parsing.
+//!
+//! Converts PE section headers into the crate's unified `Section` type
+//! and provides helpers for locating the .text section bounds.
+
 use crate::types::Section;
 use goblin::pe::PE;
 
-/// Extract sections from a parsed PE.
+/// Extract all non-empty sections from a parsed PE into `Section` structs.
 pub fn get_sections(pe: &PE) -> Vec<Section> {
     pe.sections
         .iter()
@@ -21,6 +26,7 @@ pub fn get_sections(pe: &PE) -> Vec<Section> {
         .collect()
 }
 
+/// Extract the null-terminated section name from the 8-byte name field.
 fn section_name(
     sec: &goblin::pe::section_table::SectionTable,
 ) -> String {

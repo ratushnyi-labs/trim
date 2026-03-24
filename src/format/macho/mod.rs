@@ -1,3 +1,10 @@
+//! Mach-O binary analysis and dead code compaction.
+//!
+//! Parses Mach-O headers, load commands, and symbol tables to build a
+//! function map. After dead code analysis, physically compacts the __text
+//! section and patches all affected metadata (load commands, symbol
+//! table, entry point).
+
 pub mod patch;
 pub mod sections;
 pub mod symbols;
@@ -19,7 +26,7 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
-/// Analyze a Mach-O binary.
+/// Analyze a Mach-O binary: returns (funcs, dead, sections).
 pub fn analyze_macho(
     data: &[u8],
 ) -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
@@ -52,6 +59,7 @@ pub fn analyze_macho(
     (funcs, dead, secs)
 }
 
+/// Build the function map from symbols; fall back to inference if stripped.
 fn build_func_map(
     macho: &goblin::mach::MachO,
     data: &[u8],
@@ -74,6 +82,7 @@ fn build_func_map(
     )
 }
 
+/// Run reachability analysis: build call graph, determine roots, find dead.
 fn run_analysis(
     funcs: &FuncMap,
     instrs: &[DecodedInstr],
@@ -104,6 +113,7 @@ fn run_analysis(
     find_dead(funcs, &live)
 }
 
+/// Detect CPU architecture from the Mach-O cputype field.
 fn detect_arch_macho(macho: &goblin::mach::MachO) -> Arch {
     let ct = macho.header.cputype;
     match ct {
@@ -115,6 +125,7 @@ fn detect_arch_macho(macho: &goblin::mach::MachO) -> Arch {
     }
 }
 
+/// Return empty results tuple for early-exit paths.
 fn empty_result()
 -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
     (FuncMap::new(), HashMap::new(), Vec::new())
@@ -165,6 +176,7 @@ pub fn reassemble_macho(
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
+/// Decode instructions from Mach-O .text and .plt (stubs) sections.
 fn decode_macho_text(
     data: &[u8],
     sections: &[Section],
@@ -184,6 +196,8 @@ fn decode_macho_text(
     instrs
 }
 
+/// Apply arch-specific branch patches, data pointer patches, and Mach-O
+/// metadata updates (entry point, load commands, symbol table).
 fn apply_macho_patches(
     data: &mut Vec<u8>,
     instrs: &[DecodedInstr],
@@ -229,6 +243,7 @@ fn apply_macho_patches(
     patch::patch_symtab(data, intervals, ts, te);
 }
 
+/// Detect CPU architecture directly from raw Mach-O bytes (no parsed MachO).
 fn detect_arch_macho_raw(data: &[u8]) -> Arch {
     if data.len() < 8 {
         return Arch::X86_64;

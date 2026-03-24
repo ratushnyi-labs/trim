@@ -1,3 +1,11 @@
+//! MIPS instruction decoder for dead code analysis.
+//!
+//! Decodes fixed-width 32-bit MIPS instructions (big- or little-endian,
+//! detected from ELF header). Extracts J/JAL absolute targets, BEQ/BNE/
+//! BLEZ/BGTZ/BLTZ/BGEZ relative branches, JR/JALR indirect control flow,
+//! and SYSCALL/BREAK halt detection. Supports MIPS32 and MIPS64.
+//! Follows the MIPS O32/N32/N64 calling conventions.
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode MIPS instructions (fixed 32-bit).
@@ -41,6 +49,7 @@ pub fn decode_text_mips(
     instrs
 }
 
+/// Decode a single MIPS instruction word by opcode dispatch.
 fn decode_mips_word(
     addr: u64,
     w: u32,

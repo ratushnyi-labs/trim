@@ -1,3 +1,9 @@
+//! MIPS branch offset patching after dead code compaction.
+//!
+//! Rewrites J/JAL 26-bit region-relative targets and BEQ/BNE/BLEZ/
+//! BGTZ/BLTZ/BGEZ 16-bit PC-relative offsets to account for address
+//! shifts. Handles both big-endian and little-endian MIPS binaries.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -27,6 +33,7 @@ pub fn patch_branches(
     }
 }
 
+/// Read a 32-bit word respecting endianness.
 fn read_word(raw: &[u8], big_endian: bool) -> u32 {
     let b: [u8; 4] =
         raw[..4].try_into().unwrap_or([0; 4]);
@@ -37,6 +44,7 @@ fn read_word(raw: &[u8], big_endian: bool) -> u32 {
     }
 }
 
+/// Write a 32-bit word respecting endianness.
 fn write_word(
     data: &mut [u8],
     off: usize,
@@ -51,6 +59,7 @@ fn write_word(
     data[off..off + 4].copy_from_slice(&b);
 }
 
+/// Patch a single MIPS instruction's branch target for address shifts.
 fn patch_one(
     data: &mut [u8],
     instr: &DecodedInstr,

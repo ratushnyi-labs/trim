@@ -1,3 +1,9 @@
+//! x86-64/32 instruction decoder for dead code analysis.
+//!
+//! Uses the `iced-x86` library to decode variable-length x86 instructions,
+//! extracting call/branch targets, PC-relative references, and flow types.
+//! Follows the System V AMD64 and cdecl calling conventions.
+
 use crate::types::{DecodedInstr, FlowType};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
@@ -20,6 +26,7 @@ pub fn decode_text_x86(
     instrs
 }
 
+/// Decode a single x86 instruction into a DecodedInstr.
 fn decode_one(
     slice: &[u8],
     base: u64,
@@ -61,6 +68,7 @@ fn decode_one(
     }
 }
 
+/// Extract the near branch target address if the first operand is NearBranch64.
 fn near_branch_target(
     instr: &iced_x86::Instruction,
 ) -> Option<u64> {
@@ -72,6 +80,7 @@ fn near_branch_target(
     None
 }
 
+/// Extract the RIP-relative memory operand address if present.
 fn extract_pc_rel(
     instr: &iced_x86::Instruction,
 ) -> Option<u64> {
@@ -81,6 +90,7 @@ fn extract_pc_rel(
     None
 }
 
+/// Map iced-x86 FlowControl to our FlowType enum.
 fn classify_flow(instr: &iced_x86::Instruction) -> FlowType {
     match instr.flow_control() {
         FlowControl::Next => FlowType::Normal,
@@ -115,6 +125,7 @@ fn classify_flow(instr: &iced_x86::Instruction) -> FlowType {
     }
 }
 
+/// Check if an instruction is HLT or UD2 (halt/trap).
 fn is_halt_instr(instr: &iced_x86::Instruction) -> bool {
     let code = instr.code();
     matches!(

@@ -1,3 +1,20 @@
+//! .NET metadata root and stream parsing.
+//!
+//! Reads the PE/COFF headers to locate the CLI header
+//! (DataDirectory entry 14), then parses the CLI header to find the
+//! metadata root (`BSJB` signature). From the metadata root it enumerates
+//! stream headers (`#~` or `#-` for tables, `#Strings`, `#Blob`) and
+//! records their file offsets and sizes.
+//!
+//! Key types:
+//! - `CliHeader` -- parsed CLI header (metadata RVA, entry-point token,
+//!   flags).
+//! - `MetadataRoot` -- absolute file offsets for the `#~`, `#Strings`,
+//!   and `#Blob` streams.
+//!
+//! The parser returns `None` on any malformed or truncated input rather
+//! than panicking.
+
 use std::collections::HashMap;
 
 /// CLI header parsed from PE DataDirectory[14].
@@ -60,6 +77,8 @@ pub fn parse_metadata_root(
     parse_streams(data, offset, streams_start + 2, num_streams)
 }
 
+/// Walk the stream headers after the metadata root, building a map of
+/// stream name to `(absolute_offset, size)` and returning a `MetadataRoot`.
 fn parse_streams(
     data: &[u8],
     base: usize,
@@ -111,6 +130,8 @@ pub fn cli_header_offset(data: &[u8]) -> Option<usize> {
     rva_to_offset(data, 0, coff_off, rva)
 }
 
+/// Extract COFF header offset, optional header offset, and optional header
+/// size from a PE binary. Validates the MZ and PE signatures.
 fn parse_pe_offsets(
     data: &[u8],
 ) -> Option<(usize, usize, usize)> {
@@ -137,6 +158,8 @@ fn parse_pe_offsets(
     Some((coff_off, opt_off, opt_size))
 }
 
+/// Read the COM descriptor (CLI header) RVA from PE DataDirectory entry 14.
+/// Handles both PE32 (magic 0x10B) and PE32+ (magic 0x20B) layouts.
 fn read_com_descriptor_rva(
     data: &[u8],
     opt_off: usize,
@@ -157,6 +180,7 @@ fn read_com_descriptor_rva(
     if rva == 0 || size == 0 { None } else { Some(rva) }
 }
 
+/// Convert an RVA to a raw file offset by iterating PE section headers.
 fn rva_to_offset(
     data: &[u8],
     _pe_off: usize,
@@ -185,6 +209,7 @@ fn rva_to_offset(
     None
 }
 
+/// Read a little-endian `u32` from `data` at `off`. Returns 0 on OOB.
 pub fn read_u32(data: &[u8], off: usize) -> u32 {
     if off + 4 > data.len() { return 0; }
     u32::from_le_bytes(
@@ -192,6 +217,7 @@ pub fn read_u32(data: &[u8], off: usize) -> u32 {
     )
 }
 
+/// Read a little-endian `u16` from `data` at `off`. Returns 0 on OOB.
 pub fn read_u16(data: &[u8], off: usize) -> u16 {
     if off + 2 > data.len() { return 0; }
     u16::from_le_bytes(
@@ -199,6 +225,7 @@ pub fn read_u16(data: &[u8], off: usize) -> u16 {
     )
 }
 
+/// Read a null-terminated ASCII string from `data` at `off`.
 fn read_cstr(data: &[u8], off: usize) -> Option<String> {
     if off >= data.len() { return None; }
     let end = data[off..].iter().position(|&b| b == 0)?;
@@ -206,6 +233,7 @@ fn read_cstr(data: &[u8], off: usize) -> Option<String> {
     String::from_utf8(data[off..off + end].to_vec()).ok()
 }
 
+/// Round `n` up to the next multiple of 4 (metadata alignment).
 fn round_up_4(n: usize) -> usize {
     (n + 3) & !3
 }

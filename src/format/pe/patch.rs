@@ -1,8 +1,15 @@
+//! PE/COFF metadata patching after dead code compaction.
+//!
+//! Updates all PE structures affected by .text compaction: entry point,
+//! section headers, COFF symbol table, export address table, base
+//! relocations (.reloc), and exception handler table (.pdata).
+
 use crate::patch::relocs::{page_shrink, total_shift};
 use crate::types::Section;
 
 // ---- PE header helpers -------------------------------------------
 
+/// Return the file offset of the PE signature from the DOS header.
 fn pe_offset(data: &[u8]) -> usize {
     if data.len() < 0x40 {
         return 0;
@@ -12,6 +19,7 @@ fn pe_offset(data: &[u8]) -> usize {
     ) as usize
 }
 
+/// Return true if the PE is PE32+ (64-bit, magic 0x020B).
 fn is_pe64(data: &[u8]) -> bool {
     let off = pe_offset(data);
     if off + 26 > data.len() {
@@ -23,6 +31,7 @@ fn is_pe64(data: &[u8]) -> bool {
     magic == 0x020B // PE32+
 }
 
+/// Read a little-endian u16 at `off`.
 fn read_u16(data: &[u8], off: usize) -> u16 {
     if off + 2 > data.len() {
         return 0;
@@ -32,6 +41,7 @@ fn read_u16(data: &[u8], off: usize) -> u16 {
     )
 }
 
+/// Read a little-endian u32 at `off`.
 fn read_u32(data: &[u8], off: usize) -> u32 {
     if off + 4 > data.len() {
         return 0;
@@ -41,12 +51,14 @@ fn read_u32(data: &[u8], off: usize) -> u32 {
     )
 }
 
+/// Write a little-endian u32 at `off`.
 fn write_u32(data: &mut [u8], off: usize, val: u32) {
     if off + 4 <= data.len() {
         data[off..off + 4].copy_from_slice(&val.to_le_bytes());
     }
 }
 
+/// Read a little-endian u64 at `off`.
 fn read_u64(data: &[u8], off: usize) -> u64 {
     if off + 8 > data.len() {
         return 0;
@@ -56,6 +68,7 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
     )
 }
 
+/// Write a little-endian u64 at `off`.
 fn write_u64(data: &mut [u8], off: usize, val: u64) {
     if off + 8 <= data.len() {
         data[off..off + 8].copy_from_slice(&val.to_le_bytes());
@@ -141,6 +154,8 @@ pub fn patch_section_headers(
     }
 }
 
+/// Patch a single PE section header: shrink .text sizes, shift
+/// VirtualAddress if in .text range, and shift raw offsets after .text.
 fn patch_one_sec_hdr(
     data: &mut [u8],
     base: usize,
@@ -317,6 +332,7 @@ pub fn patch_base_relocs(
     }
 }
 
+/// Patch a single base relocation target (HIGHLOW or DIR64).
 fn patch_reloc_target(
     data: &mut [u8],
     sections: &[Section],
@@ -402,6 +418,7 @@ pub fn patch_pdata(
 
 // ---- Helper: RVA to file offset ---------------------------------
 
+/// Convert an RVA to a file offset using section mappings.
 fn rva_to_offset(rva: u64, sections: &[Section]) -> Option<u64> {
     for sec in sections {
         if rva >= sec.vaddr && rva < sec.vaddr + sec.size {

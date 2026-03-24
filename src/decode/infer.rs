@@ -1,3 +1,15 @@
+//! Function boundary inference for stripped binaries.
+//!
+//! When symbol tables are unavailable (stripped binaries), infers function
+//! start addresses from three sources:
+//! 1. Call targets — addresses targeted by call instructions
+//! 2. PC-relative references — addresses loaded via LEA/ADRP patterns
+//! 3. Data section pointers — addresses found in .got, .init_array, etc.
+//!
+//! Each inferred function extends from its start address to the next
+//! function's start (or the end of .text). Known dynamic symbols and
+//! the entry point anchor the initial set.
+
 use crate::types::{
     DecodedInstr, Endian, FuncInfo, FuncMap, Section,
 };
@@ -45,6 +57,7 @@ pub fn infer_functions(
     build_func_map(&starts, text_end)
 }
 
+/// Insert call/ref targets into the function start map if within .text bounds.
 fn insert_targets(
     starts: &mut BTreeMap<u64, (String, bool)>,
     targets: &[u64],
@@ -60,6 +73,7 @@ fn insert_targets(
     }
 }
 
+/// Extract all target addresses from call instructions.
 fn collect_call_targets(
     instrs: &[DecodedInstr],
 ) -> Vec<u64> {
@@ -70,6 +84,7 @@ fn collect_call_targets(
         .collect()
 }
 
+/// Extract all PC-relative reference targets (LEA/ADRP patterns).
 fn collect_ref_targets(
     instrs: &[DecodedInstr],
 ) -> Vec<u64> {
@@ -79,6 +94,7 @@ fn collect_ref_targets(
         .collect()
 }
 
+/// Scan data sections (.got, .init_array, etc.) for pointers into .text.
 fn scan_data_code_refs(
     data: &[u8],
     sections: &[Section],
@@ -119,6 +135,8 @@ fn scan_data_code_refs(
     refs
 }
 
+/// Build the final FuncMap from sorted start addresses.
+/// Each function's size extends to the next function or to text_end.
 fn build_func_map(
     starts: &BTreeMap<u64, (String, bool)>,
     text_end: u64,

@@ -1,3 +1,9 @@
+//! Dominator tree and dominance frontier computation.
+//!
+//! Implements the Cooper-Harvey-Kennedy iterative dominator algorithm
+//! to compute immediate dominators and dominance frontiers for a CFG.
+//! Used by SSA construction to determine phi-node placement.
+
 use std::collections::HashSet;
 
 /// Dominance info for a CFG.
@@ -22,6 +28,7 @@ pub fn compute_dom_tree(
     DomTree { idom, frontiers }
 }
 
+/// Build predecessor lists from successor edges.
 fn build_predecessors(
     succs: &[Vec<usize>],
     n: usize,
@@ -69,6 +76,7 @@ fn compute_rpo(
     post_order
 }
 
+/// Assign reverse post-order numbers to each block.
 fn build_rpo_numbers(
     order: &[usize],
     n: usize,
@@ -111,6 +119,7 @@ fn compute_idoms(
     idom
 }
 
+/// Find the new immediate dominator for block `b` from its predecessors.
 fn find_new_idom(
     b: usize,
     preds: &[Vec<usize>],

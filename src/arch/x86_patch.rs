@@ -1,3 +1,10 @@
+//! x86-64/32 branch and reference patching after dead code compaction.
+//!
+//! Rewrites relative CALL (E8), JMP (E9/EB), and Jcc (0F 8x / 7x)
+//! displacements, RIP-relative memory operand displacements, and
+//! switch jump table entries to account for address shifts caused
+//! by dead code removal.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -55,6 +62,7 @@ pub fn patch_call_jmp(
     }
 }
 
+/// Patch one relative call/jmp displacement for address shifts.
 fn patch_one_rel(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -103,6 +111,7 @@ pub fn patch_pc_rel(
     }
 }
 
+/// Patch one RIP-relative displacement for address shifts.
 fn patch_one_pc_rel(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -136,6 +145,7 @@ fn patch_one_pc_rel(
     }
 }
 
+/// Find the byte offset of a 32-bit displacement value within raw bytes.
 fn find_disp_pos(raw: &[u8], disp_val: i32) -> Option<usize> {
     let packed = disp_val.to_le_bytes();
     raw.windows(4).position(|w| w == packed)
@@ -158,6 +168,7 @@ pub fn find_jump_tables(
     tables
 }
 
+/// Detect a single jump table from a MOVSXD+ADD+JMP pattern.
 fn detect_one_table(
     instrs: &[DecodedInstr],
     i: usize,
@@ -206,6 +217,7 @@ pub fn patch_jump_tables(
     }
 }
 
+/// Patch all entries in a single jump table for address shifts.
 fn patch_one_table(
     data: &mut [u8],
     base: u64,
@@ -235,6 +247,7 @@ fn patch_one_table(
     }
 }
 
+/// Check if an instruction is a REX.W MOVSXD (jump table index load).
 fn is_movslq_scale4(instr: &DecodedInstr) -> bool {
     if instr.raw.len() >= 3 {
         let has_rex_w = instr.raw[0] == 0x48;
@@ -244,6 +257,7 @@ fn is_movslq_scale4(instr: &DecodedInstr) -> bool {
     false
 }
 
+/// Extract the immediate from a CMP instruction (for jump table size).
 fn extract_cmp_imm(instr: &DecodedInstr) -> Option<usize> {
     let raw = &instr.raw;
     if raw.is_empty() {

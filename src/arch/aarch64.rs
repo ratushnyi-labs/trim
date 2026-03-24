@@ -1,3 +1,11 @@
+//! AArch64 instruction decoder for dead code analysis.
+//!
+//! Decodes A64 fixed-width 32-bit little-endian instructions to extract
+//! call/branch targets (B, BL, B.cond, CBZ, CBNZ, TBZ, TBNZ) and
+//! PC-relative references (ADRP, ADR, LDR literal). Used by the
+//! analysis engine to build call graphs and detect dead branches
+//! on 64-bit ARM binaries. Follows the AAPCS64 calling convention.
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode AArch64 instructions (fixed 32-bit, little-endian).
@@ -33,12 +41,14 @@ pub fn decode_text_aarch64(
     instrs
 }
 
+/// Intermediate decoded A64 instruction data.
 struct A64Decoded {
     targets: Vec<u64>,
     pc_rel: Option<u64>,
     flow: FlowType,
 }
 
+/// Decode a single A64 instruction word at the given address.
 fn decode_a64_word(addr: u64, w: u32) -> A64Decoded {
     let mut d = A64Decoded {
         targets: Vec::new(),
@@ -67,6 +77,7 @@ fn decode_a64_word(addr: u64, w: u32) -> A64Decoded {
     d
 }
 
+/// Decode RET, BR, BLR, BRK, and delegate to branch/pcrel decoders.
 fn decode_a64_other(addr: u64, w: u32, d: &mut A64Decoded) {
     // RET: 1101_0110_0101_1111_0000_00 Rn 00000
     if (w & 0xFFFF_FC1F) == 0xD65F_0000 {
@@ -91,6 +102,7 @@ fn decode_a64_other(addr: u64, w: u32, d: &mut A64Decoded) {
     decode_a64_branches(addr, w, d);
 }
 
+/// Decode conditional branches: B.cond, CBZ/CBNZ, TBZ/TBNZ.
 fn decode_a64_branches(addr: u64, w: u32, d: &mut A64Decoded) {
     // B.cond: 0101_0100 imm19[23:5] 0 cond[3:0]
     if (w & 0xFF00_0010) == 0x5400_0000 {
@@ -113,6 +125,7 @@ fn decode_a64_branches(addr: u64, w: u32, d: &mut A64Decoded) {
     decode_a64_pcrel(addr, w, d);
 }
 
+/// Decode PC-relative instructions: ADRP, ADR, LDR literal.
 fn decode_a64_pcrel(addr: u64, w: u32, d: &mut A64Decoded) {
     // ADRP
     if (w & 0x9F00_0000) == 0x9000_0000 {
@@ -130,24 +143,28 @@ fn decode_a64_pcrel(addr: u64, w: u32, d: &mut A64Decoded) {
     }
 }
 
+/// Compute target from a 26-bit signed immediate (B/BL).
 fn branch26_target(addr: u64, w: u32) -> u64 {
     let imm26 = (w & 0x03FF_FFFF) as i32;
     let offset = sign_extend(imm26, 26) << 2;
     (addr as i64 + offset as i64) as u64
 }
 
+/// Compute target from a 19-bit signed immediate (B.cond, CBZ, CBNZ).
 fn branch19_target(addr: u64, w: u32) -> u64 {
     let imm19 = ((w >> 5) & 0x7FFFF) as i32;
     let offset = sign_extend(imm19, 19) << 2;
     (addr as i64 + offset as i64) as u64
 }
 
+/// Compute target from a 14-bit signed immediate (TBZ/TBNZ).
 fn branch14_target(addr: u64, w: u32) -> u64 {
     let imm14 = ((w >> 5) & 0x3FFF) as i32;
     let offset = sign_extend(imm14, 14) << 2;
     (addr as i64 + offset as i64) as u64
 }
 
+/// Compute ADRP target (page-aligned PC-relative).
 fn adrp_target(addr: u64, w: u32) -> u64 {
     let immhi = ((w >> 5) & 0x7FFFF) as i64;
     let immlo = ((w >> 29) & 0x3) as i64;
@@ -157,6 +174,7 @@ fn adrp_target(addr: u64, w: u32) -> u64 {
     (page + (offset << 12)) as u64
 }
 
+/// Compute ADR target (PC-relative byte offset).
 fn adr_target(addr: u64, w: u32) -> u64 {
     let immhi = ((w >> 5) & 0x7FFFF) as i64;
     let immlo = ((w >> 29) & 0x3) as i64;
@@ -165,6 +183,7 @@ fn adr_target(addr: u64, w: u32) -> u64 {
     (addr as i64 + offset) as u64
 }
 
+/// Sign-extend an integer from the given bit width to 32 bits.
 fn sign_extend(val: i32, bits: u32) -> i32 {
     let shift = 32 - bits;
     (val << shift) >> shift

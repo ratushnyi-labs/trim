@@ -1,3 +1,9 @@
+//! Physical dead code compaction for the .text section.
+//!
+//! Removes dead intervals from .text by building a compacted copy of
+//! live bytes, then drains the freed page-aligned region from the file.
+//! Used by all binary formats after branch and metadata patching.
+
 use crate::patch::relocs::page_shrink;
 use crate::types::Section;
 
@@ -25,6 +31,7 @@ pub fn compact_text(
     saved as u64
 }
 
+/// Build a new byte vector containing only live (non-dead) text bytes.
 fn build_live_text(
     data: &[u8],
     intervals: &[(u64, u64)],
@@ -54,6 +61,7 @@ fn build_live_text(
     new_text
 }
 
+/// Write compacted text back into `data` and drain freed pages.
 fn apply_compact(
     data: &mut Vec<u8>,
     off: usize,

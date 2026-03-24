@@ -1,3 +1,10 @@
+//! Root function discovery for BFS reachability.
+//!
+//! Determines the initial set of root functions that seed the
+//! reachability analysis. Roots include runtime-keep symbols,
+//! global (exported) functions, data-referenced functions, and
+//! orphan references from outside known functions.
+
 use crate::constants::RUNTIME_KEEP;
 use crate::types::FuncMap;
 use std::collections::HashSet;

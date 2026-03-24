@@ -1,7 +1,28 @@
-/// Java bytecode analysis: call graph and dead branch detection.
+//! Java bytecode call-graph construction, dead branch scanning, and
+//! physical branch-offset patching for dead-block compaction.
+//!
+//! Provides three main capabilities:
+//! 1. **Call-graph extraction** -- scans bytecode for `invokevirtual`,
+//!    `invokespecial`, `invokestatic`, and `invokeinterface` instructions,
+//!    resolving Methodref/InterfaceMethodref constant-pool entries back to
+//!    local method indices.
+//! 2. **Dead branch detection** -- identifies unreachable bytecode after
+//!    `return` variants, `athrow`, `goto`, and `goto_w` up to the next
+//!    branch target.
+//! 3. **Physical compaction** -- patches 2-byte and 4-byte branch offsets,
+//!    excises dead byte ranges, and rebuilds the method_info with updated
+//!    Code attribute lengths. Bails out if exception handlers,
+//!    `tableswitch`/`lookupswitch`, or a `StackMapTable` attribute are
+//!    present.
+//!
+//! Key functions:
+//! - `scan_bytecode_calls` -- produces callee-index set for one method.
+//! - `find_dead_branches` -- returns `Vec<DeadBlock>` across live methods.
+//! - `compact_method_code` -- returns rewritten method_info bytes.
+
 use super::classfile::{cp_utf8, ClassFile, CpEntry};
 use crate::analysis::cfg::DeadBlock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Scan bytecode for invoke* instructions, returning
 /// indices of called internal methods.
@@ -117,6 +138,9 @@ pub fn find_dead_branches(
     blocks
 }
 
+/// Scan a single method's bytecode for dead regions. Collects branch
+/// targets first, then marks bytecode after terminators as dead until
+/// the next branch target or end of code.
 fn scan_dead_in_method(
     data: &[u8],
     cf: &ClassFile,
@@ -191,6 +215,8 @@ fn scan_dead_in_method(
     }
 }
 
+/// Collect all branch target offsets (code-relative) from conditional
+/// branches, goto, goto_w, jsr_w, tableswitch, and lookupswitch.
 fn collect_branch_targets(
     data: &[u8],
     code_offset: usize,
@@ -372,18 +398,21 @@ fn opcode_length(
     }
 }
 
+/// Read a big-endian `u16`.
 fn read_u16_be(data: &[u8], off: usize) -> u16 {
     u16::from_be_bytes(
         data[off..off + 2].try_into().unwrap_or([0; 2]),
     )
 }
 
+/// Read a big-endian `i16`.
 fn read_i16_be(data: &[u8], off: usize) -> i16 {
     i16::from_be_bytes(
         data[off..off + 2].try_into().unwrap_or([0; 2]),
     )
 }
 
+/// Read a big-endian `i32`.
 fn read_i32_be(data: &[u8], off: usize) -> i32 {
     i32::from_be_bytes(
         data[off..off + 4].try_into().unwrap_or([0; 4]),
@@ -446,6 +475,8 @@ pub fn compact_method_code(
     ))
 }
 
+/// Check if the bytecode contains a `tableswitch` or `lookupswitch`.
+/// Their variable-length padding makes offset patching unsafe.
 fn has_switch(
     data: &[u8],
     code_off: usize,
@@ -461,6 +492,8 @@ fn has_switch(
     false
 }
 
+/// Check if the Code attribute contains a StackMapTable sub-attribute.
+/// Compaction would invalidate stack-map frame offsets, so we bail out.
 fn has_stack_map(
     data: &[u8],
     code_off: usize,

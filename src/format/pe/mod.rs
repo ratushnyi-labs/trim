@@ -1,3 +1,10 @@
+//! PE/COFF binary analysis and dead code compaction.
+//!
+//! Parses PE headers, section tables, COFF symbol tables, and export
+//! directories to build a function map. After dead code analysis,
+//! physically compacts the .text section and patches all affected
+//! metadata (relocations, exports, section headers, entry point).
+
 pub mod patch;
 pub mod sections;
 pub mod symbols;
@@ -49,6 +56,7 @@ pub fn analyze_pe(
     (funcs, dead, secs)
 }
 
+/// Build the function map from COFF symbols; fall back to exports + inference.
 fn build_func_map(
     pe: &goblin::pe::PE,
     data: &[u8],
@@ -70,6 +78,7 @@ fn build_func_map(
     )
 }
 
+/// Run reachability analysis: build call graph, determine roots, find dead.
 fn run_analysis(
     funcs: &FuncMap,
     instrs: &[DecodedInstr],
@@ -97,6 +106,7 @@ fn run_analysis(
     find_dead(funcs, &live)
 }
 
+/// Detect CPU architecture from the COFF machine type field.
 fn detect_arch_pe(pe: &goblin::pe::PE) -> Arch {
     match pe.header.coff_header.machine {
         0x8664 => Arch::X86_64,
@@ -107,6 +117,7 @@ fn detect_arch_pe(pe: &goblin::pe::PE) -> Arch {
     }
 }
 
+/// Return empty results tuple for early-exit paths.
 fn empty_result()
 -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
     (FuncMap::new(), HashMap::new(), Vec::new())
@@ -157,6 +168,7 @@ pub fn reassemble_pe(
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
+/// Decode instructions from the PE .text section.
 fn decode_pe_sections(
     data: &[u8],
     sections: &[Section],
@@ -173,6 +185,9 @@ fn decode_pe_sections(
     instrs
 }
 
+/// Apply arch-specific branch patches, data pointer patches, and PE
+/// metadata updates (entry point, section headers, symbols, exports,
+/// base relocations, .pdata).
 fn apply_pe_patches(
     data: &mut Vec<u8>,
     instrs: &[DecodedInstr],
@@ -227,6 +242,7 @@ fn apply_pe_patches(
     );
 }
 
+/// Detect CPU architecture directly from raw PE bytes (no parsed PE).
 fn detect_arch_pe_raw(data: &[u8]) -> Arch {
     if data.len() < 0x40 {
         return Arch::X86_64;

@@ -1,3 +1,23 @@
+//! CIL (Common Intermediate Language) bytecode scanning, opcode tables,
+//! dead branch detection, and physical compaction for .NET methods.
+//!
+//! Provides three main capabilities:
+//! 1. **Call-graph construction** -- scans IL method bodies for `call`,
+//!    `callvirt`, `newobj`, `ldftn`, and `ldvirtftn` opcodes to extract
+//!    callee method tokens (MethodDef / MemberRef).
+//! 2. **Dead branch detection** -- identifies unreachable bytecode regions
+//!    after `ret`, `throw`, unconditional `br`, and `rethrow` up to the
+//!    next branch target.
+//! 3. **Physical compaction** -- removes dead byte ranges from method
+//!    bodies, patches short/long branch offsets and switch tables, then
+//!    updates the method header `code_size`. Bails out to NOP-fill if the
+//!    method has exception handlers (fat header MoreSects flag).
+//!
+//! Key functions:
+//! - `build_il_call_graph` -- produces caller-index to callee-token map.
+//! - `find_il_dead_blocks` -- returns `Vec<DeadBlock>` for live methods.
+//! - `compact_il_dead_blocks` -- in-place compaction with branch patching.
+
 use crate::analysis::cfg::DeadBlock;
 use crate::format::dotnet::metadata::read_u32;
 use std::collections::{HashMap, HashSet};
@@ -36,7 +56,8 @@ pub fn build_il_call_graph(
     graph
 }
 
-/// Parse a single IL method body, extract tokens.
+/// Parse a single IL method body (tiny or fat header) and extract
+/// all method-call tokens found in its bytecode.
 fn parse_method_body(
     data: &[u8],
     offset: usize,
@@ -62,6 +83,8 @@ fn parse_method_body(
     tokens
 }
 
+/// Parse a fat method header and return `(code_offset, code_size)`.
+/// Returns `(0, 0)` if the header is truncated.
 fn parse_fat_header(
     data: &[u8],
     offset: usize,
@@ -258,6 +281,7 @@ fn find_method_for_rva(
     None
 }
 
+/// Parse a method header (tiny or fat) and return `(code_offset, code_size)`.
 fn parse_method_header(
     data: &[u8],
     off: usize,
@@ -274,6 +298,7 @@ fn parse_method_header(
     }
 }
 
+/// Return the byte size of a method header (1 for tiny, variable for fat).
 fn method_header_size(
     data: &[u8],
     off: usize,
@@ -511,6 +536,9 @@ pub fn find_il_dead_blocks(
     blocks
 }
 
+/// Scan a single IL method body for dead code regions. Collects branch
+/// targets in a first pass, then identifies unreachable bytes after
+/// terminators (`ret`, `throw`, `br`, `rethrow`) in a second pass.
 fn scan_method_dead_blocks(
     data: &[u8],
     offset: usize,

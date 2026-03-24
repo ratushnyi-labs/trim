@@ -1,7 +1,12 @@
+//! Mach-O section parsing.
+//!
+//! Iterates Mach-O segments and sections, mapping the native
+//! (segment, section) naming convention to ELF-like flat names
+//! (e.g. `__TEXT,__text` becomes `.text`).
+
 use crate::types::Section;
 
-/// Extract sections from a parsed Mach-O.
-/// Maps Mach-O segment/section names to ELF-like names.
+/// Extract sections from a parsed Mach-O, mapping names to ELF-like format.
 pub fn get_sections(
     macho: &goblin::mach::MachO,
 ) -> Vec<Section> {
@@ -26,6 +31,7 @@ pub fn get_sections(
     secs
 }
 
+/// Extract the segment name as a String.
 fn seg_name_str(
     seg: &goblin::mach::segment::Segment,
 ) -> String {

@@ -1,4 +1,13 @@
-/// Java .class file parser (ECMA/JVM spec).
+//! Java `.class` file parser.
+//!
+//! Parses the constant pool (all 14 tag types), methods table, and Code
+//! attributes from a `.class` file. The parser is tolerant of truncated
+//! input -- returns `None` if the file is malformed rather than panicking.
+//!
+//! Key types:
+//! - `ClassFile` -- parsed class with constant pool and method list.
+//! - `MethodInfo` -- single method with access flags, code offset/length.
+//! - `CpEntry` -- constant pool entry (Utf8, Methodref, Class, etc.).
 
 /// Parsed constant pool entry.
 #[derive(Clone)]
@@ -20,7 +29,8 @@ pub enum CpEntry {
     Placeholder, // second slot for Long/Double
 }
 
-/// Parsed method info.
+/// Parsed method_info structure from the class file, including the
+/// Code attribute location and exception table length.
 pub struct MethodInfo {
     pub access_flags: u16,
     pub name_index: u16,
@@ -33,7 +43,8 @@ pub struct MethodInfo {
     pub raw_size: usize,   // total bytes of this method_info
 }
 
-/// Parsed class file.
+/// Parsed `.class` file with constant pool, methods, and layout metadata
+/// needed for reassembly.
 pub struct ClassFile {
     pub constant_pool: Vec<CpEntry>,
     pub access_flags: u16,
@@ -42,7 +53,8 @@ pub struct ClassFile {
     pub total_size: usize,
 }
 
-/// Parse a Java .class file.
+/// Parse a Java `.class` file starting from the CAFEBABE magic.
+/// Returns `None` if the file is too short or has an invalid magic number.
 pub fn parse_classfile(data: &[u8]) -> Option<ClassFile> {
     if data.len() < 10
         || read_u32(data, 0) != 0xCAFE_BABE
@@ -86,6 +98,8 @@ pub fn parse_classfile(data: &[u8]) -> Option<ClassFile> {
     })
 }
 
+/// Parse the constant pool starting at `pos`. Handles all 14 tag types
+/// and inserts `Placeholder` entries for the second slot of Long/Double.
 fn parse_constant_pool(
     data: &[u8],
     mut pos: usize,
@@ -201,6 +215,8 @@ fn parse_constant_pool(
     Some((pool, pos))
 }
 
+/// Parse a single method_info at `start`, walking its attributes to
+/// locate the Code attribute (bytecode offset, length, exception table).
 fn parse_method(
     data: &[u8],
     start: usize,
@@ -276,6 +292,8 @@ fn parse_method(
     ))
 }
 
+/// Skip over a fields or methods table (used to skip the fields table
+/// before parsing methods).
 fn skip_fields_or_methods(
     data: &[u8],
     mut pos: usize,
@@ -311,6 +329,7 @@ fn skip_fields_or_methods(
     Some(pos)
 }
 
+/// Skip over class-level attributes at the end of the file.
 fn skip_attributes(
     data: &[u8],
     mut pos: usize,
@@ -341,6 +360,7 @@ pub fn cp_utf8(pool: &[CpEntry], idx: u16) -> &str {
     ""
 }
 
+/// Read a big-endian `u16` from `data` at `off`. Returns 0 on OOB.
 fn read_u16(data: &[u8], off: usize) -> u16 {
     if off + 2 > data.len() { return 0; }
     u16::from_be_bytes(
@@ -348,6 +368,7 @@ fn read_u16(data: &[u8], off: usize) -> u16 {
     )
 }
 
+/// Read a big-endian `u32` from `data` at `off`. Returns 0 on OOB.
 fn read_u32(data: &[u8], off: usize) -> u32 {
     if off + 4 > data.len() { return 0; }
     u32::from_be_bytes(

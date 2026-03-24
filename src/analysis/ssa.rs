@@ -1,3 +1,10 @@
+//! SSA (Static Single Assignment) form construction.
+//!
+//! Builds SSA from per-block register effects and dominance information.
+//! Inserts phi-nodes at dominance frontiers and renames values using a
+//! dominator-tree walk. The resulting SSA form is consumed by the SCCP
+//! solver for precise constant propagation across branches.
+
 use crate::analysis::dominance::DomTree;
 use crate::analysis::regstate::{RegId, SsaEffect, REG_COUNT};
 use std::collections::{HashSet, VecDeque};
@@ -48,6 +55,7 @@ pub fn build_ssa(
     form
 }
 
+/// Create initial SSA definitions for entry block registers.
 fn create_entry_defs(form: &mut SsaForm) {
     for reg in 0..REG_COUNT as RegId {
         let vid = form.defs.len();
@@ -56,6 +64,7 @@ fn create_entry_defs(form: &mut SsaForm) {
     }
 }
 
+/// Insert phi-nodes at dominance frontiers for each register.
 fn insert_phi_nodes(
     form: &mut SsaForm,
     block_effects: &[Vec<SsaEffect>],
@@ -82,6 +91,7 @@ fn insert_phi_nodes(
     }
 }
 
+/// Find blocks that define (write to) a given register.
 fn find_def_blocks(
     block_effects: &[Vec<SsaEffect>],
     reg: RegId,
@@ -99,6 +109,7 @@ fn find_def_blocks(
     defs
 }
 
+/// Check if an SSA effect defines (writes to) the given register.
 fn defines_reg(eff: &SsaEffect, reg: RegId) -> bool {
     match eff {
         SsaEffect::MovConst(d, _)
@@ -178,6 +189,7 @@ fn rename_values(
     }
 }
 
+/// Build a children list from the immediate dominator array.
 fn build_dom_children(
     idom: &[Option<usize>],
     n: usize,
@@ -193,12 +205,14 @@ fn build_dom_children(
     children
 }
 
+/// Snapshot current stack depths for restoration after subtree walk.
 fn save_stack_lens(
     stacks: &[Vec<ValId>],
 ) -> Vec<usize> {
     stacks.iter().map(|s| s.len()).collect()
 }
 
+/// Restore stacks to saved depths after processing a dominator subtree.
 fn restore_stacks(
     stacks: &mut [Vec<ValId>],
     lens: &[usize],
@@ -208,6 +222,7 @@ fn restore_stacks(
     }
 }
 
+/// Push phi-node values onto register stacks for the current block.
 fn rename_block_phis(
     form: &mut SsaForm,
     b: usize,
@@ -221,6 +236,7 @@ fn rename_block_phis(
     }
 }
 
+/// Record effects and push new SSA definitions onto register stacks.
 fn rename_block_effects(
     form: &mut SsaForm,
     b: usize,
@@ -235,6 +251,7 @@ fn rename_block_effects(
     }
 }
 
+/// Push an SSA value ID onto the stack for the register defined by the effect.
 fn push_def(
     eff: &SsaEffect,
     vid: ValId,
@@ -260,6 +277,7 @@ fn push_def(
     }
 }
 
+/// Fill phi-node operands from successor blocks (deferred to SCCP).
 fn fill_succ_phis(
     _form: &mut SsaForm,
     _b: usize,

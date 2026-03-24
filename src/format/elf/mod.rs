@@ -1,3 +1,10 @@
+//! ELF binary analysis and dead code compaction.
+//!
+//! Parses ELF headers, section tables, and symbol tables to build a function
+//! map. After dead code analysis, physically compacts the .text section by
+//! removing dead regions and patching all affected metadata (relocations,
+//! symbols, program headers, entry point).
+
 pub mod patch;
 pub mod sections;
 pub mod symbols;
@@ -19,7 +26,7 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
-/// ELF code sections to decode for references.
+/// ELF code sections to decode for call/jump references.
 const DECODE_SECTIONS: &[&str] = &[
     ".text", ".plt", ".plt.got", ".plt.sec", ".init", ".fini",
 ];
@@ -77,6 +84,7 @@ pub fn analyze_elf_full(
     (funcs, dead, sections, plt_names)
 }
 
+/// Build the function map from symtab; fall back to inference if stripped.
 fn build_func_map(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -97,6 +105,7 @@ fn build_func_map(
     funcs
 }
 
+/// Run reachability analysis: build call graph, determine roots, find dead.
 fn run_analysis(
     funcs: &FuncMap,
     instrs: &[DecodedInstr],
@@ -124,6 +133,7 @@ fn run_analysis(
     find_dead(funcs, &live)
 }
 
+/// Return empty results tuple for early-exit paths.
 fn empty_full() -> (
     FuncMap,
     HashMap<String, (u64, u64)>,
@@ -179,6 +189,7 @@ pub fn reassemble_elf(
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
+/// Decode instructions from all ELF code sections (text, PLT, init, fini).
 fn decode_sections(
     data: &[u8],
     sections: &[Section],
@@ -196,6 +207,8 @@ fn decode_sections(
     instrs
 }
 
+/// Apply arch-specific branch patches, data pointer patches, and ELF
+/// metadata updates (relocations, symbols, dynamic, headers).
 fn apply_patches(
     data: &mut Vec<u8>,
     instrs: &[DecodedInstr],
@@ -261,6 +274,7 @@ fn apply_patches(
     patch::patch_headers(data, sections, intervals, ts, te);
 }
 
+/// Detect CPU architecture from the ELF e_machine field.
 fn detect_arch(data: &[u8]) -> Arch {
     if data.len() < 20 {
         return Arch::X86_64;
@@ -293,10 +307,12 @@ fn detect_arch(data: &[u8]) -> Arch {
     }
 }
 
+/// Return true if the ELF is 64-bit (EI_CLASS == ELFCLASS64).
 fn detect_is64(data: &[u8]) -> bool {
     data.len() > 4 && data[4] == 2
 }
 
+/// Detect endianness from EI_DATA byte.
 fn detect_endian(data: &[u8]) -> Endian {
     if data.len() > 5 && data[5] == 2 {
         Endian::Big

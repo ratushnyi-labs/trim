@@ -1,3 +1,9 @@
+//! s390x branch offset patching after dead code compaction.
+//!
+//! Rewrites BRC/BRAS 16-bit halfword-relative offsets (4-byte instructions)
+//! and BRCL/BRASL 32-bit halfword-relative offsets (6-byte instructions)
+//! to account for address shifts. s390x is always big-endian.
+
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, Section};
 
@@ -25,6 +31,7 @@ pub fn patch_branches(
     }
 }
 
+/// Patch a single s390x instruction's branch offset by length dispatch.
 fn patch_one(
     data: &mut [u8],
     instr: &DecodedInstr,
@@ -59,6 +66,7 @@ fn patch_one(
     }
 }
 
+/// Patch a 4-byte s390x instruction (BRC/BRAS) 16-bit halfword offset.
 fn patch_4byte(
     data: &mut [u8],
     foff: usize,
@@ -88,6 +96,7 @@ fn patch_4byte(
     data[foff + 2..foff + 4].copy_from_slice(&bytes);
 }
 
+/// Patch a 6-byte s390x instruction (BRCL/BRASL) 32-bit halfword offset.
 fn patch_6byte(
     data: &mut [u8],
     foff: usize,

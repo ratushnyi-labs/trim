@@ -1,3 +1,25 @@
+//! WebAssembly module analysis, call-graph construction, dead function
+//! detection, dead branch scanning, and Code section rebuild.
+//!
+//! Uses `wasmparser` to iterate sections. The Import section provides the
+//! import-function count (so Code-section indices are offset correctly),
+//! the Export and Start sections seed the root set, and the Element section
+//! adds table-referenced functions. A BFS over the call graph (built from
+//! `call` instructions) determines liveness.
+//!
+//! Dead branch detection scans live function bodies for `unreachable`
+//! (0x00), `return` (0x0F), and unconditional `br` (0x0C) opcodes, then
+//! marks bytecode up to the next block boundary (`end`/`else`) as dead.
+//!
+//! Compaction rebuilds the Code section: dead functions get a minimal
+//! 4-byte body (`size=3, 0 locals, unreachable, end`), and live functions
+//! with dead blocks have those ranges excised.
+//!
+//! Key types:
+//! - `WasmModule` -- parsed module with function list, root set, and call
+//!   graph.
+//! - `WasmFunc` -- single function with index, name, body offset/size.
+
 use crate::analysis::cfg::DeadBlock;
 use crate::types::{FuncInfo, FuncMap, Section};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -113,12 +135,14 @@ fn build_block_ranges(
     result
 }
 
+/// Parsed WebAssembly module with call graph and root set.
 struct WasmModule {
     functions: Vec<WasmFunc>,
     roots: HashSet<u32>,
     call_graph: HashMap<u32, Vec<u32>>,
 }
 
+/// A single Wasm function entry: index, name, and body byte range.
 struct WasmFunc {
     index: u32,
     name: String,
@@ -126,6 +150,8 @@ struct WasmFunc {
     body_size: u64,
 }
 
+/// Parse a Wasm binary into a `WasmModule` using `wasmparser`. Walks
+/// Import, Function, Export, Start, Element, and Code sections.
 fn parse_module(data: &[u8]) -> Option<WasmModule> {
     use wasmparser::{Parser, Payload};
     let parser = Parser::new(0);
@@ -228,6 +254,8 @@ fn parse_module(data: &[u8]) -> Option<WasmModule> {
     })
 }
 
+/// Extract function indices from the Element section and add them to roots
+/// (they may be targets of `call_indirect`).
 fn parse_elements(
     reader: wasmparser::ElementSectionReader<'_>,
     roots: &mut HashSet<u32>,
@@ -253,6 +281,7 @@ fn parse_elements(
     }
 }
 
+/// Extract direct `call` target indices from a function body.
 fn extract_calls(
     body: wasmparser::FunctionBody<'_>,
     _func_idx: u32,
@@ -281,6 +310,8 @@ fn extract_calls(
     callees
 }
 
+/// Build a `FuncMap` from parsed module functions, marking exported
+/// functions as global.
 fn build_func_map(module: &WasmModule) -> FuncMap {
     let mut funcs = FuncMap::new();
     for f in &module.functions {
@@ -296,6 +327,7 @@ fn build_func_map(module: &WasmModule) -> FuncMap {
     funcs
 }
 
+/// Identify dead (unreachable) functions via BFS liveness.
 fn find_dead_functions(
     module: &WasmModule,
     _funcs: &FuncMap,
@@ -313,6 +345,7 @@ fn find_dead_functions(
     dead
 }
 
+/// BFS from root function indices over the call graph, returning live set.
 fn bfs_live(module: &WasmModule) -> HashSet<u32> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -368,6 +401,9 @@ pub fn find_wasm_dead_blocks(
     blocks
 }
 
+/// Scan a single Wasm function body for dead code after `unreachable`,
+/// `return`, or unconditional `br`. Tracks block nesting depth and ends
+/// dead regions at `end` (0x0B) or `else` (0x05) boundaries.
 fn scan_wasm_body_dead(
     data: &[u8],
     func: &WasmFunc,
@@ -480,6 +516,7 @@ fn scan_wasm_body_dead(
     }
 }
 
+/// Skip the locals declaration at the start of a function body.
 fn skip_locals(body: &[u8], mut pos: usize) -> usize {
     if pos >= body.len() {
         return pos;
@@ -496,6 +533,7 @@ fn skip_locals(body: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// Skip a block type (empty 0x40, valtype, or s33 type index).
 fn skip_block_type(body: &[u8], pos: usize) -> usize {
     if pos >= body.len() {
         return pos;
@@ -513,6 +551,8 @@ fn skip_block_type(body: &[u8], pos: usize) -> usize {
     }
 }
 
+/// Advance past a single Wasm instruction at `pos`, returning the new
+/// position. Handles variable-length operands (LEB128, memargs, etc.).
 fn skip_wasm_instr(body: &[u8], pos: usize) -> usize {
     if pos >= body.len() {
         return body.len();
@@ -571,6 +611,7 @@ fn skip_wasm_instr(body: &[u8], pos: usize) -> usize {
     }
 }
 
+/// Encode a `u32` as an unsigned LEB128 byte sequence.
 fn write_leb128_u32(val: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut v = val;
@@ -661,6 +702,8 @@ fn rebuild_code_section(
     wrap_code_section(num_functions, &bodies)
 }
 
+/// Emit a minimal dead-function body (4 bytes: size=3, 0 locals,
+/// unreachable, end) or copy verbatim if already tiny.
 fn emit_dead_func(
     bodies: &mut Vec<u8>,
     data: &[u8],
@@ -707,6 +750,8 @@ fn excise_ranges(
     result
 }
 
+/// Wrap rebuilt function bodies into a complete Code section (id 0x0A)
+/// with proper LEB128-encoded section and function counts.
 fn wrap_code_section(
     num_functions: u32,
     bodies: &[u8],
@@ -725,6 +770,8 @@ fn wrap_code_section(
     section
 }
 
+/// Decode an unsigned LEB128 `u32` starting at `pos`.
+/// Returns `(value, new_pos)`.
 fn read_leb128_u32(data: &[u8], mut pos: usize) -> (u32, usize) {
     let mut result = 0u32;
     let mut shift = 0;
@@ -743,6 +790,7 @@ fn read_leb128_u32(data: &[u8], mut pos: usize) -> (u32, usize) {
     (result, pos)
 }
 
+/// Skip over a LEB128-encoded value, returning the position after it.
 fn skip_leb128(data: &[u8], mut pos: usize) -> usize {
     while pos < data.len() {
         let b = data[pos];
@@ -754,6 +802,7 @@ fn skip_leb128(data: &[u8], mut pos: usize) -> usize {
     pos
 }
 
+/// Return empty analysis results.
 fn empty() -> (
     FuncMap,
     HashMap<String, (u64, u64)>,

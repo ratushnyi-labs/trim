@@ -1,3 +1,9 @@
+//! ARM32 (A32) instruction decoder for dead code analysis.
+//!
+//! Decodes fixed-width 32-bit little-endian ARM instructions to extract
+//! B, BL, BLX branch targets and BX return detection. Does not handle
+//! Thumb mode. Follows the AAPCS (ARM Architecture Procedure Call Standard).
+
 use crate::types::{DecodedInstr, FlowType};
 
 /// Decode ARM32 instructions (fixed 32-bit, little-endian).
@@ -34,6 +40,7 @@ pub fn decode_text_arm32(
     instrs
 }
 
+/// Decode a single ARM32 instruction word into targets and flow type.
 fn decode_arm32_word(
     addr: u64,
     w: u32,
@@ -59,6 +66,7 @@ fn decode_arm32_word(
     decode_arm32_b_bl(addr, w, &mut targets)
 }
 
+/// Decode ARM32 B/BL conditional branch instruction.
 fn decode_arm32_b_bl(
     addr: u64,
     w: u32,

@@ -1,8 +1,15 @@
+//! Relocation and interval arithmetic for dead code compaction.
+//!
+//! Builds sorted, merged dead-region intervals from function and block
+//! analysis results. Computes per-address shift amounts, page-aligned
+//! shrink totals, and defragments intervals by absorbing adjacent
+//! padding bytes.
+
 use crate::analysis::cfg::DeadBlock;
 use crate::types::Section;
 use std::collections::HashMap;
 
-/// Sorted dead intervals [(start_vaddr, end_vaddr)].
+/// Build sorted dead intervals [(start_vaddr, end_vaddr)] from the dead map.
 pub fn dead_intervals(
     dead: &HashMap<String, (u64, u64)>,
 ) -> Vec<(u64, u64)> {
@@ -119,6 +126,7 @@ pub fn defrag_intervals(
     merge_intervals(&mut expanded)
 }
 
+/// Expand a single interval by absorbing adjacent padding bytes.
 fn expand_one(
     data: &[u8],
     text: &Section,
@@ -160,6 +168,7 @@ fn expand_one(
     (lo, hi)
 }
 
+/// Sort and merge overlapping/adjacent intervals into a minimal set.
 fn merge_intervals(
     intervals: &mut Vec<(u64, u64)>,
 ) -> Vec<(u64, u64)> {

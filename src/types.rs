@@ -1,3 +1,11 @@
+//! Shared types used across the entire `trim` codebase.
+//!
+//! Defines the core data structures for representing CPU architectures,
+//! decoded instructions, function metadata, binary sections, and
+//! utility functions for pointer I/O. These types form the common
+//! interface between the format parsers, architecture decoders,
+//! analysis engine, and patching layer.
+
 use std::collections::{HashMap, HashSet};
 
 /// CPU architecture.
