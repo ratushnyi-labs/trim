@@ -31,7 +31,7 @@ jobs:
             ext: ""
           # macOS
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: macos-amd64
             ext: ""
           - target: aarch64-apple-darwin
