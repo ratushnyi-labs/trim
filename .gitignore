@@ -17,3 +17,11 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# leasevibe-hooks:begin - machine-local build-on-target artifacts + host-local config (never commit)
+# The hook WIRING (.claude/settings.json) and the AGENTS.md / CLAUDE.md pointers stay committed.
+/.claude/hooks/
+/.claude/settings.local.json
+/.leasevibe.yaml
+/.codexoflaws.yaml
+# leasevibe-hooks:end
