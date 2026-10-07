@@ -471,6 +471,191 @@ echo "$output" | grep -q 'result: 25' && \
     fail "BigDead: file size" "not reduced ($orig_sz_big -> $new_sz_big)"
 
 # =============================================
+# NativeAOT layout: managed code in __managedcode / __unbox
+# =============================================
+printf '\n--- NativeAOT layout: managed code sections ---\n'
+gcc -g -O0 -fno-inline -o /work/test-nat /tests/nativeaot-sections.c
+cp /work/test-nat /work/test-nat-strip
+strip --strip-all /work/test-nat-strip
+orig_sz_nat=$(stat -c%s /work/test-nat)
+printf 'Built: test-nat (%d bytes)\n' "$orig_sz_nat"
+
+output=$(trim --dry-run /work/test-nat 2>&1)
+echo "$output"
+echo "$output" | grep -q 'dead_f01' && \
+    pass "NativeAOT: detected dead functions" || \
+    fail "NativeAOT: detection" "dead_f01 not found"
+
+echo "$output" | grep -q 'rt_helper\|rt_unbox' && \
+    fail "NativeAOT: false positive" "helper called from managed code flagged" || \
+    pass "NativeAOT: helpers called from managed code kept"
+
+trim --in-place /work/test-nat
+new_sz_nat=$(stat -c%s /work/test-nat)
+printf 'Size: %d -> %d bytes\n' "$orig_sz_nat" "$new_sz_nat"
+
+output=$(/work/test-nat 2>&1) && \
+    pass "NativeAOT: patched binary executes" || \
+    fail "NativeAOT: execution" "crashed"
+
+echo "$output" | grep -q 'result: 31' && \
+    pass "NativeAOT: managed->.text branches patched" || \
+    fail "NativeAOT: output" "got: $output"
+
+[ "$new_sz_nat" -lt "$orig_sz_nat" ] && \
+    pass "NativeAOT: file physically smaller ($orig_sz_nat -> $new_sz_nat)" || \
+    fail "NativeAOT: file size" "not reduced ($orig_sz_nat -> $new_sz_nat)"
+
+trim --in-place /work/test-nat-strip 2>/dev/null
+output=$(/work/test-nat-strip 2>&1)
+echo "$output" | grep -q 'result: 31' && \
+    pass "NativeAOT stripped: patched binary output correct" || \
+    fail "NativeAOT stripped: output" "got: $output"
+
+# =============================================
+# NativeAOT image (__modules): dead code zero-filled in place
+# =============================================
+printf '\n--- NativeAOT image: zero-fill in place ---\n'
+# With a __modules section trim detects a NativeAOT image and zero-fills
+# dead code in place instead of compacting: no code moves and the file
+# keeps its size. The variant's 32-bit self-relative pointer from
+# __modules to the ELF header (which trim cannot patch) goes stale if
+# anything moves.
+gcc -g -O0 -fno-inline -DWITH_MODULES \
+    -o /work/test-natm /tests/nativeaot-sections.c
+cp /work/test-natm /work/test-natm-orig
+cp /work/test-natm /work/test-natm-strip
+strip --strip-all /work/test-natm-strip
+orig_sz_natm=$(stat -c%s /work/test-natm)
+printf 'Built: test-natm (%d bytes)\n' "$orig_sz_natm"
+
+natm_out=$(trim --in-place /work/test-natm 2>&1) || true
+echo "$natm_out"
+echo "$natm_out" | \
+    grep -q 'note: NativeAOT image detected; dead code zero-filled' && \
+    pass "NativeAOT image: zero-fill note printed" || \
+    fail "NativeAOT image: note" "not printed"
+echo "$natm_out" | grep -q '30 dead functions removed' && \
+    pass "NativeAOT image: 30 dead functions zero-filled" || \
+    fail "NativeAOT image: zero-fill" "not reported"
+
+new_sz_natm=$(stat -c%s /work/test-natm)
+[ "$new_sz_natm" -eq "$orig_sz_natm" ] && \
+    pass "NativeAOT image: file size unchanged ($new_sz_natm)" || \
+    fail "NativeAOT image: file size" "$orig_sz_natm -> $new_sz_natm"
+
+readelf -SW /work/test-natm-orig > /work/natm-shdr-orig
+readelf -SW /work/test-natm > /work/natm-shdr-new
+cmp -s /work/natm-shdr-orig /work/natm-shdr-new && \
+    pass "NativeAOT image: section headers unchanged" || \
+    fail "NativeAOT image: sections" \
+        "$(diff /work/natm-shdr-orig /work/natm-shdr-new)"
+
+readelf -lW /work/test-natm-orig > /work/natm-phdr-orig
+readelf -lW /work/test-natm > /work/natm-phdr-new
+cmp -s /work/natm-phdr-orig /work/natm-phdr-new && \
+    pass "NativeAOT image: program headers unchanged" || \
+    fail "NativeAOT image: program headers" \
+        "$(diff /work/natm-phdr-orig /work/natm-phdr-new)"
+
+# Dead function bodies (file ranges from the original symtab) must be
+# all zero, and no byte outside them may change.
+text_loc=$(readelf -SW /work/test-natm-orig | sed -n \
+    's/.*\] \.text *PROGBITS *\([0-9a-f]*\) \([0-9a-f]*\) .*/\1 \2/p')
+read -r text_va text_off <<EOF
+$text_loc
+EOF
+nm -S /work/test-natm-orig | grep ' dead_f' > /work/natm-dead-syms
+: > /work/natm-dead-ranges
+while read -r addr size _ _; do
+    lo=$((0x$addr - 0x$text_va + 0x$text_off))
+    echo "$lo $((lo + 0x$size))" >> /work/natm-dead-ranges
+done < /work/natm-dead-syms
+natm_dirty=0
+while read -r lo hi; do
+    if od -An -v -tx1 -j "$lo" -N $((hi - lo)) /work/test-natm | \
+        grep -q '[1-9a-f]'; then
+        natm_dirty=$((natm_dirty + 1))
+    fi
+done < /work/natm-dead-ranges
+natm_ranges=$(wc -l < /work/natm-dead-ranges)
+[ "$natm_ranges" -eq 30 ] && [ "$natm_dirty" -eq 0 ] && \
+    pass "NativeAOT image: dead function bytes zeroed ($natm_ranges)" || \
+    fail "NativeAOT image: zeroed" \
+        "$natm_dirty of $natm_ranges dead functions not all zero"
+natm_stray=$(cmp -l /work/test-natm-orig /work/test-natm | awk '
+    NR == FNR { lo[NR] = $1; hi[NR] = $2; n = NR; next }
+    { off = $1 - 1; hit = 0
+      for (i = 1; i <= n; i++) if (off >= lo[i] && off < hi[i]) hit = 1
+      if (!hit || $3 != 0) bad++ }
+    END { print bad + 0 }' /work/natm-dead-ranges -)
+[ "$natm_stray" -eq 0 ] && \
+    pass "NativeAOT image: no byte changed outside dead functions" || \
+    fail "NativeAOT image: stray changes" "$natm_stray bytes"
+
+output=$(/work/test-natm 2>&1) && \
+    pass "NativeAOT image: patched binary executes" || \
+    fail "NativeAOT image: execution" "crashed"
+echo "$output" | grep -q 'result: 31' && \
+    pass "NativeAOT image: output correct" || \
+    fail "NativeAOT image: output" "got: $output"
+echo "$output" | grep -q 'modules: ok' && \
+    pass "NativeAOT image: self-relative pointer past .text valid" || \
+    fail "NativeAOT image: __modules pointer" "got: $output"
+
+# Stripped: function inference finds no dead code in this fixture, so
+# this only checks trim leaves it working.
+trim --in-place /work/test-natm-strip 2>/dev/null || true
+output=$(/work/test-natm-strip 2>&1) || true
+echo "$output" | grep -q 'modules: ok' && \
+    echo "$output" | grep -q 'result: 31' && \
+    pass "NativeAOT image stripped: patched binary output correct" || \
+    fail "NativeAOT image stripped: output" "got: $output"
+
+# Managed code sections without __modules are still compacted.
+gcc -g -O0 -fno-inline -o /work/test-nat-drain /tests/nativeaot-sections.c
+orig_sz_drain=$(stat -c%s /work/test-nat-drain)
+natm_out=$(trim --in-place /work/test-nat-drain 2>&1) || true
+new_sz_drain=$(stat -c%s /work/test-nat-drain)
+! echo "$natm_out" | grep -q 'note: NativeAOT' && \
+    [ "$new_sz_drain" -lt "$orig_sz_drain" ] && \
+    pass "NativeAOT without __modules: compacted ($orig_sz_drain -> $new_sz_drain)" || \
+    fail "NativeAOT without __modules" "note or size: $orig_sz_drain -> $new_sz_drain"
+
+# =============================================
+# Switch jump-table: hoisted table base
+# =============================================
+printf '\n--- Switch jump-table: hoisted table base ---\n'
+# -O2 turns the dense switch into a base-relative jump table; because it
+# sits in a loop, the table-base `lea` is hoisted far (>6 instructions)
+# before the `movsxd`, past the old detection window. Dead code before
+# the dispatcher shifts the switch targets, so a stale table crashes.
+gcc -O2 -fno-inline -o /work/test-jt /tests/jumptable-switch.c
+printf 'Built: test-jt (%d bytes)\n' "$(stat -c%s /work/test-jt)"
+
+jt_expected=$(/work/test-jt 2>&1)
+echo "$jt_expected" | grep -q 'result:' && \
+    pass "JumpTable: original produces result" || \
+    fail "JumpTable: original" "no result: $jt_expected"
+
+cp /work/test-jt /work/test-jt-patch
+jt_patch_out=$(trim --in-place /work/test-jt-patch 2>&1)
+echo "$jt_patch_out"
+
+echo "$jt_patch_out" | grep -q 'dead functions removed' && \
+    pass "JumpTable: dead functions compacted" || \
+    fail "JumpTable: compaction" "not reported"
+
+/work/test-jt-patch > /dev/null 2>&1 && \
+    pass "JumpTable: patched binary executes" || \
+    fail "JumpTable: execution" "crashed after patching"
+
+jt_got=$(/work/test-jt-patch 2>&1)
+[ "$jt_got" = "$jt_expected" ] && \
+    pass "JumpTable: output correct after hoisted-base patch" || \
+    fail "JumpTable: output" "expected [$jt_expected] got [$jt_got]"
+
+# =============================================
 # Stream mode: output file
 # =============================================
 printf '\n--- Stream mode: output file ---\n'
@@ -1569,6 +1754,39 @@ head_bytes=$(xxd -l 4 -p /work/test-java-patch.class)
 # Cleanup
 # =============================================
 rm -f /work/hello-* /work/lib.* /work/lib-* /work/test-* /work/multi*
+
+# =============================================
+# Unwind tables: C++ exceptions through moved code
+# (.eh_frame / .eh_frame_hdr re-pointed after compaction)
+# =============================================
+printf '\n--- Unwind tables: C++ exceptions through moved code ---\n'
+if g++ -g -O0 -o /work/eh-unwind /tests/eh-unwind.cpp; then
+    cp /work/eh-unwind /work/eh-unwind-strip
+    strip --strip-all /work/eh-unwind-strip
+    for eh_bin in /work/eh-unwind /work/eh-unwind-strip; do
+        eh_tag=$(basename "$eh_bin")
+        orig_sz_eh=$(stat -c%s "$eh_bin")
+        trim --in-place "$eh_bin" > /dev/null 2>&1 || \
+            fail "EH $eh_tag: trim" "exited non-zero"
+        new_sz_eh=$(stat -c%s "$eh_bin")
+        printf 'Size: %d -> %d bytes (%s)\n' \
+            "$orig_sz_eh" "$new_sz_eh" "$eh_tag"
+        [ "$new_sz_eh" -lt "$orig_sz_eh" ] && \
+            pass "EH $eh_tag: file physically smaller ($orig_sz_eh -> $new_sz_eh)" || \
+            fail "EH $eh_tag: file size" "not reduced ($orig_sz_eh -> $new_sz_eh)"
+        output=$("$eh_bin" 2>&1) && \
+            pass "EH $eh_tag: patched binary executes" || \
+            fail "EH $eh_tag: execution" "crashed: $output"
+        echo "$output" | grep -q 'caught: boom' && \
+        echo "$output" | grep -q 'result: -1 5 unwound: 6' && \
+        echo "$output" | grep -q 'marker: eh-unwind done' && \
+            pass "EH $eh_tag: exception unwinds through moved frames" || \
+            fail "EH $eh_tag: output" "got: $output"
+    done
+else
+    fail "EH: build" "g++ could not build eh-unwind.cpp"
+fi
+rm -f /work/eh-unwind /work/eh-unwind-strip
 
 # =============================================
 # Summary

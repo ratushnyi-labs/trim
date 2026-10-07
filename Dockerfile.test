@@ -33,6 +33,7 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
     fi \
     && apk add --no-cache \
         gcc \
+        g++ \
         musl-dev \
         clang19 \
         lld19 \

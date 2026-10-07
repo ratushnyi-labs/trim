@@ -3,8 +3,9 @@
 //! Parses ELF headers, section tables, and symbol tables to build a function
 //! map. After dead code analysis, physically compacts the .text section by
 //! removing dead regions and patching all affected metadata (relocations,
-//! symbols, program headers, entry point).
+//! symbols, program headers, entry point, unwind tables).
 
+pub mod ehframe;
 pub mod patch;
 pub mod sections;
 pub mod symbols;
@@ -26,10 +27,23 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
-/// ELF code sections to decode for call/jump references.
-const DECODE_SECTIONS: &[&str] = &[
-    ".text", ".plt", ".plt.got", ".plt.sec", ".init", ".fini",
+/// ELF code sections other than .text that may branch into .text.
+/// `__managedcode` and `__unbox` hold .NET NativeAOT managed code, which
+/// calls runtime and System.Native helpers living in .text.
+const EXTRA_CODE_SECTIONS: &[&str] = &[
+    ".plt", ".plt.got", ".plt.sec", ".init", ".fini",
+    "__managedcode", "__unbox",
 ];
+
+/// .NET NativeAOT module list: the ReadyToRun module headers the runtime
+/// registers at startup. NativeAOT images hold references compaction
+/// cannot patch yet (TRIM-5), such as 32-bit self-relative pointers in
+/// the ReadyToRun tables, the dehydrated data and .data arrays, so their
+/// dead code is zero-filled in place instead of compacted.
+const NATIVEAOT_MODULES: &str = "__modules";
+
+/// .NET NativeAOT managed code sections.
+const NATIVEAOT_CODE: &[&str] = &["__managedcode", "__unbox"];
 
 /// Analyze an ELF binary: returns (funcs, dead, sections).
 pub fn analyze_elf(
@@ -80,6 +94,11 @@ pub fn analyze_elf_full(
     }
     let plt_names =
         symbols::get_plt_names(&elf, &sections);
+    // Branches from code outside .text (PLT, init/fini, NativeAOT managed
+    // code) must count as references; outside the function map they
+    // become orphan references, i.e. roots.
+    let mut instrs = instrs;
+    instrs.extend(decode_named(data, &sections, EXTRA_CODE_SECTIONS));
     let dead = run_analysis(&funcs, &instrs, data, &sections);
     (funcs, dead, sections, plt_names)
 }
@@ -152,6 +171,14 @@ pub fn reassemble_elf(
     sections: &[Section],
 ) -> (usize, u64, usize, u64) {
     let arch = detect_arch(data);
+    // Landing pads are reachable only through the unwinder (LSDA).
+    let dead_blocks =
+        &ehframe::retain_unwindable_blocks(data, sections, dead_blocks);
+    if is_nativeaot(sections) {
+        return zero_fill_in_place(
+            data, dead, dead_blocks, sections, arch,
+        );
+    }
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
         None => {
@@ -189,14 +216,54 @@ pub fn reassemble_elf(
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
-/// Decode instructions from all ELF code sections (text, PLT, init, fini).
+/// True for a .NET NativeAOT image: it has the `__modules` section and
+/// at least one managed code section (names survive `strip`). Managed
+/// code sections alone are not enough: without `__modules` there are no
+/// ReadyToRun tables to keep valid, so compaction stays safe.
+fn is_nativeaot(sections: &[Section]) -> bool {
+    let has = |name: &str| sections.iter().any(|s| s.name == name);
+    has(NATIVEAOT_MODULES) && NATIVEAOT_CODE.iter().any(|n| has(n))
+}
+
+/// Zero-fill the dead functions and blocks of a NativeAOT image in
+/// place, noting it on stderr. No code moves and the file keeps its
+/// size, so the references trim cannot patch yet stay valid (see
+/// `NATIVEAOT_MODULES`).
+fn zero_fill_in_place(
+    data: &mut [u8],
+    dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
+    sections: &[Section],
+    arch: Arch,
+) -> (usize, u64, usize, u64) {
+    eprintln!(
+        "  note: NativeAOT image detected; dead code zero-filled in \
+         place (no compaction)"
+    );
+    let (fc, fs) = zero_fill(data, dead, sections);
+    let (bc, bs) = zero_fill_blocks(data, dead_blocks, sections, arch);
+    (fc, fs, bc, bs)
+}
+
+/// Decode instructions from all ELF code sections (.text and extras).
 fn decode_sections(
     data: &[u8],
     sections: &[Section],
 ) -> Vec<DecodedInstr> {
+    let mut instrs = decode_named(data, sections, &[".text"]);
+    instrs.extend(decode_named(data, sections, EXTRA_CODE_SECTIONS));
+    instrs
+}
+
+/// Decode instructions from the named ELF sections that are present.
+fn decode_named(
+    data: &[u8],
+    sections: &[Section],
+    names: &[&str],
+) -> Vec<DecodedInstr> {
     let arch = detect_arch(data);
     let mut instrs = Vec::new();
-    for name in DECODE_SECTIONS {
+    for name in names {
         if let Some(sec) = sections.iter().find(|s| s.name == *name)
         {
             instrs.extend(crate::arch::decode_text(
@@ -267,6 +334,7 @@ fn apply_patches(
     let is64 = detect_is64(data);
     let endian = detect_endian(data);
     patch_data_ptrs(data, sections, intervals, ts, te, is64, endian);
+    ehframe::patch_eh_frame(data, sections, intervals, ts, te);
     patch::patch_rela_dyn(data, sections, intervals, ts, te);
     patch::patch_entry_point(data, intervals, ts, te);
     patch::patch_symbols(data, sections, intervals, ts, te);
