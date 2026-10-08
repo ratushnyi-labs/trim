@@ -692,6 +692,69 @@ jt_got=$(/work/test-jt-patch 2>&1)
     fail "JumpTable: output" "expected [$jt_expected] got [$jt_got]"
 
 # =============================================
+# Switch jump-table: r13/rbp base, base LEA in another block
+# =============================================
+printf '\n--- Switch jump-table: r13/rbp base, split base LEA ---\n'
+# gcc -O2 keeps the table base in r13: `movslq 0x0(%r13,idx,4)` needs a
+# zero disp8 (ModRM mod=01), a form the detector used to reject. clang
+# -O2 enters the switch loop by a jump to its test, so the base `lea`
+# ends a different basic block than the dispatch, and a linear walk back
+# stops at that jmp. Dead code before both dispatchers shifts the switch
+# targets, so a stale table crashes; each main self-checks its result.
+gcc -O2 -fno-inline -o /work/test-jt-r13 /tests/jumptable-r13.c
+clang-19 -O2 -fno-inline -o /work/test-jt-split /tests/jumptable-split.c
+printf 'Built: test-jt-r13 (%d bytes), test-jt-split (%d bytes)\n' \
+    "$(stat -c%s /work/test-jt-r13)" "$(stat -c%s /work/test-jt-split)"
+
+objdump -d /work/test-jt-r13 | grep -Eq 'movslq +0x0\(%(r13|rbp),' && \
+    pass "JumpTable r13/rbp: fixture dispatches via 0x0(%r13|%rbp)" || \
+    fail "JumpTable r13/rbp: fixture form" "no movslq 0x0(%r13|%rbp,...)"
+
+objdump -d --no-show-raw-insn /work/test-jt-split | \
+    awk '/<scan_records>:/ { f = 1; next }
+         f && /^$/ { f = 0 }
+         f && /lea .*\(%rip\)/ { l = 1 }
+         f && l && /jmp +[0-9a-f]+ </ { j = 1 }
+         f && j && /movslq/ { s = 1 }
+         END { exit !s }' && \
+    pass "JumpTable split LEA: fixture's base lea is followed by a jmp" || \
+    fail "JumpTable split LEA: fixture form" "no lea, jmp, movslq sequence"
+
+jt_r13_expected=$(/work/test-jt-r13 2>&1) || true
+echo "$jt_r13_expected" | grep -q 'result: .* ok' && \
+    pass "JumpTable r13/rbp: original self-check ok" || \
+    fail "JumpTable r13/rbp: original" "got: $jt_r13_expected"
+
+cp /work/test-jt-r13 /work/test-jt-r13-patch
+jt_r13_out=$(trim --in-place /work/test-jt-r13-patch 2>&1) || true
+echo "$jt_r13_out" | grep -q 'dead functions removed' && \
+    pass "JumpTable r13/rbp: dead functions compacted" || \
+    fail "JumpTable r13/rbp: compaction" "not reported"
+
+jt_r13_got=$(/work/test-jt-r13-patch 2>&1) || true
+[ "$jt_r13_got" = "$jt_r13_expected" ] && \
+    pass "JumpTable r13/rbp: output correct after patch" || \
+    fail "JumpTable r13/rbp: output" \
+        "expected [$jt_r13_expected] got [$jt_r13_got]"
+
+jt_split_expected=$(/work/test-jt-split 2>&1) || true
+echo "$jt_split_expected" | grep -q 'result: .* ok' && \
+    pass "JumpTable split LEA: original self-check ok" || \
+    fail "JumpTable split LEA: original" "got: $jt_split_expected"
+
+cp /work/test-jt-split /work/test-jt-split-patch
+jt_split_out=$(trim --in-place /work/test-jt-split-patch 2>&1) || true
+echo "$jt_split_out" | grep -q 'dead functions removed' && \
+    pass "JumpTable split LEA: dead functions compacted" || \
+    fail "JumpTable split LEA: compaction" "not reported"
+
+jt_split_got=$(/work/test-jt-split-patch 2>&1) || true
+[ "$jt_split_got" = "$jt_split_expected" ] && \
+    pass "JumpTable split LEA: output correct after patch" || \
+    fail "JumpTable split LEA: output" \
+        "expected [$jt_split_expected] got [$jt_split_got]"
+
+# =============================================
 # Stream mode: output file
 # =============================================
 printf '\n--- Stream mode: output file ---\n'
