@@ -8,6 +8,7 @@
 
 pub mod ehframe;
 pub mod patch;
+pub mod relr;
 pub mod sections;
 pub mod symbols;
 

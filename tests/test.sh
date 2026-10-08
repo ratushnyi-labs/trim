@@ -2109,6 +2109,169 @@ fi
 rm -f /work/eh-unwind /work/eh-unwind-strip
 
 # =============================================
+# RELR packing (--relr): RELATIVE relocations
+# =============================================
+printf '\n--- RELR packing: --relr ---\n'
+# relr-pointers.c holds ~4200 R_X86_64_RELATIVE relocations (dense and
+# sparse pointer tables in .data.rel.ro and .data). --relr packs them
+# into a RELR table (DT_RELR) inside the old .rela.dyn range:
+# - musl static-pie: every relocation is RELATIVE and .rela.dyn ends the
+#   first (read-only) segment, so its header becomes .relr.dyn, the RELA
+#   tags leave .dynamic and the freed whole pages leave the file;
+# - dynamic PIE: GLOB_DAT and an unaligned RELATIVE relocation stay RELA
+#   and a .relr.dyn header is appended; .rela.plt follows .rela.dyn in
+#   its segment and nothing in a segment may move, so the slack stays
+#   as padding;
+# - the same PIE with its data-pointer words zeroed in place (as lld
+#   leaves them; RELA ignores them): --relr must write the addends back.
+# Every vaddr stays. Plain trim (no --relr) is the reference: the packed
+# binary must print exactly what the original prints.
+gcc -O0 -static-pie -o /work/relr-spie /tests/relr-pointers.c
+gcc -O0 -DWITH_UNALIGNED -o /work/relr-pie /tests/relr-pointers.c
+cp /work/relr-pie /work/relr-pie0
+python3 /tests/relr_zero_words.py /work/relr-pie0
+for rb in relr-spie relr-pie relr-pie0; do
+    rb_in=/work/$rb
+    rb_exp=$("$rb_in" 2>&1) || true
+    trim "$rb_in" "$rb_in-plain" > /dev/null 2>&1 || true
+    rb_rc=0
+    rb_out=$(trim --relr "$rb_in" "$rb_in-relr" 2>&1) || rb_rc=$?
+    echo "$rb_out" | grep 'relr\|Error' || true
+    [ "$rb_rc" -eq 0 ] && [ -s "$rb_in-relr" ] && \
+        echo "$rb_out" | grep -q 'relr: packed' && \
+        pass "RELR $rb: trim --relr packed the relocations" || \
+        fail "RELR $rb: trim --relr" "rc=$rb_rc: $rb_out"
+    rb_got=$("$rb_in-relr" 2>&1) || true
+    echo "$rb_exp" | grep -q 'relr-fixture: ok' && \
+        [ "$rb_got" = "$rb_exp" ] && \
+        pass "RELR $rb: packed binary output identical" || \
+        fail "RELR $rb: output" "got: $rb_got"
+    rb_dyn=$(readelf -dW "$rb_in-relr" 2>&1) || true
+    echo "$rb_dyn" | grep -q '(RELR) ' && \
+        echo "$rb_dyn" | grep -q '(RELRSZ) ' && \
+        echo "$rb_dyn" | grep -q '(RELRENT) *8 ' && \
+        pass "RELR $rb: .dynamic has DT_RELR, DT_RELRSZ, DT_RELRENT" || \
+        fail "RELR $rb: .dynamic" "$rb_dyn"
+    # readelf decodes .relr.dyn on its own: it must relocate exactly the
+    # word-aligned RELATIVE relocations; all others stay in .rela.dyn.
+    rb_want=$(readelf -rW "$rb_in-plain" | \
+        awk '$3 == "R_X86_64_RELATIVE" && $1 ~ /[08]$/' | wc -l)
+    rb_have=$(readelf -rW "$rb_in-relr" | sed -n \
+        "s/.*'\.relr\.dyn' .* relocate \([0-9]*\) locations.*/\1/p")
+    rb_rela0=$(readelf -rW "$rb_in-plain" | sed -n \
+        "s/.*'\.rela\.dyn' .* contains \([0-9]*\) entr.*/\1/p")
+    rb_rela1=$(readelf -rW "$rb_in-relr" | sed -n \
+        "s/.*'\.rela\.dyn' .* contains \([0-9]*\) entr.*/\1/p")
+    [ -n "$rb_have" ] && [ "$rb_have" -eq "$rb_want" ] && \
+        [ "${rb_rela1:-0}" -eq $((rb_rela0 - rb_want)) ] && \
+        pass "RELR $rb: .relr.dyn relocates $rb_want words, ${rb_rela1:-0} stay RELA" || \
+        fail "RELR $rb: tables" \
+            "relr '$rb_have' of $rb_want; rela ${rb_rela0} -> ${rb_rela1:-0}"
+    readelf -lW "$rb_in-plain" | \
+        awk '/^  [A-Z]/ && $1 != "Type" {print $1, $3}' > /work/relr-va-plain
+    readelf -lW "$rb_in-relr" | \
+        awk '/^  [A-Z]/ && $1 != "Type" {print $1, $3}' > /work/relr-va-new
+    [ -s /work/relr-va-new ] && cmp -s /work/relr-va-plain /work/relr-va-new && \
+        pass "RELR $rb: every segment keeps its vaddr" || \
+        fail "RELR $rb: vaddrs" "$(diff /work/relr-va-plain /work/relr-va-new)"
+    rb_sz_plain=$(stat -c%s "$rb_in-plain" 2>/dev/null || echo 0)
+    rb_sz_relr=$(stat -c%s "$rb_in-relr" 2>/dev/null || echo 0)
+    printf 'Size: %d -> %d bytes (%s, without -> with --relr)\n' \
+        "$rb_sz_plain" "$rb_sz_relr" "$rb"
+    case $rb in
+    relr-spie)
+        rb_freed=$((rb_sz_plain - rb_sz_relr))
+        [ "$rb_freed" -ge 4096 ] && [ $((rb_freed % 4096)) -eq 0 ] && \
+            pass "RELR $rb: $((rb_freed / 4096)) whole pages left the file ($rb_sz_plain -> $rb_sz_relr)" || \
+            fail "RELR $rb: file size" "$rb_sz_plain -> $rb_sz_relr"
+        rb_shdr=$(readelf -SW "$rb_in-relr" 2>&1) || true
+        echo "$rb_shdr" | grep -q '\.relr\.dyn *RELR ' && \
+            ! echo "$rb_shdr" | grep -q '\.rela\.dyn' && \
+            ! echo "$rb_dyn" | grep -q '(RELA' && \
+            pass "RELR $rb: no RELA left; its header now describes .relr.dyn" || \
+            fail "RELR $rb: headers" "$(echo "$rb_shdr" | grep rel)"
+        ;;
+    relr-pie)
+        echo "$rb_out" | \
+            grep -q 'slack kept as padding (.rela.plt follows .rela.dyn' && \
+            [ "$rb_sz_relr" -ge "$rb_sz_plain" ] && \
+            [ "$rb_sz_relr" -le $((rb_sz_plain + 96)) ] && \
+            readelf -SW "$rb_in-relr" | grep -q '\.relr\.dyn *RELR ' && \
+            pass "RELR $rb: slack kept as padding, .relr.dyn header appended" || \
+            fail "RELR $rb: padding" "$rb_sz_plain -> $rb_sz_relr"
+        ;;
+    relr-pie0)
+        echo "$rb_out" | grep -q 'wrote [1-9][0-9]* addends in place' && \
+            cmp -s "$rb_in-relr" /work/relr-pie-relr && \
+            pass "RELR $rb: addends written back (same image as relr-pie)" || \
+            fail "RELR $rb: addends" "not written back"
+        ;;
+    esac
+done
+
+readelf -dW /work/relr-spie-plain | grep -q '(RELA) ' && \
+    ! readelf -dW /work/relr-spie-plain | grep -q '(RELR)' && \
+    pass "RELR: without --relr the relocations stay RELA" || \
+    fail "RELR: default" "plain trim changed the relocations"
+
+trim --help 2>&1 | grep -q -- '--relr ' && \
+    pass "RELR: --help documents --relr" || \
+    fail "RELR: --help" "no --relr entry"
+
+# glibc 2.36+ will not load an object with DT_RELR whose DT_NEEDED names
+# libc.so.* unless it needs the GLIBC_ABI_DT_RELR version, which --relr
+# does not add. Alpine has no glibc: a stand-in libc.so.6 with versioned
+# symbols gives the fixtures the same DT_NEEDED and DT_VERNEED (they are
+# built, never run). Needing GLIBC_ABI_DT_RELR already, packing proceeds.
+printf 'int relr_fake(void) { return 0; }\nint relr_fake2(void) { return 1; }\n' \
+    > /work/relr-fake.c
+printf 'GLIBC_2.2.5 { global: *; };\n' > /work/relr-libc1.map
+printf 'GLIBC_2.2.5 { global: relr_fake; local: *; };\nGLIBC_ABI_DT_RELR { global: relr_fake2; };\n' \
+    > /work/relr-libc2.map
+for rv in 1 2; do
+    gcc -shared -fPIC -Wl,-soname,libc.so.6 \
+        -Wl,--version-script=/work/relr-libc$rv.map \
+        -o /work/relr-libc$rv.so /work/relr-fake.c
+done
+gcc -O0 -o /work/relr-glibc /tests/relr-pointers.c -Wl,--no-as-needed \
+    -Wl,-u,relr_fake /work/relr-libc1.so
+gcc -O0 -o /work/relr-glibcv /tests/relr-pointers.c -Wl,--no-as-needed \
+    -Wl,-u,relr_fake -Wl,-u,relr_fake2 /work/relr-libc2.so
+rg_out=$(trim --relr /work/relr-glibcv /work/relr-glibcv-r 2>&1) || true
+echo "$rg_out" | grep 'relr\|Error' || true
+echo "$rg_out" | grep -q 'relr: packed' && \
+    readelf -dW /work/relr-glibcv-r | grep -q '(RELR) ' && \
+    pass "RELR relr-glibcv: needs GLIBC_ABI_DT_RELR already; packed" || \
+    fail "RELR relr-glibcv: packing" "$rg_out"
+
+# Refusals: a fixed-address executable, a .dynamic without room for the
+# three RELR tags (--spare-dynamic-tags=0 while RELA entries remain), an
+# unsupported architecture, an already packed image and a glibc-linked
+# PIE without GLIBC_ABI_DT_RELR. Each gets a clear message, and the
+# output is exactly what plain trim writes.
+gcc -O0 -no-pie -o /work/relr-nopie /tests/relr-pointers.c
+gcc -O0 -DWITH_UNALIGNED -Wl,--spare-dynamic-tags=0 \
+    -o /work/relr-full /tests/relr-pointers.c
+clang-19 --target=riscv64-linux-gnu -march=rv64gc -nostdlib -static \
+    -fuse-ld=lld -o /work/relr-riscv /tests/riscv-hello.c 2>/dev/null
+for rr in relr-nopie:'not position-independent' \
+          relr-full:'no room in .dynamic' \
+          relr-riscv:'unsupported architecture RISC-V' \
+          relr-spie-relr:'already has DT_RELR' \
+          relr-glibc:'linked against glibc (libc.so.6)'; do
+    rr_bin=/work/${rr%%:*}
+    rr_why=${rr#*:}
+    trim "$rr_bin" "$rr_bin-plain" > /dev/null 2>&1 || true
+    rr_out=$(trim --relr "$rr_bin" "$rr_bin-r" 2>&1) || true
+    echo "$rr_out" | grep 'relr\|Error' || true
+    echo "$rr_out" | grep -q "relr: refused: $rr_why" && \
+        cmp -s "$rr_bin-plain" "$rr_bin-r" && \
+        pass "RELR refusal ${rr%%:*}: $rr_why; output unchanged" || \
+        fail "RELR refusal ${rr%%:*}" "$rr_out"
+done
+rm -f /work/relr-*
+
+# =============================================
 # Summary
 # =============================================
 printf '\n=== Test Summary ===\n'

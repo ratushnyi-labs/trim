@@ -38,12 +38,12 @@ fn main() {
             println!("{}", LICENSE);
             process::exit(0);
         }
-        Action::InPlace { dry_run, files, max_sccp } => {
-            process::exit(run_in_place(&files, dry_run, max_sccp));
+        Action::InPlace { dry_run, files, max_sccp, relr } => {
+            process::exit(run_in_place(&files, dry_run, max_sccp, relr));
         }
-        Action::Stream { dry_run, input, output, max_sccp } => {
+        Action::Stream { dry_run, input, output, max_sccp, relr } => {
             process::exit(run_stream(
-                &input, output.as_deref(), dry_run, max_sccp,
+                &input, output.as_deref(), dry_run, max_sccp, relr,
             ));
         }
     }
@@ -54,8 +54,14 @@ enum Action {
     Help,
     Version,
     License,
-    InPlace { dry_run: bool, files: Vec<String>, max_sccp: usize },
-    Stream { dry_run: bool, input: String, output: Option<String>, max_sccp: usize },
+    InPlace { dry_run: bool, files: Vec<String>, max_sccp: usize, relr: bool },
+    Stream {
+        dry_run: bool,
+        input: String,
+        output: Option<String>,
+        max_sccp: usize,
+        relr: bool,
+    },
 }
 
 /// Parse CLI arguments into an `Action`. Returns an error message on failure.
@@ -66,6 +72,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let mut in_place = false;
     let mut dry_run = false;
+    let mut relr = false;
     let mut max_sccp = trim::analysis::sccp::DEFAULT_MAX_INSTRS;
     let mut positional = Vec::new();
     let mut i = 0;
@@ -76,6 +83,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "--license" | "-l" => return Ok(Action::License),
             "--in-place" | "-i" => in_place = true,
             "--dry-run" => dry_run = true,
+            "--relr" => relr = true,
             "--max-sccp-instrs" => {
                 i += 1;
                 max_sccp = parse_max_sccp(&args, i)?;
@@ -97,7 +105,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         if positional.is_empty() {
             return Err("--in-place requires at least one file".into());
         }
-        return Ok(Action::InPlace { dry_run, files: positional, max_sccp });
+        return Ok(Action::InPlace { dry_run, files: positional, max_sccp, relr });
     }
     if positional.is_empty() {
         eprint_usage();
@@ -108,7 +116,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let input = positional[0].clone();
     let output = positional.get(1).cloned();
-    Ok(Action::Stream { dry_run, input, output, max_sccp })
+    Ok(Action::Stream { dry_run, input, output, max_sccp, relr })
 }
 
 /// Parse the `--max-sccp-instrs` value from the argument list at index `i`.
@@ -129,10 +137,11 @@ fn run_in_place(
     files: &[String],
     dry_run: bool,
     max_sccp: usize,
+    relr: bool,
 ) -> i32 {
     let mut rc = 0;
     for path in files {
-        match trim::process_file(path, dry_run, max_sccp) {
+        match trim::process_file(path, dry_run, max_sccp, relr) {
             Ok(result) => {
                 if result != 0 {
                     rc = result;
@@ -178,6 +187,7 @@ fn run_stream(
     output: Option<&str>,
     dry_run: bool,
     max_sccp: usize,
+    relr: bool,
 ) -> i32 {
     let data = match read_input(input) {
         Ok(d) => d,
@@ -185,7 +195,7 @@ fn run_stream(
     };
     let label = if input == "-" { "<stdin>" } else { input };
     let result = match trim::process_bytes(
-        &data, label, dry_run, max_sccp,
+        &data, label, dry_run, max_sccp, relr,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -257,6 +267,11 @@ fn eprint_usage() {
          \x20 --dry-run               Report dead code without producing output\n\
          \x20 --max-sccp-instrs N     Max instructions per function for SCCP\n\
          \x20                         analysis (default: 10000)\n\
+         \x20 --relr                  Also pack RELATIVE relocations into a\n\
+         \x20                         RELR table (DT_RELR) and drop the freed\n\
+         \x20                         pages (x86-64/AArch64 ELF PIE). Opt-in:\n\
+         \x20                         the loader must support DT_RELR (glibc\n\
+         \x20                         2.36+, musl 1.2.4+)\n\
          \x20 --version, -v           Show version\n\
          \x20 --license, -l           Show license\n\
          \x20 --help, -h              Show this help message\n\

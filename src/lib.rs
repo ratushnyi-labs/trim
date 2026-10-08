@@ -417,8 +417,45 @@ fn reassemble_format(
     }
 }
 
-/// Analyze and patch binary data, return patched bytes.
+/// Analyze and patch binary data, return patched bytes. With `relr`,
+/// the RELATIVE relocations of the result are then packed into RELR
+/// (`--relr`; on a dry run only reported).
 pub fn process_bytes(
+    data: &[u8],
+    label: &str,
+    dry_run: bool,
+    max_sccp_instrs: usize,
+    relr: bool,
+) -> Result<Option<Vec<u8>>> {
+    let trimmed = trim_dead_code(data, label, dry_run, max_sccp_instrs)?;
+    if !relr {
+        return Ok(trimmed);
+    }
+    let packed = apply_relr(trimmed.as_deref().unwrap_or(data));
+    if dry_run {
+        return Ok(None);
+    }
+    Ok(packed.or(trimmed))
+}
+
+/// Pack the RELATIVE relocations of an ELF image into RELR, reporting
+/// to stderr. None (input left as is) when the image is refused.
+fn apply_relr(data: &[u8]) -> Option<Vec<u8>> {
+    match format::elf::relr::pack_relative(data) {
+        Ok((out, report)) => {
+            report.print();
+            Some(out)
+        }
+        Err(why) => {
+            eprintln!("  relr: refused: {}; relocations left unchanged", why);
+            None
+        }
+    }
+}
+
+/// Find dead code and remove it, return the patched bytes (None when
+/// nothing changed or on a dry run).
+fn trim_dead_code(
     data: &[u8],
     label: &str,
     dry_run: bool,
@@ -531,11 +568,13 @@ fn patch_binary(
     Ok(Some(mdata))
 }
 
-/// Process a single file in-place: analyze and optionally patch.
+/// Process a single file in-place: analyze and optionally patch
+/// (`relr`: also pack RELATIVE relocations, see `process_bytes`).
 pub fn process_file(
     path: &str,
     dry_run: bool,
     max_sccp_instrs: usize,
+    relr: bool,
 ) -> Result<i32> {
     let meta = fs::metadata(path)
         .with_context(|| format!("Error: '{}' not found", path))?;
@@ -562,7 +601,7 @@ pub fn process_file(
         }
     }
     let data = fs::read(path)?;
-    match process_bytes(&data, path, dry_run, max_sccp_instrs)? {
+    match process_bytes(&data, path, dry_run, max_sccp_instrs, relr)? {
         Some(patched) => {
             fs::write(path, &patched)?;
             Ok(0)
