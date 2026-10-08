@@ -51,6 +51,20 @@ pub enum FlowType {
     IndirectCall,
 }
 
+impl FlowType {
+    /// True if execution can continue past an instruction of this flow:
+    /// it does not return, jump, branch indirectly or halt.
+    pub fn falls_through(self) -> bool {
+        !matches!(
+            self,
+            FlowType::Return
+                | FlowType::UnconditionalBranch
+                | FlowType::IndirectBranch
+                | FlowType::Halt
+        )
+    }
+}
+
 /// A decoded instruction with metadata.
 #[derive(Debug, Clone)]
 pub struct DecodedInstr {

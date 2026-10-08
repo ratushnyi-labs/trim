@@ -5,6 +5,7 @@
 //! switch jump table entries to account for address shifts caused
 //! by dead code removal.
 
+use crate::constants::MAX_TABLE_ENTRIES;
 use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::types::{vaddr_to_offset, DecodedInstr, FlowType, Section};
 use iced_x86::{
@@ -173,9 +174,6 @@ fn find_disp_pos(raw: &[u8], disp_val: i32) -> Option<usize> {
     let packed = disp_val.to_le_bytes();
     raw.windows(4).position(|w| w == packed)
 }
-
-/// Upper bound on entries for a table whose size could not be derived.
-const MAX_TABLE_ENTRIES: usize = 4096;
 
 /// Most instructions between a dispatch's MOVSXD and its `jmp reg`.
 const MAX_DISPATCH_GAP: usize = 8;
@@ -409,7 +407,7 @@ fn predecessors(
         return None;
     }
     let mut preds = cfg.preds.get(&addr).cloned().unwrap_or_default();
-    if falls_through(&run[j - 1]) {
+    if run[j - 1].flow.falls_through() {
         preds.push(j - 1);
     }
     let Some(edges) = edges else {
@@ -437,17 +435,6 @@ fn reg_def(instr: &DecodedInstr, reg: u8) -> RegDef {
     } else {
         RegDef::Kept
     }
-}
-
-/// True if execution can continue from `instr` to the next instruction.
-fn falls_through(instr: &DecodedInstr) -> bool {
-    !matches!(
-        instr.flow,
-        FlowType::UnconditionalBranch
-            | FlowType::IndirectBranch
-            | FlowType::Return
-            | FlowType::Halt
-    )
 }
 
 /// True for `endbr64`, which marks an indirect branch or call target.

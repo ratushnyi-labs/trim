@@ -5,7 +5,7 @@
 
 use crate::types::{FuncInfo, FuncMap, Section};
 use goblin::elf::section_header::SHN_UNDEF;
-use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC};
+use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_TLS};
 use goblin::elf::Elf;
 use std::collections::HashMap;
 
@@ -49,38 +49,58 @@ pub fn get_functions_symtab(elf: &Elf) -> FuncMap {
     funcs
 }
 
-/// Extract defined functions from the dynamic symbol table (.dynsym).
+/// Code entry points of the dynamic symbol table (.dynsym): every
+/// defined entry whose value lies in an executable section, whatever
+/// its type (STT_FUNC, an IFUNC resolver, an untyped assembly label,
+/// ...). The dynamic linker reaches them through `st_value` alone, so
+/// all are roots. A name seen again at another address (symbol
+/// versions) gets an `@<addr>` suffix so that no entry is lost.
 pub fn get_dynamic_symbols(elf: &Elf) -> FuncMap {
+    let code = exec_ranges(elf);
     let mut funcs = FuncMap::new();
     for sym in &elf.dynsyms {
-        if sym.st_type() != STT_FUNC {
+        if sym.st_shndx == SHN_UNDEF as usize || sym.st_type() == STT_TLS {
             continue;
         }
-        if sym.st_value == 0
-            || sym.st_shndx == SHN_UNDEF as usize
-        {
+        let addr = sym.st_value;
+        if !code.iter().any(|&(lo, hi)| lo <= addr && addr < hi) {
             continue;
         }
-        let name = elf
-            .dynstrtab
-            .get_at(sym.st_name)
-            .unwrap_or("")
-            .to_string();
+        let name = elf.dynstrtab.get_at(sym.st_name).unwrap_or("");
         if name.is_empty() {
             continue;
         }
-        let bind = sym.st_bind();
-        let is_global = bind == STB_GLOBAL || bind == STB_WEAK;
-        funcs.insert(
-            name,
-            FuncInfo {
-                addr: sym.st_value,
-                size: sym.st_size,
-                is_global,
-            },
-        );
+        let key = match funcs.get(name) {
+            Some(fi) if fi.addr != addr => format!("{}@{:x}", name, addr),
+            _ => name.to_string(),
+        };
+        let fi = FuncInfo { addr, size: sym.st_size, is_global: true };
+        funcs.insert(key, fi);
     }
     funcs
+}
+
+/// Address ranges `[lo, hi)` of the allocated executable sections, or
+/// of the executable PT_LOAD segments when there are no section headers.
+fn exec_ranges(elf: &Elf) -> Vec<(u64, u64)> {
+    use goblin::elf::program_header::{PF_X, PT_LOAD};
+    use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR};
+    let span = |lo: u64, len: u64| Some((lo, lo.checked_add(len)?));
+    let flags = u64::from(SHF_ALLOC | SHF_EXECINSTR);
+    let secs: Vec<(u64, u64)> = elf
+        .section_headers
+        .iter()
+        .filter(|sh| sh.sh_flags & flags == flags && sh.sh_addr != 0)
+        .filter_map(|sh| span(sh.sh_addr, sh.sh_size))
+        .collect();
+    if !secs.is_empty() {
+        return secs;
+    }
+    elf.program_headers
+        .iter()
+        .filter(|ph| ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0)
+        .filter_map(|ph| span(ph.p_vaddr, ph.p_memsz))
+        .collect()
 }
 
 /// Map PLT entry addresses to imported symbol names.

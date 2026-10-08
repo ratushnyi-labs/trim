@@ -511,15 +511,24 @@ for fde_mode in pie nopie static; do
     echo "$fde_dry"
     fde_dead=0
     fde_kept=0
+    fde_missing=
     for n in dead_fde_1 dead_fde_2 dead_fde_3 dead_fde_4 $fde_live; do
         a=$(echo "$fde_syms" | awk -v n="$n" '$3 == n {
             sub(/^0+/, "", $1); print $1 }')
+        # A name nm cannot find proves nothing: never count it as kept.
+        if [ -z "$a" ]; then
+            fde_missing="$fde_missing $n"
+            continue
+        fi
         if echo "$fde_dry" | grep -q "@ 0x$a\$"; then
             case $n in dead_*) fde_dead=$((fde_dead + 1)) ;; esac
         else
             case $n in dead_*) ;; *) fde_kept=$((fde_kept + 1)) ;; esac
         fi
     done
+    [ -z "$fde_missing" ] && \
+        pass "FdeBounds $fde_mode: every checked function has an address" || \
+        fail "FdeBounds $fde_mode: symbols" "nm finds no address for:$fde_missing"
     [ "$fde_dead" -eq 4 ] && \
         pass "FdeBounds $fde_mode: dead FDE-only functions found" || \
         fail "FdeBounds $fde_mode: detection" "$fde_dead of 4 found"
@@ -540,6 +549,34 @@ for fde_mode in pie nopie static; do
         pass "FdeBounds $fde_mode: dead code removed from the file" || \
         fail "FdeBounds $fde_mode: removal" "$fde_left markers left"
 done
+
+# =============================================
+# .dynsym-only exports: IFUNC and untyped symbols
+# =============================================
+printf '\n--- .dynsym-only exports: IFUNC and untyped ---\n'
+# In a stripped shared library an IFUNC resolver (STT_GNU_IFUNC) and an
+# untyped assembly export (STT_NOTYPE) are named only by their .dynsym
+# st_value. Split at FDE boundaries they had no reference and were
+# removed. Every defined .dynsym entry in executable code is a root.
+# musl does not bind IFUNCs, so the loader binds both through st_value.
+gcc -g -O0 -fno-inline -fPIC -shared \
+    -o /work/libdynsym.so /tests/dynsym-exports.c
+gcc -g -O0 -o /work/dynsym-loader /tests/dynsym-loader.c
+strip --strip-all /work/libdynsym.so
+dyn_want='dynsym: ifunc=16 notype=42'
+output=$(/work/dynsym-loader /work/libdynsym.so 2>&1) || true
+echo "$output" | grep -q 'types: ifunc=10 notype=0' && \
+    echo "$output" | grep -q "$dyn_want" && \
+    pass "DynsymExports: original binds IFUNC and NOTYPE exports" || \
+    fail "DynsymExports: original" "got: $output"
+dyn_out=$(trim --in-place /work/libdynsym.so 2>&1) || true
+echo "$dyn_out" | grep -q '4 dead functions removed' && \
+    pass "DynsymExports: the 4 dead functions removed" || \
+    fail "DynsymExports: removal" "got: $dyn_out"
+output=$(/work/dynsym-loader /work/libdynsym.so 2>&1) || true
+echo "$output" | grep -q "$dyn_want" && \
+    pass "DynsymExports: exports still bound and correct after trim" || \
+    fail "DynsymExports: patched" "got: $output"
 
 # =============================================
 # Static printf: constant-flag branch folding

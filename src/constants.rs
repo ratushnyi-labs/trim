@@ -9,6 +9,10 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+/// Most 32-bit entries read from one relative jump table whose size is
+/// not known.
+pub const MAX_TABLE_ENTRIES: usize = 4096;
+
 /// Set of function names that must always be treated as live roots.
 /// These are runtime/startup symbols that the linker or OS loader
 /// calls directly, bypassing normal call-graph edges.

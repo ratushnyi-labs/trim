@@ -138,16 +138,23 @@ fn build_func_map(
     }
 }
 
-/// FDE boundary hints for a stripped x86-64 image with `.eh_frame`.
-/// None for other architectures: their decoders do not resolve address
-/// formation exactly (ADRP/ADD, AUIPC, LUI pairs, GOT-relative offsets),
-/// so a function split off at its FDE could lose references it has.
+/// FDE boundary hints for a stripped 64-bit x86-64 image with
+/// `.eh_frame`. None for other architectures: their decoders do not
+/// resolve address formation exactly (ADRP/ADD, AUIPC, LUI pairs,
+/// GOT-relative offsets), so a function split off at its FDE could lose
+/// references it has. None for x32 (ELFCLASS32), whose pointer scans
+/// assume 8-byte pointers. None for NativeAOT images: code they reach
+/// only through 32-bit self-relative pointers in ReadyToRun data is not
+/// a root, so it must stay merged into the function before it.
 fn fde_hints(
     elf: &goblin::elf::Elf,
     data: &[u8],
     sections: &[Section],
 ) -> Option<crate::decode::infer::FdeHints> {
-    if detect_arch(data) != Arch::X86_64 {
+    if detect_arch(data) != Arch::X86_64 || !elf.is_64 {
+        return None;
+    }
+    if is_nativeaot(sections) {
         return None;
     }
     let fdes = ehframe::fde_ranges(data, sections);

@@ -20,7 +20,17 @@
 //! entries become explicit references, and code addresses held in data,
 //! relocations, personality pointers and (fixed-address images)
 //! instruction immediates make the function holding them a root.
+//!
+//! One fall-through rule is a heuristic, not a proof: a call that is
+//! the last instruction of its FDE is taken never to return (compilers
+//! end a function's unwind range right after a call only when the
+//! callee cannot return, e.g. `__stack_chk_fail`, `_Unwind_Resume`).
+//! Code right after such a call therefore gets no fall-through
+//! reference. Were the callee to return after all, that code would only
+//! stay live through its other references. See `falls_into` and its
+//! tests.
 
+use crate::constants::MAX_TABLE_ENTRIES;
 use crate::types::{
     DecodedInstr, Endian, FlowType, FuncInfo, FuncMap, Section,
 };
@@ -28,9 +38,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Inferred function starts: address -> (name, is_global).
 type Starts = BTreeMap<u64, (String, bool)>;
-
-/// Most 32-bit entries read from one candidate relative jump table.
-const MAX_TABLE_ENTRIES: usize = 4096;
 
 /// What an image says about exact code boundaries and address-taken
 /// code, for `infer_functions_fde`.
@@ -550,22 +557,12 @@ fn falls_into(
             None => {
                 let end = x.addr + x.len as u64;
                 let ends_fde = x.is_call && fde_ends.contains(&end);
-                return (continues(x.flow) && !ends_fde).then_some(x.addr);
+                let goes_on = x.flow.falls_through() && !ends_fde;
+                return goes_on.then_some(x.addr);
             }
         }
     }
     None
-}
-
-/// True if execution can continue past an instruction of this flow.
-fn continues(flow: FlowType) -> bool {
-    !matches!(
-        flow,
-        FlowType::Return
-            | FlowType::UnconditionalBranch
-            | FlowType::IndirectBranch
-            | FlowType::Halt
-    )
 }
 
 /// Classify x86 alignment padding: INT3, or a NOP (`90`, `0F 1F /0`,
@@ -646,4 +643,54 @@ fn table_targets(
         out.push(t);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An instruction at `addr` of `len` bytes with the given flow.
+    fn ins(addr: u64, raw: &[u8], flow: FlowType) -> DecodedInstr {
+        DecodedInstr {
+            addr,
+            raw: raw.to_vec(),
+            len: raw.len(),
+            targets: Vec::new(),
+            pc_rel_target: None,
+            is_call: flow == FlowType::Call,
+            flow,
+        }
+    }
+
+    /// The call heuristic: a call that ends its FDE does not fall into
+    /// the next function; the same call inside an FDE does.
+    #[test]
+    fn call_ending_its_fde_does_not_fall_through() {
+        let call = [0xE8, 0, 0, 0, 0];
+        let code = vec![ins(0x100, &call, FlowType::Call)];
+        let ends: HashSet<u64> = [0x105].into_iter().collect();
+        assert_eq!(falls_into(&code, 0x105, &ends), None);
+        assert_eq!(falls_into(&code, 0x105, &HashSet::new()), Some(0x100));
+    }
+
+    /// NOP padding is crossed (the call rule still applies across it);
+    /// INT3 padding traps; a return or jump ends the flow.
+    #[test]
+    fn padding_and_flow_ends() {
+        let call = [0xE8, 0, 0, 0, 0];
+        let nops = vec![
+            ins(0x100, &call, FlowType::Call),
+            ins(0x105, &[0x0F, 0x1F, 0x00], FlowType::Normal),
+        ];
+        let ends: HashSet<u64> = [0x105].into_iter().collect();
+        assert_eq!(falls_into(&nops, 0x108, &HashSet::new()), Some(0x100));
+        assert_eq!(falls_into(&nops, 0x108, &ends), None);
+        let trap = vec![
+            ins(0x100, &[0x90], FlowType::Normal),
+            ins(0x101, &[0xCC], FlowType::Normal),
+        ];
+        assert_eq!(falls_into(&trap, 0x102, &HashSet::new()), None);
+        let ret = vec![ins(0x100, &[0xC3], FlowType::Return)];
+        assert_eq!(falls_into(&ret, 0x101, &HashSet::new()), None);
+    }
 }
