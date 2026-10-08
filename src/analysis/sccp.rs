@@ -2,8 +2,9 @@
 //!
 //! Performs a worklist-driven forward dataflow analysis over a function's
 //! CFG, tracking register values as lattice elements (Bot/Const/Top).
-//! When an equality branch (EQ/NE) reads a constant flags value, only
-//! the edge its condition selects is propagated, leaving the other
+//! When an equality branch (EQ/NE) reads a constant flags value, or
+//! an AArch64 CBZ/CBNZ/TBZ/TBNZ reads a constant register, only the
+//! edge its condition selects is propagated, leaving the other
 //! successor unreachable. Unreachable blocks are reported as dead
 //! branches.
 
@@ -11,8 +12,8 @@ use crate::analysis::cfg::{BasicBlock, DeadBlock, FuncCfg};
 use crate::analysis::dominance::compute_dom_tree;
 use crate::analysis::lattice::{eval_binop, CondCode, Value};
 use crate::analysis::regstate::{
-    arch_effects, branch_cond, caller_saved, SsaEffect,
-    FLAGS_REG, REG_COUNT,
+    arch_effects, branch_test, caller_saved, BranchTest, SsaEffect,
+    TestSrc, FLAGS_REG, REG_COUNT,
 };
 use crate::types::{Arch, DecodedInstr, FlowType, FuncMap};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -64,10 +65,10 @@ pub fn sccp_dead_blocks(
 }
 
 /// A block ending in a two-way conditional branch with a decoded
-/// condition: the successor block when taken and when not taken.
+/// test: the successor block when taken and when not taken.
 #[derive(Debug, Clone, Copy)]
 struct CondTerm {
-    cc: CondCode,
+    test: BranchTest,
     taken: usize,
     fallthrough: usize,
 }
@@ -120,11 +121,11 @@ fn cond_term(
     let mut taken_ids =
         last.targets.iter().filter_map(|t| by_addr.get(t));
     let taken = *taken_ids.next()?;
-    let cc = branch_cond(&last.raw, arch, big_endian)?;
+    let test = branch_test(&last.raw, arch, big_endian)?;
     let unique = taken_ids.next().is_none() && taken != fallthrough;
     let matches = block.successors.contains(&taken)
         && block.successors.contains(&fallthrough);
-    (unique && matches).then_some(CondTerm { cc, taken, fallthrough })
+    (unique && matches).then_some(CondTerm { test, taken, fallthrough })
 }
 
 /// Collect all instructions that fall within the function's address range.
@@ -372,9 +373,9 @@ fn propagate_succs(
     flow: &SccpFlow,
     worklist: &mut VecDeque<usize>,
 ) {
-    let flags = &vals[FLAGS_REG as usize];
     let only = flow.terms[b].and_then(|t| {
-        match resolve_branch(t.cc, flags) {
+        let zero = tested_zero(t.test.src, vals);
+        match resolve_branch(t.test.cc, zero) {
             BranchResult::AlwaysTaken => Some(t.taken),
             BranchResult::NeverTaken => Some(t.fallthrough),
             BranchResult::Unknown => None,
@@ -397,11 +398,12 @@ enum BranchResult {
     Unknown,
 }
 
-/// Resolve a branch from its condition and FLAGS. Only EQ/NE are
-/// folded: FLAGS holds the compare difference (or test AND) without
-/// the operand width or carry/overflow that ordered conditions need.
-fn resolve_branch(cc: CondCode, flags: &Value) -> BranchResult {
-    let zero = match flags_zero(flags) {
+/// Resolve a branch from its condition and whether the tested value
+/// is zero. Only EQ/NE are folded: FLAGS holds the compare difference
+/// (or test AND) without the operand width or carry/overflow that
+/// ordered conditions need.
+fn resolve_branch(cc: CondCode, zero: Option<bool>) -> BranchResult {
+    let zero = match zero {
         Some(z) => z,
         None => return BranchResult::Unknown,
     };
@@ -414,6 +416,17 @@ fn resolve_branch(cc: CondCode, flags: &Value) -> BranchResult {
         BranchResult::AlwaysTaken
     } else {
         BranchResult::NeverTaken
+    }
+}
+
+/// Whether the value a branch tests is zero, if known: FLAGS through
+/// `flags_zero`, or the masked bits of a constant register exactly.
+fn tested_zero(src: TestSrc, vals: &[Value]) -> Option<bool> {
+    match src {
+        TestSrc::Flags => flags_zero(vals.get(FLAGS_REG as usize)?),
+        TestSrc::RegBits(r, mask) => {
+            vals.get(r as usize)?.as_const().map(|v| v & mask == 0)
+        }
     }
 }
 

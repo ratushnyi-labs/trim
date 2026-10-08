@@ -524,10 +524,43 @@ pub fn caller_saved(arch: Arch) -> &'static [RegId] {
 
 // ===== Conditional branch conditions =====
 
-/// Condition tested by a conditional branch, or None when it is not
-/// decoded. Outside x86 only equality branches are decoded, and only
-/// those whose FLAGS value comes from the matching compare effect.
-pub fn branch_cond(
+/// The value a decoded conditional branch tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestSrc {
+    /// The FLAGS value left by the last compare/test effect.
+    Flags,
+    /// Register `RegId` masked with the `i64` bits (AArch64 CBZ/CBNZ
+    /// on the W or X width, TBZ/TBNZ on one bit). Exact: tracked
+    /// AArch64 values are the full 64-bit register contents.
+    RegBits(RegId, i64),
+}
+
+/// A decoded conditional branch: `cc` EQ is taken when the tested
+/// value is zero, NE when it is nonzero. x86 also reports ordered
+/// conditions, which are never folded.
+#[derive(Debug, Clone, Copy)]
+pub struct BranchTest {
+    pub cc: CondCode,
+    pub src: TestSrc,
+}
+
+/// What a conditional branch tests, or None when it is not decoded.
+pub fn branch_test(
+    raw: &[u8],
+    arch: Arch,
+    big_endian: bool,
+) -> Option<BranchTest> {
+    if arch == Arch::Aarch64 {
+        return a64_branch_test(word_le(raw)?);
+    }
+    let cc = branch_cond(raw, arch, big_endian)?;
+    Some(BranchTest { cc, src: TestSrc::Flags })
+}
+
+/// FLAGS condition tested by a conditional branch, or None when it is
+/// not decoded. Outside x86 only equality branches are decoded, and
+/// only those whose FLAGS value comes from the matching compare effect.
+fn branch_cond(
     raw: &[u8],
     arch: Arch,
     big_endian: bool,
@@ -559,7 +592,7 @@ fn eq_ne(is_eq: bool) -> CondCode {
     if is_eq { CondCode::Eq } else { CondCode::Ne }
 }
 
-/// AArch64 B.EQ / B.NE (CBZ/CBNZ/TBZ do not read FLAGS).
+/// AArch64 B.EQ / B.NE (not BC.cond).
 fn a64_branch_cond(w: u32) -> Option<CondCode> {
     if w & 0xFF00_0010 != 0x5400_0000 {
         return None;
@@ -568,6 +601,25 @@ fn a64_branch_cond(w: u32) -> Option<CondCode> {
         0 | 1 => Some(eq_ne(w & 0xF == 0)),
         _ => None,
     }
+}
+
+/// AArch64 B.EQ/B.NE on FLAGS, CBZ/CBNZ on a W or X register, and
+/// TBZ/TBNZ on one register bit. Bit 24 selects the NZ form.
+fn a64_branch_test(w: u32) -> Option<BranchTest> {
+    if let Some(cc) = a64_branch_cond(w) {
+        return Some(BranchTest { cc, src: TestSrc::Flags });
+    }
+    let mask = match w & 0x7E00_0000 {
+        // CBZ/CBNZ: sf 011010 op imm19 Rt
+        0x3400_0000 if w >> 31 == 1 => -1,
+        0x3400_0000 => 0xFFFF_FFFF,
+        // TBZ/TBNZ: b5 011011 op b40 imm14 Rt
+        0x3600_0000 => 1i64 << (((w >> 31) << 5) | ((w >> 19) & 0x1F)),
+        _ => return None,
+    };
+    let reg = aarch64_reg_id(w & 0x1F)?;
+    let cc = eq_ne((w >> 24) & 1 == 0);
+    Some(BranchTest { cc, src: TestSrc::RegBits(reg, mask) })
 }
 
 /// ARM32 BEQ / BNE (A32 B encoding, not BL).
@@ -638,13 +690,16 @@ fn s390x_branch_cond(raw: &[u8]) -> Option<CondCode> {
 
 // ===== AArch64 =====
 
-/// AArch64 caller-saved: X0-X15, FLAGS.
+/// AArch64 caller-saved: X0-X15 and FLAGS, i.e. every tracked AArch64
+/// register. A call also clobbers X16-X18 and X30, which are never
+/// tracked (see `aarch64_reg_id`).
 pub const AARCH64_CALLER_SAVED: &[RegId] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     FLAGS_REG,
 ];
 
-/// Map AArch64 register number to abstract register ID (0..15 tracked).
+/// Map AArch64 register number to abstract register ID. Only X0-X15
+/// are tracked; X16-X30 and 31 (SP or XZR) never hold a constant.
 fn aarch64_reg_id(reg: u32) -> Option<RegId> {
     if reg <= 15 {
         Some(reg as RegId)
@@ -653,206 +708,412 @@ fn aarch64_reg_id(reg: u32) -> Option<RegId> {
     }
 }
 
-/// Extract SSA effects from a raw AArch64 instruction word.
+/// Extract SSA effects from a raw AArch64 instruction word. Each word
+/// is classified by its top-level encoding group (bits 28:25). An
+/// instruction not modeled exactly clobbers every register and FLAGS
+/// it may write; an unclassified one clobbers all of them.
 fn aarch64_effects(raw: &[u8]) -> Vec<SsaEffect> {
-    if raw.len() < 4 {
-        return vec![SsaEffect::Nop];
+    let w = match word_le(raw) {
+        Some(w) => w,
+        None => return a64_clobber_all(),
+    };
+    match (w >> 25) & 0xF {
+        0b1000 | 0b1001 => a64_dp_imm(w),
+        0b1010 | 0b1011 => a64_branch_sys(w),
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => a64_ldst(w),
+        0b0101 | 0b1101 => a64_dp_reg(w),
+        0b0111 | 0b1111 => a64_fp_simd(w),
+        // Reserved, SME, SVE and unallocated encodings.
+        _ => a64_clobber_all(),
     }
-    let w = u32::from_le_bytes(
-        raw[..4].try_into().unwrap_or([0; 4]),
-    );
-    // Move wide immediate: bits[28:23] = 100101
-    if (w >> 23) & 0x3F == 0x25 {
-        return a64_movwide(w);
-    }
-    // Add/sub immediate: bits[28:24] = 10001
-    if (w >> 24) & 0x1F == 0x11 {
-        return a64_addsub_imm(w);
-    }
-    // Add/sub shifted register: bits[28:24] = 01011
-    if (w >> 24) & 0x1F == 0x0B {
-        return a64_addsub_reg(w);
-    }
-    // Logical shifted register: bits[28:24] = 01010
-    if (w >> 24) & 0x1F == 0x0A {
-        return a64_logical_reg(w);
-    }
-    vec![SsaEffect::Nop]
 }
 
-/// AArch64 MOVZ/MOVN wide immediate effect.
-fn a64_movwide(w: u32) -> Vec<SsaEffect> {
+/// Clobber every tracked AArch64 register and FLAGS.
+fn a64_clobber_all() -> Vec<SsaEffect> {
+    AARCH64_CALLER_SAVED
+        .iter()
+        .map(|&r| SsaEffect::Clobber(r))
+        .collect()
+}
+
+/// Clobber the register in a 5-bit field if it is tracked.
+fn a64_clobber_reg(effects: &mut Vec<SsaEffect>, field: u32) {
+    if let Some(r) = aarch64_reg_id(field) {
+        effects.push(SsaEffect::Clobber(r));
+    }
+}
+
+/// Effect of an unmodeled instruction whose only possible writes are
+/// the Rd field (bits 4:0) and, when `flags` is set, FLAGS.
+fn a64_clobber_rd(w: u32, flags: bool) -> Vec<SsaEffect> {
+    let mut effects = Vec::new();
+    a64_clobber_reg(&mut effects, w & 0x1F);
+    if flags {
+        effects.push(SsaEffect::Clobber(FLAGS_REG));
+    }
+    a64_or_nop(effects)
+}
+
+/// Return the effects, or a single Nop when there are none.
+fn a64_or_nop(effects: Vec<SsaEffect>) -> Vec<SsaEffect> {
+    if effects.is_empty() {
+        vec![SsaEffect::Nop]
+    } else {
+        effects
+    }
+}
+
+// ----- AArch64 data processing (immediate) -----
+
+/// Data processing (immediate), by bits 25:23. Each instruction here
+/// writes at most Rd; only ADDS/SUBS and ANDS write FLAGS.
+fn a64_dp_imm(w: u32) -> Vec<SsaEffect> {
+    match (w >> 23) & 0x7 {
+        0b010 => a64_addsub_imm(w),
+        0b100 => a64_logical_imm(w),
+        0b101 => a64_movwide(w),
+        // ADR/ADRP (PC-relative: not a constant in a PIE), add/sub
+        // with tags, min/max immediate, bitfield (LSL/LSR/ASR/UBFX/
+        // SXTW...) and extract.
+        _ => a64_clobber_rd(w, false),
+    }
+}
+
+/// AArch64 ADD/SUB (immediate), including CMP/CMN and MOV to/from SP.
+/// Rn = 31 is SP, Rd = 31 is SP or (when setting flags) XZR; neither
+/// is tracked. FLAGS gets Rn - imm (SUBS) or Rn + imm (ADDS).
+fn a64_addsub_imm(w: u32) -> Vec<SsaEffect> {
+    let is_sub = (w >> 30) & 1 == 1;
+    let imm12 = ((w >> 10) & 0xFFF) as i64;
+    let imm = if (w >> 22) & 1 == 1 { imm12 << 12 } else { imm12 };
+    let rn = aarch64_reg_id((w >> 5) & 0x1F);
+    let mut effects = Vec::new();
+    if (w >> 29) & 1 == 1 {
+        effects.push(match rn {
+            Some(n) if is_sub => SsaEffect::CmpImm(n, imm),
+            Some(n) => SsaEffect::CmpImm(n, -imm),
+            None => SsaEffect::Clobber(FLAGS_REG),
+        });
+    }
+    if let Some(d) = aarch64_reg_id(w & 0x1F) {
+        let op = if is_sub { BinOp::Sub } else { BinOp::Add };
+        effects.push(match rn {
+            Some(n) => SsaEffect::BinOpImm(d, op, n, imm),
+            None => SsaEffect::Clobber(d),
+        });
+        push_zext32(&mut effects, d, w >> 31 == 0);
+    }
+    a64_or_nop(effects)
+}
+
+/// AArch64 AND/ORR/EOR/ANDS (immediate), including MOV (bitmask
+/// immediate) and TST. Rn = 31 is XZR; Rd = 31 is SP, or XZR for ANDS.
+fn a64_logical_imm(w: u32) -> Vec<SsaEffect> {
     let opc = (w >> 29) & 0x3;
-    let hw = (w >> 21) & 0x3;
-    let imm16 = ((w >> 5) & 0xFFFF) as u64;
-    let rd = w & 0x1F;
-    let rd_id = match aarch64_reg_id(rd) {
-        Some(r) => r,
+    let imm = a64_bitmask_imm(w);
+    let rn_zr = (w >> 5) & 0x1F == 31;
+    let rn = aarch64_reg_id((w >> 5) & 0x1F);
+    let mut effects = Vec::new();
+    if opc == 0b11 {
+        effects.push(match (rn, imm) {
+            (Some(n), Some(i)) => SsaEffect::TestImm(n, i),
+            _ => SsaEffect::Clobber(FLAGS_REG),
+        });
+    }
+    if let Some(d) = aarch64_reg_id(w & 0x1F) {
+        let op = a64_logic_op(opc);
+        effects.push(match (rn, imm) {
+            (_, Some(i)) if rn_zr && op != BinOp::And => {
+                SsaEffect::MovConst(d, i)
+            }
+            (_, Some(_)) if rn_zr => SsaEffect::MovConst(d, 0),
+            (Some(n), Some(i)) => SsaEffect::BinOpImm(d, op, n, i),
+            _ => SsaEffect::Clobber(d),
+        });
+        push_zext32(&mut effects, d, w >> 31 == 0);
+    }
+    a64_or_nop(effects)
+}
+
+/// Logical opcode (bits 30:29) to its operation; ANDS is AND.
+fn a64_logic_op(opc: u32) -> BinOp {
+    match opc {
+        0b01 => BinOp::Or,
+        0b10 => BinOp::Xor,
+        _ => BinOp::And,
+    }
+}
+
+/// Decode the N:immr:imms bitmask immediate of a logical (immediate)
+/// instruction (the ARM `DecodeBitMasks`), or None if reserved.
+fn a64_bitmask_imm(w: u32) -> Option<i64> {
+    let is64 = w >> 31 == 1;
+    let n = (w >> 22) & 1;
+    let immr = (w >> 16) & 0x3F;
+    let imms = (w >> 10) & 0x3F;
+    if !is64 && n == 1 {
+        return None;
+    }
+    let combined = (n << 6) | (!imms & 0x3F);
+    let len = 31u32.checked_sub(combined.leading_zeros())?;
+    if len == 0 {
+        return None;
+    }
+    let esize = 1u32 << len;
+    let levels = esize - 1;
+    let (s, r) = (imms & levels, immr & levels);
+    if s == levels {
+        return None;
+    }
+    let elem = a64_rotate_elem((1u64 << (s + 1)) - 1, r, esize);
+    let size = if is64 { 64 } else { 32 };
+    let mut value = 0u64;
+    let mut pos = 0;
+    while pos < size {
+        value |= elem << pos;
+        pos += esize;
+    }
+    Some(value as i64)
+}
+
+/// Rotate the low `esize` bits of `elem` right by `r` (r < esize).
+fn a64_rotate_elem(elem: u64, r: u32, esize: u32) -> u64 {
+    if r == 0 {
+        return elem;
+    }
+    let mask = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
+    ((elem >> r) | (elem << (esize - r))) & mask
+}
+
+/// AArch64 MOVN/MOVZ/MOVK. MOVK replaces one 16-bit field of Rd and
+/// keeps the others.
+fn a64_movwide(w: u32) -> Vec<SsaEffect> {
+    let d = match aarch64_reg_id(w & 0x1F) {
+        Some(d) => d,
         None => return vec![SsaEffect::Nop],
     };
-    let shift = hw * 16;
-    match opc {
-        0b10 => vec![SsaEffect::MovConst(
-            rd_id,
-            (imm16 << shift) as i64,
-        )],
-        0b00 => vec![SsaEffect::MovConst(
-            rd_id,
-            !((imm16 << shift) as i64),
-        )],
-        _ => vec![SsaEffect::Clobber(rd_id)],
-    }
-}
-
-/// AArch64 ADD/SUB immediate effect (includes CMP when Rd=XZR).
-fn a64_addsub_imm(w: u32) -> Vec<SsaEffect> {
-    let op = (w >> 30) & 1;
-    let s_flag = (w >> 29) & 1;
-    let sh = (w >> 22) & 1;
-    let imm12 = ((w >> 10) & 0xFFF) as i64;
-    let imm = if sh == 1 { imm12 << 12 } else { imm12 };
-    let rn = (w >> 5) & 0x1F;
-    let rd = w & 0x1F;
-    if rd == 31 && s_flag == 1 {
-        if op == 1 {
-            if let Some(rn_id) = aarch64_reg_id(rn) {
-                return vec![SsaEffect::CmpImm(rn_id, imm)];
-            }
-        }
-        return vec![SsaEffect::Clobber(FLAGS_REG)];
-    }
-    let rd_id = match aarch64_reg_id(rd) {
-        Some(r) => r,
-        None => {
-            return if s_flag == 1 {
-                vec![SsaEffect::Clobber(FLAGS_REG)]
-            } else {
-                vec![SsaEffect::Nop]
-            };
-        }
+    let shift = ((w >> 21) & 0x3) * 16;
+    let imm = (((w >> 5) & 0xFFFF) as i64) << shift;
+    let mut effects = match (w >> 29) & 0x3 {
+        0b00 => vec![SsaEffect::MovConst(d, !imm)],
+        0b10 => vec![SsaEffect::MovConst(d, imm)],
+        0b11 => vec![
+            SsaEffect::BinOpImm(d, BinOp::And, d, !(0xFFFF_i64 << shift)),
+            SsaEffect::BinOpImm(d, BinOp::Or, d, imm),
+        ],
+        _ => vec![SsaEffect::Clobber(d)],
     };
-    let bin_op =
-        if op == 1 { BinOp::Sub } else { BinOp::Add };
-    let mut effects = Vec::new();
-    if let Some(rn_id) = aarch64_reg_id(rn) {
-        effects.push(SsaEffect::BinOpImm(
-            rd_id, bin_op, rn_id, imm,
-        ));
-    } else {
-        effects.push(SsaEffect::Clobber(rd_id));
-    }
-    if s_flag == 1 {
-        effects.push(SsaEffect::Clobber(FLAGS_REG));
-    }
+    push_zext32(&mut effects, d, w >> 31 == 0);
     effects
 }
 
-/// AArch64 ADD/SUB shifted register effect.
-fn a64_addsub_reg(w: u32) -> Vec<SsaEffect> {
-    let op = (w >> 30) & 1;
-    let s_flag = (w >> 29) & 1;
-    let rm = (w >> 16) & 0x1F;
-    let rn = (w >> 5) & 0x1F;
-    let rd = w & 0x1F;
-    if rd == 31 && s_flag == 1 && op == 1 {
-        if let (Some(a), Some(b)) =
-            (aarch64_reg_id(rn), aarch64_reg_id(rm))
-        {
-            return vec![SsaEffect::CmpReg(a, b)];
-        }
-        return vec![SsaEffect::Clobber(FLAGS_REG)];
-    }
-    let rd_id = match aarch64_reg_id(rd) {
-        Some(r) => r,
-        None => {
-            return if s_flag == 1 {
-                vec![SsaEffect::Clobber(FLAGS_REG)]
-            } else {
-                vec![SsaEffect::Nop]
-            };
-        }
-    };
-    let bin_op =
-        if op == 1 { BinOp::Sub } else { BinOp::Add };
-    let mut effects = Vec::new();
-    match (aarch64_reg_id(rn), aarch64_reg_id(rm)) {
-        (Some(a), Some(b)) => {
-            effects
-                .push(SsaEffect::BinOp(rd_id, bin_op, a, b));
-        }
-        _ => effects.push(SsaEffect::Clobber(rd_id)),
-    }
-    if s_flag == 1 {
-        effects.push(SsaEffect::Clobber(FLAGS_REG));
-    }
-    effects
-}
+// ----- AArch64 branches, exception generation and system -----
 
-/// AArch64 logical shifted register effect (AND, ORR, EOR, ANDS).
-fn a64_logical_reg(w: u32) -> Vec<SsaEffect> {
-    let opc = (w >> 29) & 0x3;
-    let n_bit = (w >> 21) & 1;
-    let rm = (w >> 16) & 0x1F;
-    let imm6 = (w >> 10) & 0x3F;
-    let rn = (w >> 5) & 0x1F;
-    let rd = w & 0x1F;
-    // ORR Xd, XZR, Xm (no shift) = MOV
-    if opc == 0b01 && rn == 31 && imm6 == 0 && n_bit == 0
-    {
-        if let (Some(r), Some(s)) =
-            (aarch64_reg_id(rd), aarch64_reg_id(rm))
-        {
-            return vec![SsaEffect::MovReg(r, s)];
-        }
-        if let Some(r) = aarch64_reg_id(rd) {
-            return vec![SsaEffect::Clobber(r)];
-        }
+/// Branches, exception generation and system instructions. MSR and
+/// PSTATE writes may change NZCV; MRS writes Rt. SVC, SYS/SYSL,
+/// register branches (BLRAA, ...) and anything unknown clobber all
+/// tracked registers and FLAGS. BL/BLR get the call clobber before
+/// effects are extracted.
+fn a64_branch_sys(w: u32) -> Vec<SsaEffect> {
+    if a64_writes_nothing(w) {
         return vec![SsaEffect::Nop];
     }
-    // ANDS Rd=31 = TST
-    if opc == 0b11 && rd == 31 {
-        if imm6 == 0 && n_bit == 0 {
-            if let (Some(a), Some(b)) =
-                (aarch64_reg_id(rn), aarch64_reg_id(rm))
-            {
-                return vec![SsaEffect::TestReg(a, b)];
-            }
-        }
+    // MSR (immediate) to PSTATE (CFINV, AXFLAG, ...) or MSR (register).
+    if w & 0xFFF8_F01F == 0xD500_401F || w & 0xFFF0_0000 == 0xD510_0000
+    {
         return vec![SsaEffect::Clobber(FLAGS_REG)];
     }
-    let rd_id = match aarch64_reg_id(rd) {
-        Some(r) => r,
-        None => {
-            return if opc == 0b11 {
-                vec![SsaEffect::Clobber(FLAGS_REG)]
-            } else {
-                vec![SsaEffect::Nop]
-            };
+    // MRS Xt, <sysreg>
+    if w & 0xFFF0_0000 == 0xD530_0000 {
+        return a64_clobber_rd(w, false);
+    }
+    a64_clobber_all()
+}
+
+/// B, CBZ/CBNZ, TBZ/TBNZ, B.cond/BC.cond, hints (NOP, BTI, PAC on
+/// X16/X17/X30) and barriers write no tracked register or FLAGS.
+fn a64_writes_nothing(w: u32) -> bool {
+    w & 0xFC00_0000 == 0x1400_0000
+        || w & 0x7E00_0000 == 0x3400_0000
+        || w & 0x7E00_0000 == 0x3600_0000
+        || w & 0xFF00_0000 == 0x5400_0000
+        || w & 0xFFFF_F01F == 0xD503_201F
+        || w & 0xFFFF_F01F == 0xD503_301F
+}
+
+// ----- AArch64 loads and stores -----
+
+/// Loads and stores, by bits 29:27. Register and pair forms and
+/// literal loads are modeled; exclusives, LDAR/STLR, CAS, LDAPR/STLUR,
+/// memory tags, MOPS (which also sets NZCV) and SIMD structure loads
+/// clobber all tracked registers and FLAGS.
+fn a64_ldst(w: u32) -> Vec<SsaEffect> {
+    match (w >> 27) & 0x7 {
+        0b111 => a64_ldst_reg(w),
+        0b101 => a64_ldst_pair(w),
+        0b011 if (w >> 24) & 1 == 0 => a64_ldr_literal(w),
+        _ => a64_clobber_all(),
+    }
+}
+
+/// Load/store register: unsigned offset, unscaled, pre/post-index,
+/// unprivileged and register offset. A GPR load writes Rt; pre- and
+/// post-index write back Rn. The atomic (LDADD, SWP, LD64B, ...) and
+/// LDRAA/LDRAB forms in the same space clobber everything.
+fn a64_ldst_reg(w: u32) -> Vec<SsaEffect> {
+    let mut effects = Vec::new();
+    if (w >> 24) & 1 == 0 {
+        match ((w >> 21) & 1, (w >> 10) & 0x3) {
+            (0, 0b01) | (0, 0b11) => {
+                a64_clobber_reg(&mut effects, (w >> 5) & 0x1F);
+            }
+            (0, _) | (1, 0b10) => {}
+            _ => return a64_clobber_all(),
         }
-    };
-    let bin_op = match opc {
-        0b00 | 0b11 => BinOp::And,
-        0b01 => BinOp::Or,
-        _ => BinOp::Xor,
+    }
+    let size = w >> 30;
+    let opc = (w >> 22) & 0x3;
+    let is_prfm = opc == 0b10 && size == 0b11;
+    let is_gpr_load = (w >> 26) & 1 == 0 && opc != 0b00 && !is_prfm;
+    if is_gpr_load {
+        a64_clobber_reg(&mut effects, w & 0x1F);
+    }
+    a64_or_nop(effects)
+}
+
+/// Load/store pair (LDP/STP/LDNP/STNP/LDPSW/STGP and SIMD&FP pairs).
+/// A GPR pair load writes Rt and Rt2; pre- and post-index (bit 23)
+/// write back Rn. GPR opc 11 is not a base pair form.
+fn a64_ldst_pair(w: u32) -> Vec<SsaEffect> {
+    let is_simd = (w >> 26) & 1 == 1;
+    if !is_simd && w >> 30 == 0b11 {
+        return a64_clobber_all();
+    }
+    let mut effects = Vec::new();
+    if (w >> 23) & 1 == 1 {
+        a64_clobber_reg(&mut effects, (w >> 5) & 0x1F);
+    }
+    if !is_simd && (w >> 22) & 1 == 1 {
+        a64_clobber_reg(&mut effects, w & 0x1F);
+        a64_clobber_reg(&mut effects, (w >> 10) & 0x1F);
+    }
+    a64_or_nop(effects)
+}
+
+/// Load register (literal): a GPR load writes Rt; PRFM (opc 11) and
+/// SIMD&FP loads write no tracked register.
+fn a64_ldr_literal(w: u32) -> Vec<SsaEffect> {
+    if (w >> 26) & 1 == 1 || w >> 30 == 0b11 {
+        return vec![SsaEffect::Nop];
+    }
+    a64_clobber_rd(w, false)
+}
+
+// ----- AArch64 data processing (register) -----
+
+/// Data processing (register): each instruction writes at most Rd and
+/// FLAGS. Unshifted logical and add/sub are modeled; conditional
+/// compares only write FLAGS; for the other known classes (add/sub
+/// extended or with carry, RMIF/SETF, CSEL/CSINC, 1-, 2- and 3-source)
+/// bit 29 (S) says whether FLAGS is written.
+fn a64_dp_reg(w: u32) -> Vec<SsaEffect> {
+    let sets_flags = (w >> 29) & 1 == 1;
+    if (w >> 28) & 1 == 0 {
+        return match ((w >> 24) & 1, (w >> 21) & 1) {
+            (0, _) => a64_logical_reg(w),
+            (1, 0) => a64_addsub_reg(w),
+            _ => a64_clobber_rd(w, sets_flags),
+        };
+    }
+    match (w >> 21) & 0xF {
+        0b0010 => vec![SsaEffect::Clobber(FLAGS_REG)],
+        0b0000 | 0b0100 | 0b0110 => a64_clobber_rd(w, sets_flags),
+        op if op & 0b1000 != 0 => a64_clobber_rd(w, sets_flags),
+        _ => a64_clobber_all(),
+    }
+}
+
+/// AArch64 ADD/SUB (shifted register), including CMP/CMN/NEG. Only
+/// the unshifted form is modeled; Rn/Rm = 31 is XZR (not tracked).
+/// FLAGS gets Rn - Rm for SUBS; ADDS clobbers it.
+fn a64_addsub_reg(w: u32) -> Vec<SsaEffect> {
+    let is_sub = (w >> 30) & 1 == 1;
+    let unshifted = (w >> 10) & 0x3F == 0;
+    let ops = match (
+        aarch64_reg_id((w >> 5) & 0x1F),
+        aarch64_reg_id((w >> 16) & 0x1F),
+    ) {
+        (Some(n), Some(m)) if unshifted => Some((n, m)),
+        _ => None,
     };
     let mut effects = Vec::new();
-    if imm6 == 0 && n_bit == 0 {
-        if let (Some(a), Some(b)) =
-            (aarch64_reg_id(rn), aarch64_reg_id(rm))
-        {
-            effects.push(SsaEffect::BinOp(
-                rd_id, bin_op, a, b,
-            ));
-        } else {
-            effects.push(SsaEffect::Clobber(rd_id));
-        }
-    } else {
-        effects.push(SsaEffect::Clobber(rd_id));
+    if (w >> 29) & 1 == 1 {
+        effects.push(match ops {
+            Some((n, m)) if is_sub => SsaEffect::CmpReg(n, m),
+            _ => SsaEffect::Clobber(FLAGS_REG),
+        });
     }
+    if let Some(d) = aarch64_reg_id(w & 0x1F) {
+        let op = if is_sub { BinOp::Sub } else { BinOp::Add };
+        effects.push(match ops {
+            Some((n, m)) => SsaEffect::BinOp(d, op, n, m),
+            None => SsaEffect::Clobber(d),
+        });
+        push_zext32(&mut effects, d, w >> 31 == 0);
+    }
+    a64_or_nop(effects)
+}
+
+/// AArch64 logical (shifted register): AND/BIC/ORR/ORN/EOR/EON/ANDS/
+/// BICS, including MOV (ORR from XZR) and TST. Only the unshifted,
+/// non-inverted form is modeled; Rn/Rm = 31 is XZR.
+fn a64_logical_reg(w: u32) -> Vec<SsaEffect> {
+    let opc = (w >> 29) & 0x3;
+    let plain = (w >> 10) & 0x3F == 0 && (w >> 21) & 1 == 0;
+    let rn_zr = (w >> 5) & 0x1F == 31;
+    let n = aarch64_reg_id((w >> 5) & 0x1F);
+    let m = aarch64_reg_id((w >> 16) & 0x1F);
+    let mut effects = Vec::new();
     if opc == 0b11 {
-        effects.push(SsaEffect::Clobber(FLAGS_REG));
+        effects.push(match (n, m) {
+            (Some(a), Some(b)) if plain => SsaEffect::TestReg(a, b),
+            _ => SsaEffect::Clobber(FLAGS_REG),
+        });
     }
-    effects
+    if let Some(d) = aarch64_reg_id(w & 0x1F) {
+        effects.push(match (n, m) {
+            (_, Some(b)) if plain && rn_zr && opc == 0b01 => {
+                SsaEffect::MovReg(d, b)
+            }
+            (Some(a), Some(b)) if plain => {
+                SsaEffect::BinOp(d, a64_logic_op(opc), a, b)
+            }
+            _ => SsaEffect::Clobber(d),
+        });
+        push_zext32(&mut effects, d, w >> 31 == 0);
+    }
+    a64_or_nop(effects)
+}
+
+// ----- AArch64 scalar floating-point and Advanced SIMD -----
+
+/// Scalar FP and Advanced SIMD. Only FP-to-integer conversions and
+/// FMOV to a GPR (scalar FP class, bit 21 clear or bits 15:10 zero)
+/// and SMOV/UMOV write a GPR; only the scalar FP class (FCMP, FCCMP,
+/// FJCVTZS) writes NZCV. Rd of other matches is a SIMD register, so
+/// clobbering it as a GPR only loses precision.
+fn a64_fp_simd(w: u32) -> Vec<SsaEffect> {
+    let scalar_fp = (w >> 24) & 0x1F == 0b11110;
+    let to_gpr = scalar_fp
+        && ((w >> 21) & 1 == 0 || (w >> 10) & 0x3F == 0);
+    let simd_copy = w & 0x9FE0_8400 == 0x0E00_0400;
+    if to_gpr || simd_copy {
+        return a64_clobber_rd(w, scalar_fp);
+    }
+    if scalar_fp {
+        return vec![SsaEffect::Clobber(FLAGS_REG)];
+    }
+    vec![SsaEffect::Nop]
 }
 
 // ===== ARM32 =====

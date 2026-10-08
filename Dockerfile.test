@@ -45,6 +45,7 @@ RUN if [ -f /tmp/zscaler.crt ]; then \
         qemu-mips \
         qemu-s390x \
         qemu-loongarch64 \
+        qemu-aarch64 \
     && ln -s /usr/lib/llvm19/bin/wasm-ld /usr/local/bin/wasm-ld \
     && rm -rf /var/cache/apk/*
 

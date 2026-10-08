@@ -507,6 +507,50 @@ sp_out=$(/work/test-sprintf 2>&1) && \
     fail "StaticPrintf: output" "got: $sp_out"
 
 # =============================================
+# AArch64: sound dead-branch folding
+# =============================================
+printf '\n--- AArch64: sound dead-branch folding ---\n'
+# The AArch64 constant model used to ignore instructions it did not
+# recognise (loads, writeback, CCMP/FCMP, CSET, W zero-extension, ...)
+# and kept stale constants, so live paths were folded away. Each
+# probe_* isolates one such construct and must not be folded; each
+# probe_dead_* branches on a real constant and must still be folded.
+clang-19 --target=aarch64-linux-gnu -march=armv8.1-a -nostdlib -static \
+    -fno-pie -O2 -fuse-ld=lld -o /work/test-a64fold \
+    /tests/aarch64-fold.c 2>/dev/null
+printf 'Built: test-a64fold (%d bytes)\n' \
+    "$(stat -c%s /work/test-a64fold)"
+
+a64_expected=$(qemu-aarch64 /work/test-a64fold 2>&1) || true
+echo "$a64_expected" | \
+    grep -q '^probes: 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1$' && \
+    echo "$a64_expected" | grep -q '^dead: 1 1 1 1 1$' && \
+    pass "AArch64Fold: original output correct" || \
+    fail "AArch64Fold: original" "got: $a64_expected"
+
+a64_dry=$(trim --dry-run /work/test-a64fold 2>&1)
+echo "$a64_dry" | grep 'dead branch:.*(in probe_' | \
+    grep -qv '(in probe_dead_' && \
+    fail "AArch64Fold: false positive" "a live probe path flagged dead" || \
+    pass "AArch64Fold: live probe paths kept"
+
+for p in probe_dead_beq probe_dead_cbnz probe_dead_cbz_w \
+    probe_dead_tbnz probe_dead_wrap; do
+    echo "$a64_dry" | grep -q "dead branch:.*(in $p)" && \
+        pass "AArch64Fold: $p dead path removed" || \
+        fail "AArch64Fold: folding" "$p dead path not found"
+done
+
+trim --in-place /work/test-a64fold 2>&1 | grep 'reassembled' || true
+a64_out=$(qemu-aarch64 /work/test-a64fold 2>&1) && \
+    pass "AArch64Fold: patched binary executes via QEMU" || \
+    fail "AArch64Fold: QEMU execution" "crashed"
+
+[ "$a64_out" = "$a64_expected" ] && \
+    pass "AArch64Fold: patched output matches original" || \
+    fail "AArch64Fold: output" "got: $a64_out"
+
+# =============================================
 # NativeAOT layout: managed code in __managedcode / __unbox
 # =============================================
 printf '\n--- NativeAOT layout: managed code sections ---\n'
