@@ -1505,6 +1505,53 @@ echo "$file_info" | grep -q 'PE32' && \
     fail "PE metadata: patched type" "got: $file_info"
 
 # =============================================
+# Switch jump-table: PE and Mach-O table file offsets
+# =============================================
+printf '\n--- Switch jump-table: PE and Mach-O ---\n'
+# Relative jump-table entries were read and rewritten at the table's
+# vaddr taken as a file offset, true only for PIE ELF. A PE table sits
+# at an RVA in .rdata whose raw data lies elsewhere, a Mach-O table at
+# a vmaddr past the end of the file. Both stripped fixtures carry ~3 KB
+# of dead code before the dispatcher. The PE table stays in .rdata
+# while its case targets move, so all 12 entries must be rewritten; the
+# Mach-O table follows its function in __text and moves with it. The
+# images cannot run here, so jumptable_targets.py checks statically
+# that every entry still reaches its original case code. The PE build
+# skips the mingw CRT (entry `start`: mingw makes `main` call __main).
+clang-19 --target=x86_64-w64-mingw32 -O2 -fno-inline -fuse-ld=lld -s \
+    -nostdlib -Dmain=start -Wl,-e,start \
+    -o /work/test-jt-pe.exe /tests/jumptable-mapped.c
+clang-19 --target=x86_64-apple-macosx11 -O2 -fno-inline -nostdlib \
+    -fuse-ld=lld -Wl,-no_exported_symbols -Wl,-x \
+    -o /work/test-jt-macho /tests/jumptable-mapped.c
+printf 'Built: test-jt-pe.exe (%d bytes), test-jt-macho (%d bytes)\n' \
+    "$(stat -c%s /work/test-jt-pe.exe)" "$(stat -c%s /work/test-jt-macho)"
+
+cp /work/test-jt-pe.exe /work/test-jt-pe-patch.exe
+jt_pe_out=$(trim --in-place /work/test-jt-pe-patch.exe 2>&1) || true
+echo "$jt_pe_out" | grep -q 'dead functions removed' && \
+    pass "JumpTable PE: dead functions compacted" || \
+    fail "JumpTable PE: compaction" "not reported"
+
+jt_pe_chk=$(python3 /tests/jumptable_targets.py /work/test-jt-pe.exe \
+    /work/test-jt-pe-patch.exe 12 2>&1) && \
+    echo "$jt_pe_chk" | grep -q '^12/12 entries .*(12 rewritten)' && \
+    pass "JumpTable PE: all 12 .rdata entries rewritten to their cases" || \
+    fail "JumpTable PE: table entries" "$jt_pe_chk"
+
+cp /work/test-jt-macho /work/test-jt-macho-patch
+jt_mo_out=$(trim --in-place /work/test-jt-macho-patch 2>&1) || true
+echo "$jt_mo_out" | grep -q 'dead functions removed' && \
+    pass "JumpTable Mach-O: dead functions compacted" || \
+    fail "JumpTable Mach-O: compaction" "not reported"
+
+jt_mo_chk=$(python3 /tests/jumptable_targets.py /work/test-jt-macho \
+    /work/test-jt-macho-patch 12 2>&1) && \
+    echo "$jt_mo_chk" | grep -q '^12/12 entries' && \
+    pass "JumpTable Mach-O: all 12 __text entries reach their cases" || \
+    fail "JumpTable Mach-O: table entries" "$jt_mo_chk"
+
+# =============================================
 # Mach-O metadata validation: patching preserves format
 # =============================================
 printf '\n--- Mach-O metadata validation ---\n'

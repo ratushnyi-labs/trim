@@ -216,13 +216,15 @@ enum RegDef {
 
 /// Find switch jump tables: [(base, count)], one entry per table base.
 /// `count` is None when no bounding CMP was found near the dispatch.
+/// Entries are read through `sections` (see `table_span`).
 pub fn find_jump_tables(
     data: &[u8],
     instrs: &[DecodedInstr],
+    sections: &[Section],
 ) -> Vec<(u64, Option<usize>)> {
     let mut tables: BTreeMap<u64, Option<usize>> = BTreeMap::new();
     for run in code_runs(instrs) {
-        for (base, count) in run_tables(data, run) {
+        for (base, count) in run_tables(data, sections, run) {
             let e = tables.entry(base).or_insert(count);
             *e = (*e).max(count);
         }
@@ -252,6 +254,7 @@ fn code_runs(instrs: &[DecodedInstr]) -> Vec<&[DecodedInstr]> {
 /// register is loaded by one and the same LEA on every path.
 fn run_tables(
     data: &[u8],
+    sections: &[Section],
     run: &[DecodedInstr],
 ) -> Vec<(u64, Option<usize>)> {
     let dispatches: Vec<Dispatch> = (0..run.len())
@@ -265,7 +268,7 @@ fn run_tables(
     for d in &dispatches {
         if let Some(base) = reaching_lea(run, &cfg, None, d) {
             let count = table_count(run, d.load);
-            for t in case_targets(data, run, base, count) {
+            for t in case_targets(data, sections, run, base, count) {
                 edges.entry(t).or_default().push(d.jmp);
             }
         }
@@ -476,13 +479,17 @@ fn table_count(run: &[DecodedInstr], load: usize) -> Option<usize> {
 /// `run`. With an unknown size the first other entry ends the table.
 fn case_targets(
     data: &[u8],
+    sections: &[Section],
     run: &[DecodedInstr],
     base: u64,
     count: Option<usize>,
 ) -> Vec<u64> {
+    let Some((off, fit)) = table_span(sections, base) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    for idx in 0..count.unwrap_or(MAX_TABLE_ENTRIES) {
-        let Some(entry) = read_entry(data, base, idx) else {
+    for idx in 0..count.unwrap_or(MAX_TABLE_ENTRIES).min(fit) {
+        let Some(entry) = read_entry(data, off, idx) else {
             break;
         };
         let t = (base as i64 + entry as i64) as u64;
@@ -495,33 +502,77 @@ fn case_targets(
     out
 }
 
-/// Entry `idx` of the table at `base`, whose vaddr is used as its file
-/// offset (as in the PIE layouts whose tables are patched).
-fn read_entry(data: &[u8], base: u64, idx: usize) -> Option<i32> {
-    let off = usize::try_from(base).ok()?.checked_add(idx * 4)?;
-    let bytes = data.get(off..off.checked_add(4)?)?;
+/// Where the table at vaddr `base` lies in the file: the file offset of
+/// its first entry and how many 4-byte entries fit before the end of the
+/// section holding it. None when no section holds `base`. The vaddr is
+/// mapped through that section because it equals the file offset only
+/// in some layouts (PIE ELF), not in PE (RVA vs raw data offset) nor in
+/// Mach-O (vmaddr vs fileoff).
+fn table_span(sections: &[Section], base: u64) -> Option<(usize, usize)> {
+    let sec = sections
+        .iter()
+        .find(|s| s.vaddr <= base && base - s.vaddr < s.size)?;
+    let rel = base - sec.vaddr;
+    let off = usize::try_from(sec.offset.checked_add(rel)?).ok()?;
+    let fit = usize::try_from((sec.size - rel) / 4).ok()?;
+    Some((off, fit))
+}
+
+/// File range of entry `idx` of a table whose first entry is at file
+/// offset `off`.
+fn entry_range(off: usize, idx: usize) -> Option<std::ops::Range<usize>> {
+    let at = off.checked_add(idx.checked_mul(4)?)?;
+    Some(at..at.checked_add(4)?)
+}
+
+/// Entry `idx` of the table whose first entry is at file offset `off`.
+fn read_entry(data: &[u8], off: usize, idx: usize) -> Option<i32> {
+    let bytes = data.get(entry_range(off, idx)?)?;
     Some(i32::from_le_bytes(bytes.try_into().ok()?))
 }
 
+/// Overwrite entry `idx` of the table whose first entry is at file
+/// offset `off`; out-of-file entries are left alone.
+fn write_entry(data: &mut [u8], off: usize, idx: usize, entry: i32) {
+    if let Some(bytes) = entry_range(off, idx).and_then(|r| data.get_mut(r))
+    {
+        bytes.copy_from_slice(&entry.to_le_bytes());
+    }
+}
+
+/// A detected jump table: its vaddr, the file offset of its first entry,
+/// how many entries to visit, and whether that count is a bound found at
+/// the dispatch (otherwise the first entry not targeting .text ends it).
+struct Table {
+    base: u64,
+    off: usize,
+    len: usize,
+    sized: bool,
+}
+
 /// Patch relative jump table entries. Each table is patched once and
-/// never past the start of the next detected table.
+/// never past the start of the next detected table nor the end of the
+/// section holding it; a table no section holds is skipped.
 pub fn patch_jump_tables(
     data: &mut [u8],
     instrs: &[DecodedInstr],
+    sections: &[Section],
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
 ) {
-    let tables = find_jump_tables(data, instrs);
+    let tables = find_jump_tables(data, instrs, sections);
     for (i, &(base, count)) in tables.iter().enumerate() {
+        let Some((off, fit)) = table_span(sections, base) else {
+            continue;
+        };
         let room = tables
             .get(i + 1)
             .map(|&(next, _)| ((next - base) / 4) as usize)
             .unwrap_or(MAX_TABLE_ENTRIES);
-        let limit = count.unwrap_or(MAX_TABLE_ENTRIES).min(room);
-        patch_one_table(
-            data, base, limit, count.is_none(), intervals, ts, te,
-        );
+        let len = count.unwrap_or(MAX_TABLE_ENTRIES).min(room).min(fit);
+        let table = Table { base, off, len, sized: count.is_some() };
+        patch_one_table(data, &table, intervals, ts, te);
     }
 }
 
@@ -530,21 +581,20 @@ pub fn patch_jump_tables(
 /// first entry that does not target .text ends the table.
 fn patch_one_table(
     data: &mut [u8],
-    base: u64,
-    count: usize,
-    size_unknown: bool,
+    table: &Table,
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
 ) {
+    let base = table.base;
     let base_shift = total_shift(base, intervals, ts, te) as i64;
-    for idx in 0..count {
-        let Some(entry) = read_entry(data, base, idx) else {
+    for idx in 0..table.len {
+        let Some(entry) = read_entry(data, table.off, idx) else {
             break;
         };
         let target = (base as i64 + entry as i64) as u64;
         if !(ts <= target && target < te) {
-            if size_unknown {
+            if !table.sized {
                 break;
             }
             continue;
@@ -553,10 +603,7 @@ fn patch_one_table(
             total_shift(target, intervals, ts, te) as i64;
         let delta = base_shift - tgt_shift;
         if delta != 0 {
-            let off = base as usize + idx * 4;
-            let new_entry = entry + delta as i32;
-            data[off..off + 4]
-                .copy_from_slice(&new_entry.to_le_bytes());
+            write_entry(data, table.off, idx, entry.wrapping_add(delta as i32));
         }
     }
 }
@@ -724,4 +771,143 @@ fn extract_cmp_imm(instr: &DecodedInstr) -> Option<usize> {
         return None;
     };
     usize::try_from(imm).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Arch;
+
+    /// Start of case `i` of `dispatcher`, from the dispatcher's start.
+    const CASES: [u64; 4] = [0x17, 0x1d, 0x23, 0x29];
+
+    /// Bytes `dispatcher` occupies.
+    const DISPATCH_LEN: u64 = 0x32;
+
+    /// Code of a 4-case switch at vaddr `at` whose table is at vaddr
+    /// `table`: `cmp edi,3; ja def; mov ecx,edi; lea rdx,[rip+T];
+    /// movsxd rcx,[rdx+rcx*4]; add rcx,rdx; jmp rcx`, four `mov eax,k;
+    /// ret` cases at `CASES`, and a `xor eax,eax; ret` default.
+    fn dispatcher(at: u64, table: u64) -> Vec<u8> {
+        let disp = (table as i64 - (at as i64 + 0x0e)) as i32;
+        let mut code = vec![0x83, 0xff, 0x03, 0x77, 0x2a, 0x89, 0xf9];
+        code.extend_from_slice(&[0x48, 0x8d, 0x15]);
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x63, 0x0c, 0x8a]);
+        code.extend_from_slice(&[0x48, 0x01, 0xd1, 0xff, 0xe1]);
+        for k in 1..=4u8 {
+            code.extend_from_slice(&[0xb8, k, 0, 0, 0, 0xc3]);
+        }
+        code.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+        code
+    }
+
+    /// Table entries for `dispatcher` at `at`, relative to `table`.
+    fn table_bytes(at: u64, table: u64) -> Vec<u8> {
+        CASES
+            .iter()
+            .map(|c| ((at + c) as i64 - table as i64) as i32)
+            .flat_map(i32::to_le_bytes)
+            .collect()
+    }
+
+    /// The four entries of the table at file offset `off`.
+    fn entries(data: &[u8], off: usize) -> Vec<Option<i32>> {
+        (0..4).map(|i| read_entry(data, off, i)).collect()
+    }
+
+    /// The entries `table_bytes` gives, each moved by `delta`.
+    fn expected(at: u64, table: u64, delta: i64) -> Vec<Option<i32>> {
+        CASES
+            .iter()
+            .map(|c| Some(((at + c) as i64 - table as i64 + delta) as i32))
+            .collect()
+    }
+
+    /// A section named `name` at `vaddr`, file offset `offset`.
+    fn section(name: &str, vaddr: u64, offset: u64, size: u64) -> Section {
+        let name = name.to_string();
+        Section { name, size, vaddr, offset, align: 1 }
+    }
+
+    /// Run `patch_jump_tables` on `data` with `.text` = `text` and the
+    /// one dead interval `dead`.
+    fn patch(
+        data: &mut [u8],
+        text: &Section,
+        secs: &[Section],
+        dead: (u64, u64),
+    ) {
+        let instrs = crate::arch::decode_text(
+            data, text.offset, text.vaddr, text.size, Arch::X86_64,
+        );
+        let (ts, te) = (text.vaddr, text.vaddr + text.size);
+        patch_jump_tables(data, &instrs, secs, &[dead], ts, te);
+    }
+
+    /// PE-like layout: .text at `(0x1000, text_off)`, 0x20 dead bytes
+    /// before the dispatcher, the table in .rdata at `(0x3000, rdata_off)`.
+    /// Returns the image and its sections; bytes at file offset 0x3000
+    /// (the table's vaddr) hold the sentinel 0xAB.
+    fn pe_like(text_off: u64, rdata_off: u64) -> (Vec<u8>, Vec<Section>) {
+        let (at, table) = (0x1020, 0x3000);
+        let text = section(".text", 0x1000, text_off, 0x20 + DISPATCH_LEN);
+        let rdata = section(".rdata", table, rdata_off, 16);
+        let mut data = vec![0xAB; 0x3010];
+        let t = text_off as usize;
+        data[t..t + 0x20].fill(0xcc);
+        let code = dispatcher(at, table);
+        data[t + 0x20..t + 0x20 + code.len()].copy_from_slice(&code);
+        let r = rdata_off as usize;
+        data[r..r + 16].copy_from_slice(&table_bytes(at, table));
+        (data, vec![text, rdata])
+    }
+
+    /// PE: the table is read and patched at its raw data offset; the
+    /// bytes at the file offset equal to its RVA stay untouched.
+    #[test]
+    fn pe_table_patched_at_raw_offset() {
+        let (mut data, secs) = pe_like(0x400, 0x600);
+        patch(&mut data, &secs[0], &secs, (0x1000, 0x1020));
+        assert_eq!(entries(&data, 0x600), expected(0x1020, 0x3000, -0x20));
+        assert!(data[0x3000..0x3010].iter().all(|&b| b == 0xAB));
+    }
+
+    /// PIE ELF: vaddr equals file offset, and the table is patched there
+    /// as before.
+    #[test]
+    fn identity_layout_patched_in_place() {
+        let (mut data, secs) = pe_like(0x1000, 0x3000);
+        patch(&mut data, &secs[0], &secs, (0x1000, 0x1020));
+        assert_eq!(entries(&data, 0x3000), expected(0x1020, 0x3000, -0x20));
+    }
+
+    /// A table no section holds is skipped: nothing is written.
+    #[test]
+    fn unmapped_table_skipped() {
+        let (mut data, secs) = pe_like(0x400, 0x600);
+        let before = data.clone();
+        patch(&mut data, &secs[0], &secs[..1], (0x1000, 0x1020));
+        assert_eq!(data, before);
+    }
+
+    /// Mach-O: the table follows the dispatcher in __text, at a vmaddr
+    /// above 4 GiB; dead code between the cases and the table moves the
+    /// table but not the cases, so every entry grows by the dead size.
+    #[test]
+    fn macho_inline_table_patched_at_fileoff() {
+        let (va, off, dead) = (0x1_0000_0330u64, 0x330usize, 0x22u64);
+        let table = va + DISPATCH_LEN + dead;
+        let size = DISPATCH_LEN + dead + 16;
+        let text = section(".text", va, off as u64, size);
+        let mut data = vec![0xcc; off + size as usize];
+        let code = dispatcher(va, table);
+        data[off..off + code.len()].copy_from_slice(&code);
+        let t = off + (table - va) as usize;
+        data[t..t + 16].copy_from_slice(&table_bytes(va, table));
+        let secs = [text.clone()];
+        let dead_ivl = (va + DISPATCH_LEN, table);
+        patch(&mut data, &text, &secs, dead_ivl);
+        assert_eq!(entries(&data, t), expected(va, table, dead as i64));
+    }
 }

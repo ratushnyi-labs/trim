@@ -207,7 +207,7 @@ fn apply_pe_patches(
                 data, instrs, intervals, sections, ts, te,
             );
             x86_patch::patch_jump_tables(
-                data, instrs, intervals, ts, te,
+                data, instrs, sections, intervals, ts, te,
             );
         }
         Arch::Aarch64 => {
