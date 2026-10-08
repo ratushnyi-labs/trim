@@ -20,6 +20,19 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
+/// Whether to pack RELATIVE relocations into RELR after trimming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Relr {
+    /// No packing (the default).
+    Off,
+    /// `--relr`: pack; refuse a static-pie, whose own start code may
+    /// predate DT_RELR.
+    On,
+    /// `--relr-static`: pack, static-pie input included; the caller
+    /// asserts that its statically linked libc applies DT_RELR.
+    Static,
+}
+
 /// Analysis result including dead functions and dead blocks.
 pub struct AnalysisResult {
     pub funcs: FuncMap,
@@ -417,21 +430,22 @@ fn reassemble_format(
     }
 }
 
-/// Analyze and patch binary data, return patched bytes. With `relr`,
-/// the RELATIVE relocations of the result are then packed into RELR
-/// (`--relr`; on a dry run only reported).
+/// Analyze and patch binary data, return patched bytes. Unless `relr`
+/// is `Relr::Off`, the RELATIVE relocations of the result are then
+/// packed into RELR (`--relr`, `--relr-static`; on a dry run only
+/// reported).
 pub fn process_bytes(
     data: &[u8],
     label: &str,
     dry_run: bool,
     max_sccp_instrs: usize,
-    relr: bool,
+    relr: Relr,
 ) -> Result<Option<Vec<u8>>> {
     let trimmed = trim_dead_code(data, label, dry_run, max_sccp_instrs)?;
-    if !relr {
+    if relr == Relr::Off {
         return Ok(trimmed);
     }
-    let packed = apply_relr(trimmed.as_deref().unwrap_or(data));
+    let packed = apply_relr(trimmed.as_deref().unwrap_or(data), relr);
     if dry_run {
         return Ok(None);
     }
@@ -440,8 +454,9 @@ pub fn process_bytes(
 
 /// Pack the RELATIVE relocations of an ELF image into RELR, reporting
 /// to stderr. None (input left as is) when the image is refused.
-fn apply_relr(data: &[u8]) -> Option<Vec<u8>> {
-    match format::elf::relr::pack_relative(data) {
+fn apply_relr(data: &[u8], relr: Relr) -> Option<Vec<u8>> {
+    let allow_static = relr == Relr::Static;
+    match format::elf::relr::pack_relative(data, allow_static) {
         Ok((out, report)) => {
             report.print();
             Some(out)
@@ -574,7 +589,7 @@ pub fn process_file(
     path: &str,
     dry_run: bool,
     max_sccp_instrs: usize,
-    relr: bool,
+    relr: Relr,
 ) -> Result<i32> {
     let meta = fs::metadata(path)
         .with_context(|| format!("Error: '{}' not found", path))?;

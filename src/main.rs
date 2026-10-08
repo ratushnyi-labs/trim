@@ -7,6 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::process;
+use trim::Relr;
 
 const VERSION: &str = match option_env!("TRIM_VERSION") {
     Some(v) => v,
@@ -54,13 +55,13 @@ enum Action {
     Help,
     Version,
     License,
-    InPlace { dry_run: bool, files: Vec<String>, max_sccp: usize, relr: bool },
+    InPlace { dry_run: bool, files: Vec<String>, max_sccp: usize, relr: Relr },
     Stream {
         dry_run: bool,
         input: String,
         output: Option<String>,
         max_sccp: usize,
-        relr: bool,
+        relr: Relr,
     },
 }
 
@@ -72,7 +73,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
     let mut in_place = false;
     let mut dry_run = false;
-    let mut relr = false;
+    let mut relr = Relr::Off;
     let mut max_sccp = trim::analysis::sccp::DEFAULT_MAX_INSTRS;
     let mut positional = Vec::new();
     let mut i = 0;
@@ -83,7 +84,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "--license" | "-l" => return Ok(Action::License),
             "--in-place" | "-i" => in_place = true,
             "--dry-run" => dry_run = true,
-            "--relr" => relr = true,
+            "--relr" => relr = relr.max(Relr::On),
+            "--relr-static" => relr = Relr::Static,
             "--max-sccp-instrs" => {
                 i += 1;
                 max_sccp = parse_max_sccp(&args, i)?;
@@ -137,7 +139,7 @@ fn run_in_place(
     files: &[String],
     dry_run: bool,
     max_sccp: usize,
-    relr: bool,
+    relr: Relr,
 ) -> i32 {
     let mut rc = 0;
     for path in files {
@@ -187,7 +189,7 @@ fn run_stream(
     output: Option<&str>,
     dry_run: bool,
     max_sccp: usize,
-    relr: bool,
+    relr: Relr,
 ) -> i32 {
     let data = match read_input(input) {
         Ok(d) => d,
@@ -270,8 +272,16 @@ fn eprint_usage() {
          \x20 --relr                  Also pack RELATIVE relocations into a\n\
          \x20                         RELR table (DT_RELR) and drop the freed\n\
          \x20                         pages (x86-64/AArch64 ELF PIE). Opt-in:\n\
-         \x20                         the loader must support DT_RELR (glibc\n\
-         \x20                         2.36+, musl 1.2.4+)\n\
+         \x20                         a dynamic PIE or shared library needs a\n\
+         \x20                         dynamic loader that applies DT_RELR\n\
+         \x20                         (glibc 2.36+, musl 1.2.4+). A static-pie\n\
+         \x20                         is refused: see --relr-static\n\
+         \x20 --relr-static           --relr, static-pie input included. A\n\
+         \x20                         static-pie relocates itself with the\n\
+         \x20                         start code of the libc it was linked\n\
+         \x20                         with: use only when that libc applies\n\
+         \x20                         DT_RELR (glibc 2.36+, musl 1.2.4+);\n\
+         \x20                         older ones crash at startup\n\
          \x20 --version, -v           Show version\n\
          \x20 --license, -l           Show license\n\
          \x20 --help, -h              Show this help message\n\

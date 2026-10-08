@@ -2300,7 +2300,8 @@ printf '\n--- RELR packing: --relr ---\n'
 # relr-pointers.c holds ~4200 R_X86_64_RELATIVE relocations (dense and
 # sparse pointer tables in .data.rel.ro and .data). --relr packs them
 # into a RELR table (DT_RELR) inside the old .rela.dyn range:
-# - musl static-pie: every relocation is RELATIVE and .rela.dyn ends the
+# - musl static-pie (--relr-static: Alpine's musl applies DT_RELR in
+#   its start code): every relocation is RELATIVE and .rela.dyn ends the
 #   first (read-only) segment, so its header becomes .relr.dyn, the RELA
 #   tags leave .dynamic and the freed whole pages leave the file;
 # - dynamic PIE: GLOB_DAT and an unaligned RELATIVE relocation stay RELA
@@ -2319,8 +2320,10 @@ for rb in relr-spie relr-pie relr-pie0; do
     rb_in=/work/$rb
     rb_exp=$("$rb_in" 2>&1) || true
     trim "$rb_in" "$rb_in-plain" > /dev/null 2>&1 || true
+    rb_flag=--relr
+    [ "$rb" = relr-spie ] && rb_flag=--relr-static
     rb_rc=0
-    rb_out=$(trim --relr "$rb_in" "$rb_in-relr" 2>&1) || rb_rc=$?
+    rb_out=$(trim "$rb_flag" "$rb_in" "$rb_in-relr" 2>&1) || rb_rc=$?
     echo "$rb_out" | grep 'relr\|Error' || true
     [ "$rb_rc" -eq 0 ] && [ -s "$rb_in-relr" ] && \
         echo "$rb_out" | grep -q 'relr: packed' && \
@@ -2429,20 +2432,34 @@ echo "$rg_out" | grep -q 'relr: packed' && \
     pass "RELR relr-glibcv: needs GLIBC_ABI_DT_RELR already; packed" || \
     fail "RELR relr-glibcv: packing" "$rg_out"
 
-# Refusals: a fixed-address executable, a .dynamic without room for the
-# three RELR tags (--spare-dynamic-tags=0 while RELA entries remain), an
-# unsupported architecture, an already packed image and a glibc-linked
-# PIE without GLIBC_ABI_DT_RELR. Each gets a clear message, and the
-# output is exactly what plain trim writes.
+# Refusals: a fixed-address executable, a relocatable object, a PIE
+# whose DT_RELA tag became DT_REL, one whose DT_RELASZ also covers the
+# PLT relocations (DT_JMPREL; section headers dropped as by sstrip, so
+# none contradicts the tags), a .dynamic without room for the three
+# RELR tags (--spare-dynamic-tags=0 while RELA entries remain), an
+# unsupported architecture, a PE file, an already packed image, a
+# static-pie without --relr-static and a glibc-linked PIE without
+# GLIBC_ABI_DT_RELR. Each gets a clear message, and the output is
+# exactly what plain trim writes.
 gcc -O0 -no-pie -o /work/relr-nopie /tests/relr-pointers.c
+gcc -O0 -c -o /work/relr-obj /tests/relr-pointers.c
+python3 /tests/elf_dyn_tag.py /work/relr-pie /work/relr-rel retag 7 17
+python3 /tests/elf_dyn_tag.py /work/relr-pie /work/relr-jmprel grow 8 2 noshdr
 gcc -O0 -DWITH_UNALIGNED -Wl,--spare-dynamic-tags=0 \
     -o /work/relr-full /tests/relr-pointers.c
 clang-19 --target=riscv64-linux-gnu -march=rv64gc -nostdlib -static \
     -fuse-ld=lld -o /work/relr-riscv /tests/riscv-hello.c 2>/dev/null
-for rr in relr-nopie:'not position-independent' \
+clang-19 --target=x86_64-w64-mingw32 -O0 -fuse-ld=lld \
+    -o /work/relr-pe.exe /tests/hello.c 2>/dev/null
+for rr in relr-nopie:'not position-independent (ET_EXEC' \
+          relr-obj:'not position-independent (ET_REL' \
+          relr-rel:'has DT_REL relocations' \
+          relr-jmprel:'the PLT relocations (DT_JMPREL) lie inside' \
           relr-full:'no room in .dynamic' \
           relr-riscv:'unsupported architecture RISC-V' \
+          relr-pe.exe:'not an ELF file' \
           relr-spie-relr:'already has DT_RELR' \
+          relr-spie:'static-pie (ET_DYN without PT_INTERP)' \
           relr-glibc:'linked against glibc (libc.so.6)'; do
     rr_bin=/work/${rr%%:*}
     rr_why=${rr#*:}
@@ -2454,6 +2471,56 @@ for rr in relr-nopie:'not position-independent' \
         pass "RELR refusal ${rr%%:*}: $rr_why; output unchanged" || \
         fail "RELR refusal ${rr%%:*}" "$rr_out"
 done
+
+# Overlay data after the last section and header table: the relocations
+# are packed in place, but nothing may move in the file.
+cp /work/relr-spie /work/relr-ovl
+printf 'TRIM-OVERLAY-DATA' >> /work/relr-ovl
+ro_out=$(trim --relr-static /work/relr-ovl /work/relr-ovl-r 2>&1) || true
+echo "$ro_out" | grep 'relr\|Error' || true
+ro_got=$(/work/relr-ovl-r 2>&1) || true
+echo "$ro_out" | grep -q 'relr: packed' && \
+    echo "$ro_out" | grep -q 'bytes of overlay data follow' && \
+    [ "$(tail -c 17 /work/relr-ovl-r)" = TRIM-OVERLAY-DATA ] && \
+    [ "$ro_got" = "$(/work/relr-spie 2>&1)" ] && \
+    pass "RELR relr-ovl: overlay kept in place (packed, nothing drained)" || \
+    fail "RELR relr-ovl: overlay" "$ro_out"
+
+# --dry-run --relr reports the packing and writes nothing.
+cp /work/relr-pie /work/relr-dry
+rd_out=$(trim --dry-run --relr /work/relr-dry /work/relr-dry-out 2>&1) || true
+rd_ip=$(trim --dry-run --relr -i /work/relr-dry 2>&1) || true
+echo "$rd_out" | grep -q 'relr: packed' && \
+    echo "$rd_ip" | grep -q 'relr: packed' && \
+    cmp -s /work/relr-pie /work/relr-dry && [ ! -e /work/relr-dry-out ] && \
+    pass "RELR --dry-run --relr: packing reported, nothing written" || \
+    fail "RELR --dry-run --relr" "$rd_out"
+
+# AArch64 static-pie without libc: its own start code applies DT_RELA
+# and DT_RELR (relr-aarch64.c). --relr refuses it; --relr-static packs
+# it, and the packed image runs exactly like the original under QEMU.
+clang-19 --target=aarch64-linux-gnu -fPIE -static-pie -nostdlib -O1 \
+    -fuse-ld=lld -o /work/relr-a64 /tests/relr-aarch64.c
+ra_exp=$(qemu-aarch64 /work/relr-a64 2>&1) || true
+trim /work/relr-a64 /work/relr-a64-plain > /dev/null 2>&1 || true
+ra_out=$(trim --relr /work/relr-a64 /work/relr-a64-r 2>&1) || true
+echo "$ra_out" | grep -q 'relr: refused: static-pie' && \
+    cmp -s /work/relr-a64-plain /work/relr-a64-r && \
+    pass "RELR relr-a64: --relr refuses an AArch64 static-pie" || \
+    fail "RELR relr-a64: refusal" "$ra_out"
+ra_out=$(trim --relr-static /work/relr-a64 /work/relr-a64-rs 2>&1) || true
+echo "$ra_out" | grep 'relr\|Error' || true
+ra_got=$(qemu-aarch64 /work/relr-a64-rs 2>&1) || true
+echo "$ra_exp" | grep -q '^relr-a64: ok$' && \
+    echo "$ra_out" | grep -q 'relr: packed' && \
+    readelf -dW /work/relr-a64-rs | grep -q '(RELR) ' && \
+    [ "$ra_got" = "$ra_exp" ] && \
+    pass "RELR relr-a64: --relr-static packed it; QEMU output identical" || \
+    fail "RELR relr-a64: --relr-static" "got: $ra_got / $ra_out"
+
+trim --help 2>&1 | grep -q -- '--relr-static ' && \
+    pass "RELR: --help documents --relr-static" || \
+    fail "RELR: --help" "no --relr-static entry"
 rm -f /work/relr-*
 
 # =============================================
