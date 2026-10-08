@@ -63,8 +63,37 @@ pub fn x86_effects(raw: &[u8], addr: u64) -> Vec<SsaEffect> {
     extract_x86_effects(&instr)
 }
 
-/// Dispatch x86 instruction to the appropriate effect extractor.
+/// Extract x86 effects, clobbering FLAGS for any instruction that
+/// writes flags without a modeled compare (e.g. `dec`, `bt`, an ALU
+/// op on memory), so a branch never reads a stale compare result.
 fn extract_x86_effects(
+    instr: &iced_x86::Instruction,
+) -> Vec<SsaEffect> {
+    let mut effects = extract_x86_reg_effects(instr);
+    if instr.rflags_modified() != 0 && !defines_flags(&effects) {
+        effects.push(SsaEffect::Clobber(FLAGS_REG));
+    }
+    effects
+}
+
+/// True if the effects already set or clobber FLAGS.
+fn defines_flags(effects: &[SsaEffect]) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            SsaEffect::CmpReg(..)
+                | SsaEffect::CmpImm(..)
+                | SsaEffect::TestReg(..)
+                | SsaEffect::TestImm(..)
+                | SsaEffect::Clobber(FLAGS_REG)
+        )
+    })
+}
+
+/// Dispatch x86 instruction to the appropriate effect extractor.
+/// Anything not modeled (including `imul`, `push` and `pop`, which
+/// write implicit registers) clobbers every register it writes.
+fn extract_x86_reg_effects(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
     use iced_x86::Mnemonic::*;
@@ -74,37 +103,81 @@ fn extract_x86_effects(
         Xor if is_self_xor(instr) => extract_self_xor(instr),
         Add | Sub | And | Or | Xor => extract_alu(instr),
         Shl | Shr | Sar => extract_shift(instr),
-        Imul => extract_imul(instr),
         Cmp => extract_cmp(instr),
         Test => extract_test(instr),
-        Push | Pop | Call | Ret | Nop => vec![SsaEffect::Nop],
+        Call | Ret | Nop => vec![SsaEffect::Nop],
         _ => extract_clobbers(instr),
     }
 }
 
-/// Extract SSA effects from a MOV instruction.
+/// Map a full-width x86 destination to its register ID: a 64-bit
+/// GPR, or a 32-bit GPR (flagged `true`) whose write zero-extends.
+/// 8/16-bit writes merge into the old value and are not modeled.
+fn x86_full_dst(
+    reg: iced_x86::Register,
+) -> Option<(RegId, bool)> {
+    let id = x86_reg_id(reg)?;
+    if reg.is_gpr64() {
+        Some((id, false))
+    } else if reg.is_gpr32() {
+        Some((id, true))
+    } else {
+        None
+    }
+}
+
+/// Append the implicit zero-extension of a 32-bit register write.
+fn push_zext32(effects: &mut Vec<SsaEffect>, dst: RegId, is32: bool) {
+    if is32 {
+        effects.push(SsaEffect::BinOpImm(
+            dst, BinOp::And, dst, 0xFFFF_FFFF,
+        ));
+    }
+}
+
+/// Map a compare/test operand to its register ID. AH/BH/CH/DH are
+/// bits 8..15 of their parent, so comparing them as the parent's
+/// low bits would be wrong; they are not modeled.
+fn x86_cmp_reg(reg: iced_x86::Register) -> Option<RegId> {
+    use iced_x86::Register as R;
+    match reg {
+        R::AH | R::BH | R::CH | R::DH => None,
+        _ => x86_reg_id(reg),
+    }
+}
+
+/// Extract SSA effects from a MOV instruction. Only 32/64-bit
+/// register destinations are modeled; narrower ones are clobbered.
 fn extract_mov(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
     use iced_x86::OpKind;
-    if instr.op_count() < 2 {
+    if instr.op_count() < 2
+        || instr.op_kind(0) != OpKind::Register
+    {
         return vec![SsaEffect::Nop];
     }
-    let dst = instr.op_kind(0);
-    let src = instr.op_kind(1);
-    let dst_reg = match dst {
-        OpKind::Register => x86_reg_id(instr.op_register(0)),
-        _ => return vec![SsaEffect::Nop],
-    };
-    let dst_reg = match dst_reg {
-        Some(r) => r,
-        None => return vec![SsaEffect::Nop],
-    };
-    match src {
+    let (dst_reg, is32) =
+        match x86_full_dst(instr.op_register(0)) {
+            Some(d) => d,
+            None => return extract_clobbers(instr),
+        };
+    let mut effects = vec![mov_src_effect(instr, dst_reg)];
+    push_zext32(&mut effects, dst_reg, is32);
+    effects
+}
+
+/// Effect of a MOV source operand on its register destination.
+fn mov_src_effect(
+    instr: &iced_x86::Instruction,
+    dst_reg: RegId,
+) -> SsaEffect {
+    use iced_x86::OpKind;
+    match instr.op_kind(1) {
         OpKind::Register => {
             match x86_reg_id(instr.op_register(1)) {
-                Some(s) => vec![SsaEffect::MovReg(dst_reg, s)],
-                None => vec![SsaEffect::Clobber(dst_reg)],
+                Some(s) => SsaEffect::MovReg(dst_reg, s),
+                None => SsaEffect::Clobber(dst_reg),
             }
         }
         OpKind::Immediate8
@@ -116,9 +189,9 @@ fn extract_mov(
         | OpKind::Immediate8to64
         | OpKind::Immediate32to64 => {
             let imm = instr.immediate(1) as i64;
-            vec![SsaEffect::MovConst(dst_reg, imm)]
+            SsaEffect::MovConst(dst_reg, imm)
         }
-        _ => vec![SsaEffect::Clobber(dst_reg)],
+        _ => SsaEffect::Clobber(dst_reg),
     }
 }
 
@@ -134,11 +207,15 @@ fn extract_lea(
 }
 
 /// Extract SSA effects from ALU instructions (ADD, SUB, AND, OR, XOR).
+/// Only 32/64-bit register destinations are modeled; a memory
+/// destination leaves registers alone, a narrower one is clobbered.
 fn extract_alu(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
     use iced_x86::{Mnemonic::*, OpKind};
-    if instr.op_count() < 2 {
+    if instr.op_count() < 2
+        || instr.op_kind(0) != OpKind::Register
+    {
         return vec![SsaEffect::Nop];
     }
     let op = match instr.mnemonic() {
@@ -149,9 +226,9 @@ fn extract_alu(
         Xor => BinOp::Xor,
         _ => return vec![SsaEffect::Nop],
     };
-    let dst = match x86_reg_id(instr.op_register(0)) {
-        Some(r) => r,
-        None => return vec![SsaEffect::Nop],
+    let (dst, is32) = match x86_full_dst(instr.op_register(0)) {
+        Some(d) => d,
+        None => return extract_clobbers(instr),
     };
     let mut effects = Vec::new();
     match instr.op_kind(1) {
@@ -178,26 +255,13 @@ fn extract_alu(
         }
         _ => effects.push(SsaEffect::Clobber(dst)),
     }
+    push_zext32(&mut effects, dst, is32);
     effects.push(SsaEffect::Clobber(FLAGS_REG));
     effects
 }
 
 /// Extract SSA effects from shift instructions (SHL, SHR, SAR).
 fn extract_shift(
-    instr: &iced_x86::Instruction,
-) -> Vec<SsaEffect> {
-    let dst = match x86_reg_id(instr.op_register(0)) {
-        Some(r) => r,
-        None => return vec![SsaEffect::Nop],
-    };
-    vec![
-        SsaEffect::Clobber(dst),
-        SsaEffect::Clobber(FLAGS_REG),
-    ]
-}
-
-/// Extract SSA effects from IMUL (clobber destination and flags).
-fn extract_imul(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
     let dst = match x86_reg_id(instr.op_register(0)) {
@@ -219,12 +283,12 @@ fn extract_cmp(
         return vec![SsaEffect::Nop];
     }
     let a = match instr.op_kind(0) {
-        OpKind::Register => x86_reg_id(instr.op_register(0)),
+        OpKind::Register => x86_cmp_reg(instr.op_register(0)),
         _ => None,
     };
     match instr.op_kind(1) {
         OpKind::Register => {
-            let b = x86_reg_id(instr.op_register(1));
+            let b = x86_cmp_reg(instr.op_register(1));
             match (a, b) {
                 (Some(ar), Some(br)) => {
                     vec![SsaEffect::CmpReg(ar, br)]
@@ -259,12 +323,12 @@ fn extract_test(
         return vec![SsaEffect::Nop];
     }
     let a = match instr.op_kind(0) {
-        OpKind::Register => x86_reg_id(instr.op_register(0)),
+        OpKind::Register => x86_cmp_reg(instr.op_register(0)),
         _ => None,
     };
     match instr.op_kind(1) {
         OpKind::Register => {
-            let b = x86_reg_id(instr.op_register(1));
+            let b = x86_cmp_reg(instr.op_register(1));
             match (a, b) {
                 (Some(ar), Some(br)) => {
                     vec![SsaEffect::TestReg(ar, br)]
@@ -297,16 +361,17 @@ fn is_self_xor(instr: &iced_x86::Instruction) -> bool {
         && instr.op_register(0) == instr.op_register(1)
 }
 
-/// Self-XOR produces MovConst(reg, 0) and clobbers FLAGS.
+/// Self-XOR of a 32/64-bit register produces MovConst(reg, 0) and
+/// clobbers FLAGS; a narrower one only zeroes part of the register.
 fn extract_self_xor(
     instr: &iced_x86::Instruction,
 ) -> Vec<SsaEffect> {
-    match x86_reg_id(instr.op_register(0)) {
-        Some(r) => vec![
+    match x86_full_dst(instr.op_register(0)) {
+        Some((r, _)) => vec![
             SsaEffect::MovConst(r, 0),
             SsaEffect::Clobber(FLAGS_REG),
         ],
-        None => vec![SsaEffect::Nop],
+        None => extract_clobbers(instr),
     }
 }
 
@@ -454,6 +519,120 @@ pub fn caller_saved(arch: Arch) -> &'static [RegId] {
         Arch::Mips32 | Arch::Mips64 => MIPS_CALLER_SAVED,
         Arch::S390x => S390X_CALLER_SAVED,
         Arch::LoongArch64 => LOONGARCH_CALLER_SAVED,
+    }
+}
+
+// ===== Conditional branch conditions =====
+
+/// Condition tested by a conditional branch, or None when it is not
+/// decoded. Outside x86 only equality branches are decoded, and only
+/// those whose FLAGS value comes from the matching compare effect.
+pub fn branch_cond(
+    raw: &[u8],
+    arch: Arch,
+    big_endian: bool,
+) -> Option<CondCode> {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => {
+            x86_branch_cond(raw).map(|b| b.cc)
+        }
+        Arch::Aarch64 => a64_branch_cond(word_le(raw)?),
+        Arch::Arm32 => arm32_branch_cond(word_le(raw)?),
+        Arch::RiscV64 | Arch::RiscV32 => {
+            rv_branch_cond(raw)
+        }
+        Arch::Mips32 | Arch::Mips64 => {
+            mips_branch_cond(raw, big_endian)
+        }
+        Arch::S390x => s390x_branch_cond(raw),
+        Arch::LoongArch64 => la_branch_cond(word_le(raw)?),
+    }
+}
+
+/// Read a little-endian 32-bit instruction word.
+fn word_le(raw: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(raw.get(..4)?.try_into().ok()?))
+}
+
+/// Map an "equal"/"not equal" selector to a CondCode.
+fn eq_ne(is_eq: bool) -> CondCode {
+    if is_eq { CondCode::Eq } else { CondCode::Ne }
+}
+
+/// AArch64 B.EQ / B.NE (CBZ/CBNZ/TBZ do not read FLAGS).
+fn a64_branch_cond(w: u32) -> Option<CondCode> {
+    if w & 0xFF00_0010 != 0x5400_0000 {
+        return None;
+    }
+    match w & 0xF {
+        0 | 1 => Some(eq_ne(w & 0xF == 0)),
+        _ => None,
+    }
+}
+
+/// ARM32 BEQ / BNE (A32 B encoding, not BL).
+fn arm32_branch_cond(w: u32) -> Option<CondCode> {
+    if (w >> 24) & 0xF != 0xA {
+        return None;
+    }
+    match w >> 28 {
+        0 | 1 => Some(eq_ne(w >> 28 == 0)),
+        _ => None,
+    }
+}
+
+/// RISC-V BEQ / BNE; `rv_branch` sets FLAGS from the same operands.
+/// Compressed C.BEQZ/C.BNEZ set no FLAGS effect and are not decoded.
+fn rv_branch_cond(raw: &[u8]) -> Option<CondCode> {
+    if raw.first()? & 0x03 != 0x03 {
+        return None;
+    }
+    let w = word_le(raw)?;
+    if w & 0x7F != 0x63 {
+        return None;
+    }
+    match (w >> 12) & 0x7 {
+        0 | 1 => Some(eq_ne((w >> 12) & 0x7 == 0)),
+        _ => None,
+    }
+}
+
+/// MIPS BEQ / BNE; `mips_branch` sets FLAGS from the same operands.
+fn mips_branch_cond(
+    raw: &[u8],
+    big_endian: bool,
+) -> Option<CondCode> {
+    let bytes: [u8; 4] = raw.get(..4)?.try_into().ok()?;
+    let w = if big_endian {
+        u32::from_be_bytes(bytes)
+    } else {
+        u32::from_le_bytes(bytes)
+    };
+    match w >> 26 {
+        0x04 | 0x05 => Some(eq_ne(w >> 26 == 0x04)),
+        _ => None,
+    }
+}
+
+/// LoongArch BEQ/BNE/BEQZ/BNEZ; `la_branch_*` set FLAGS from them.
+fn la_branch_cond(w: u32) -> Option<CondCode> {
+    match w >> 26 {
+        0x16 | 0x10 => Some(CondCode::Eq),
+        0x17 | 0x11 => Some(CondCode::Ne),
+        _ => None,
+    }
+}
+
+/// s390x BRC/BRCL with mask 8 (equal) or 7 (not equal).
+fn s390x_branch_cond(raw: &[u8]) -> Option<CondCode> {
+    let is_brc = raw.len() == 4 && raw[0] == 0xA7;
+    let is_brcl = raw.len() == 6 && raw[0] == 0xC0;
+    if !(is_brc || is_brcl) || raw[1] & 0x0F != 0x04 {
+        return None;
+    }
+    match raw[1] >> 4 {
+        8 | 7 => Some(eq_ne(raw[1] >> 4 == 8)),
+        _ => None,
     }
 }
 

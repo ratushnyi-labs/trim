@@ -2,19 +2,20 @@
 //!
 //! Performs a worklist-driven forward dataflow analysis over a function's
 //! CFG, tracking register values as lattice elements (Bot/Const/Top).
-//! When a conditional branch's flags register resolves to a constant,
-//! only the taken edge is propagated, leaving the other successor
-//! unreachable. Unreachable blocks are reported as dead branches.
+//! When an equality branch (EQ/NE) reads a constant flags value, only
+//! the edge its condition selects is propagated, leaving the other
+//! successor unreachable. Unreachable blocks are reported as dead
+//! branches.
 
-use crate::analysis::cfg::{DeadBlock, FuncCfg};
+use crate::analysis::cfg::{BasicBlock, DeadBlock, FuncCfg};
 use crate::analysis::dominance::compute_dom_tree;
-use crate::analysis::lattice::{eval_binop, Value};
+use crate::analysis::lattice::{eval_binop, CondCode, Value};
 use crate::analysis::regstate::{
-    arch_effects, caller_saved, SsaEffect, FLAGS_REG,
-    REG_COUNT,
+    arch_effects, branch_cond, caller_saved, SsaEffect,
+    FLAGS_REG, REG_COUNT,
 };
 use crate::types::{Arch, DecodedInstr, FlowType, FuncMap};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Default instruction limit for SCCP analysis.
 pub const DEFAULT_MAX_INSTRS: usize = 10_000;
@@ -45,15 +46,85 @@ pub fn sccp_dead_blocks(
     }
     let block_effects =
         build_block_effects(cfg, &func_instrs, arch, big_endian);
+    let terms =
+        build_cond_terms(cfg, &func_instrs, arch, big_endian);
     let n = cfg.blocks.len();
     let succs: Vec<Vec<usize>> =
         cfg.blocks.iter().map(|b| b.successors.clone()).collect();
     let dom = compute_dom_tree(&succs, cfg.entry_block, n);
     let mut state = SccpState::new(n);
     state.mark_edge_exec(cfg.entry_block);
-    run_sccp(&mut state, cfg, &block_effects, &succs, &dom);
+    let flow = SccpFlow { succs: &succs, terms: &terms };
+    if !run_sccp(&mut state, cfg, &block_effects, &flow, &dom) {
+        // Not converged: unvisited blocks are not proven dead.
+        return SccpResult { dead: Vec::new(), skipped: true, instr_count: count };
+    }
     let dead = find_sccp_dead(cfg, &state, arch);
     SccpResult { dead, skipped: false, instr_count: count }
+}
+
+/// A block ending in a two-way conditional branch with a decoded
+/// condition: the successor block when taken and when not taken.
+#[derive(Debug, Clone, Copy)]
+struct CondTerm {
+    cc: CondCode,
+    taken: usize,
+    fallthrough: usize,
+}
+
+/// Successor lists plus the foldable conditional terminators.
+struct SccpFlow<'a> {
+    succs: &'a [Vec<usize>],
+    terms: &'a [Option<CondTerm>],
+}
+
+/// Find the foldable conditional terminator of every block. Blocks
+/// ending in anything else (including indirect jumps) are never
+/// folded and keep all their successors.
+fn build_cond_terms(
+    cfg: &FuncCfg,
+    instrs: &[&DecodedInstr],
+    arch: Arch,
+    big_endian: bool,
+) -> Vec<Option<CondTerm>> {
+    let by_addr: HashMap<u64, usize> = cfg
+        .blocks
+        .iter()
+        .map(|b| (b.start_addr, b.id))
+        .collect();
+    cfg.blocks
+        .iter()
+        .map(|b| cond_term(b, instrs, &by_addr, arch, big_endian))
+        .collect()
+}
+
+/// Decode a block's conditional terminator into its condition and
+/// its taken/fall-through successors, if all three are known.
+fn cond_term(
+    block: &BasicBlock,
+    instrs: &[&DecodedInstr],
+    by_addr: &HashMap<u64, usize>,
+    arch: Arch,
+    big_endian: bool,
+) -> Option<CondTerm> {
+    let last = instrs.iter().rev().find(|i| {
+        i.addr >= block.start_addr && i.addr < block.end_addr
+    })?;
+    if last.flow != FlowType::ConditionalBranch
+        || block.successors.len() != 2
+    {
+        return None;
+    }
+    let ft_addr = last.addr + last.len as u64;
+    let fallthrough = *by_addr.get(&ft_addr)?;
+    let mut taken_ids =
+        last.targets.iter().filter_map(|t| by_addr.get(t));
+    let taken = *taken_ids.next()?;
+    let cc = branch_cond(&last.raw, arch, big_endian)?;
+    let unique = taken_ids.next().is_none() && taken != fallthrough;
+    let matches = block.successors.contains(&taken)
+        && block.successors.contains(&fallthrough);
+    (unique && matches).then_some(CondTerm { cc, taken, fallthrough })
 }
 
 /// Collect all instructions that fall within the function's address range.
@@ -96,14 +167,15 @@ fn build_block_effects(
         .collect()
 }
 
-/// Append effects for one instruction (call sites clobber caller-saved regs).
+/// Append effects for one instruction (call sites, direct or indirect,
+/// clobber caller-saved regs).
 fn add_instr_effects(
     effects: &mut Vec<SsaEffect>,
     instr: &DecodedInstr,
     arch: Arch,
     big_endian: bool,
 ) {
-    if instr.is_call {
+    if instr.is_call || instr.flow == FlowType::IndirectCall {
         for &r in caller_saved(arch) {
             effects.push(SsaEffect::Clobber(r));
         }
@@ -146,13 +218,14 @@ impl SccpState {
 }
 
 /// Main SCCP worklist loop: propagate register values through the CFG.
+/// Returns false if the iteration limit stopped it before a fixpoint.
 fn run_sccp(
     state: &mut SccpState,
     cfg: &FuncCfg,
     block_effects: &[Vec<SsaEffect>],
-    succs: &[Vec<usize>],
+    flow: &SccpFlow,
     _dom: &crate::analysis::dominance::DomTree,
-) {
+) -> bool {
     let n = cfg.blocks.len();
     init_entry_regs(state, cfg.entry_block);
     let mut worklist: VecDeque<usize> = VecDeque::new();
@@ -162,16 +235,15 @@ fn run_sccp(
     while let Some(b) = worklist.pop_front() {
         iterations += 1;
         if iterations > max_iter {
-            break;
+            return false;
         }
         if !state.is_exec(b) {
             continue;
         }
         let new_vals = eval_block(state, b, block_effects);
-        propagate_succs(
-            state, cfg, b, &new_vals, succs, &mut worklist,
-        );
+        propagate_succs(state, b, &new_vals, flow, &mut worklist);
     }
+    true
 }
 
 /// Initialize entry block registers to Top (unknown incoming values).
@@ -295,62 +367,25 @@ fn apply_test_imm(vals: &mut [Value], a: u8, imm: i64) {
 /// Propagate register values to successor blocks, respecting branch resolution.
 fn propagate_succs(
     state: &mut SccpState,
-    cfg: &FuncCfg,
     b: usize,
     vals: &[Value],
-    succs: &[Vec<usize>],
-    worklist: &mut VecDeque<usize>,
-) {
-    let term_flow = block_terminator_flow(cfg, b);
-    match term_flow {
-        Some(FlowType::ConditionalBranch) => {
-            propagate_cond(
-                state, cfg, b, vals, succs, worklist,
-            );
-        }
-        _ => {
-            propagate_all(state, b, vals, succs, worklist);
-        }
-    }
-}
-
-/// Determine the terminator flow type for a block.
-fn block_terminator_flow(
-    cfg: &FuncCfg,
-    b: usize,
-) -> Option<FlowType> {
-    let block = &cfg.blocks[b];
-    if block.successors.is_empty() {
-        return Some(FlowType::Return);
-    }
-    if block.successors.len() == 1 {
-        return Some(FlowType::UnconditionalBranch);
-    }
-    Some(FlowType::ConditionalBranch)
-}
-
-/// Propagate along a conditional branch, resolving direction from FLAGS.
-fn propagate_cond(
-    state: &mut SccpState,
-    _cfg: &FuncCfg,
-    b: usize,
-    vals: &[Value],
-    succs: &[Vec<usize>],
+    flow: &SccpFlow,
     worklist: &mut VecDeque<usize>,
 ) {
     let flags = &vals[FLAGS_REG as usize];
-    let resolved = resolve_branch(flags);
-    match resolved {
-        BranchResult::AlwaysTaken => {
-            propagate_taken(state, b, vals, succs, worklist);
+    let only = flow.terms[b].and_then(|t| {
+        match resolve_branch(t.cc, flags) {
+            BranchResult::AlwaysTaken => Some(t.taken),
+            BranchResult::NeverTaken => Some(t.fallthrough),
+            BranchResult::Unknown => None,
         }
-        BranchResult::NeverTaken => {
-            propagate_fallthrough(
-                state, b, vals, succs, worklist,
-            );
-        }
-        BranchResult::Unknown => {
-            propagate_all(state, b, vals, succs, worklist);
+    });
+    match only {
+        Some(s) => merge_and_enqueue(state, b, s, vals, worklist),
+        None => {
+            for &s in &flow.succs[b] {
+                merge_and_enqueue(state, b, s, vals, worklist);
+            }
         }
     }
 }
@@ -362,59 +397,34 @@ enum BranchResult {
     Unknown,
 }
 
-/// Resolve branch direction from FLAGS: zero means not-taken, nonzero means taken.
-fn resolve_branch(flags: &Value) -> BranchResult {
+/// Resolve a branch from its condition and FLAGS. Only EQ/NE are
+/// folded: FLAGS holds the compare difference (or test AND) without
+/// the operand width or carry/overflow that ordered conditions need.
+fn resolve_branch(cc: CondCode, flags: &Value) -> BranchResult {
+    let zero = match flags_zero(flags) {
+        Some(z) => z,
+        None => return BranchResult::Unknown,
+    };
+    let taken = match cc {
+        CondCode::Eq => zero,
+        CondCode::Ne => !zero,
+        _ => return BranchResult::Unknown,
+    };
+    if taken {
+        BranchResult::AlwaysTaken
+    } else {
+        BranchResult::NeverTaken
+    }
+}
+
+/// Zero flag of a compare/test result whose width is unknown. Zero is
+/// zero at every width; a nonzero low byte is nonzero at every width
+/// (8 bits is the narrowest compare). Anything else stays unknown.
+fn flags_zero(flags: &Value) -> Option<bool> {
     match flags {
-        Value::Bot => BranchResult::Unknown,
-        Value::Top => BranchResult::Unknown,
-        Value::Const(v) => {
-            if *v == 0 {
-                BranchResult::NeverTaken
-            } else {
-                BranchResult::AlwaysTaken
-            }
-        }
-    }
-}
-
-/// Propagate values only to the taken branch target.
-fn propagate_taken(
-    state: &mut SccpState,
-    b: usize,
-    vals: &[Value],
-    succs: &[Vec<usize>],
-    worklist: &mut VecDeque<usize>,
-) {
-    if succs[b].len() >= 2 {
-        let tgt = succs[b][1];
-        merge_and_enqueue(state, b, tgt, vals, worklist);
-    }
-}
-
-/// Propagate values only to the fallthrough successor.
-fn propagate_fallthrough(
-    state: &mut SccpState,
-    b: usize,
-    vals: &[Value],
-    succs: &[Vec<usize>],
-    worklist: &mut VecDeque<usize>,
-) {
-    if !succs[b].is_empty() {
-        let ft = succs[b][0];
-        merge_and_enqueue(state, b, ft, vals, worklist);
-    }
-}
-
-/// Propagate values to all successors (unknown branch direction).
-fn propagate_all(
-    state: &mut SccpState,
-    b: usize,
-    vals: &[Value],
-    succs: &[Vec<usize>],
-    worklist: &mut VecDeque<usize>,
-) {
-    for &s in &succs[b] {
-        merge_and_enqueue(state, b, s, vals, worklist);
+        Value::Const(0) => Some(true),
+        Value::Const(v) if v & 0xFF != 0 => Some(false),
+        _ => None,
     }
 }
 

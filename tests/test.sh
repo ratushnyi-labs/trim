@@ -471,6 +471,42 @@ echo "$output" | grep -q 'result: 25' && \
     fail "BigDead: file size" "not reduced ($orig_sz_big -> $new_sz_big)"
 
 # =============================================
+# Static printf: constant-flag branch folding
+# =============================================
+printf '\n--- Static printf: constant-flag branch folding ---\n'
+# musl's printf core compares constant operands with `jl` on entry.
+# Reading any nonzero flags value as "taken" flagged the whole format
+# loop dead, so printf with format arguments printed nothing. The
+# fixture's probes each isolate a construct that must not be folded.
+gcc -static -O2 -o /work/test-sprintf /tests/static-printf.c
+printf 'Built: test-sprintf (%d bytes)\n' \
+    "$(stat -c%s /work/test-sprintf)"
+
+sp_expected=$(/work/test-sprintf 2>&1)
+echo "$sp_expected" | grep -q '^fmt: 42 hello ff' && \
+    echo "$sp_expected" | grep -q '^probes: 1 1 1 1 1 1 1 1 1$' && \
+    pass "StaticPrintf: original output correct" || \
+    fail "StaticPrintf: original" "got: $sp_expected"
+
+sp_dry=$(trim --dry-run /work/test-sprintf 2>&1)
+echo "$sp_dry" | grep -q 'dead branch:.*(in printf_core)' && \
+    fail "StaticPrintf: false positive" "printf_core blocks flagged dead" || \
+    pass "StaticPrintf: printf_core kept"
+
+echo "$sp_dry" | grep -q 'dead branch:.*(in probe_je_zero)' && \
+    pass "StaticPrintf: constant equality branch still folded" || \
+    fail "StaticPrintf: folding" "probe_je_zero dead path not found"
+
+trim --in-place /work/test-sprintf 2>&1 | grep 'reassembled' || true
+sp_out=$(/work/test-sprintf 2>&1) && \
+    pass "StaticPrintf: patched binary executes" || \
+    fail "StaticPrintf: execution" "crashed"
+
+[ "$sp_out" = "$sp_expected" ] && \
+    pass "StaticPrintf: patched output matches original" || \
+    fail "StaticPrintf: output" "got: $sp_out"
+
+# =============================================
 # NativeAOT layout: managed code in __managedcode / __unbox
 # =============================================
 printf '\n--- NativeAOT layout: managed code sections ---\n'
