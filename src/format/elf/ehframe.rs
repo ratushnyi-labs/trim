@@ -632,7 +632,7 @@ pub fn patch_eh_frame(
         return;
     }
     let cx = Ctx::new(data, intervals, ts, te);
-    let mut gone = HashSet::new();
+    let mut fdes = FdeSets::default();
     if let Some(sec) = sections.iter().find(|s| s.name == ".eh_frame") {
         for rec in parse_eh_frame(data, sec, &cx) {
             match rec {
@@ -643,47 +643,170 @@ pub fn patch_eh_frame(
                     }
                 }
                 Record::Fde(f) => {
+                    if f.begin != 0 && !fde_dead(&f, &cx) {
+                        fdes.live.insert(f.rec_vaddr);
+                    }
                     if patch_fde(data, &f, &cx) {
-                        gone.insert(f.rec_vaddr);
+                        fdes.gone.insert(f.rec_vaddr);
                     }
                 }
             }
         }
     }
     if let Some(sec) = sections.iter().find(|s| s.name == ".eh_frame_hdr") {
-        patch_hdr(data, sec, &gone, &cx);
+        patch_hdr(data, sec, &fdes, &cx);
     }
+}
+
+/// Record addresses of the FDEs `patch_eh_frame` decoded, by fate.
+#[derive(Default)]
+struct FdeSets {
+    /// FDEs neutralised (their code was removed).
+    gone: HashSet<u64>,
+    /// FDEs describing code that stays.
+    live: HashSet<u64>,
+}
+
+impl FdeSets {
+    /// True if the search-table row `(loc, fde)` stays: its FDE was not
+    /// neutralised, and it describes live code or its code is not in a
+    /// removed range (rows of FDEs that were not decoded).
+    fn keeps(&self, loc: u64, fde: u64, cx: &Ctx) -> bool {
+        !self.gone.contains(&fde)
+            && (self.live.contains(&fde) || !in_dead_range(loc, cx.intervals))
+    }
+}
+
+/// True if the whole code range of `f` lies in one removed interval.
+/// Its start alone is not enough: absorbing the padding next to a
+/// removed function can swallow the leading NOPs of a live one.
+fn fde_dead(f: &Fde, cx: &Ctx) -> bool {
+    let end = f.begin.saturating_add(f.pc_range.raw);
+    cx.intervals
+        .iter()
+        .any(|&(s, e)| s <= f.begin && f.begin < e && end <= e)
 }
 
 /// Patch one FDE: a removed function gets `pc_range = 0` (its pc_begin
 /// still mapped consistently); a live one gets its new start, length,
-/// LSDA and CFA row spacing. All-or-nothing; returns true when the FDE
-/// was neutralised.
+/// LSDA and CFA row spacing. All-or-nothing: nothing is written unless
+/// every field can be encoded (`unwind_safe_intervals` keeps whole the
+/// live functions whose CFA program cannot be re-spaced). Returns true
+/// when the FDE was neutralised.
 fn patch_fde(data: &mut [u8], f: &Fde, cx: &Ctx) -> bool {
     if f.begin == 0 {
         return false; // discarded by the linker
     }
-    let dead = in_dead_range(f.begin, cx.intervals);
-    let new_begin = cx.map(f.begin);
-    let old_range = f.pc_range.raw;
-    let new_range = if dead {
-        0
-    } else {
-        let end = f.begin.wrapping_add(old_range);
-        cx.map_end(end).wrapping_sub(new_begin).min(old_range)
-    };
+    let dead = fde_dead(f, cx);
     let mut st = Vec::new();
-    let ok = plan_ptr(&mut st, &f.pc_begin, new_begin, None, cx)
-        && plan_value(&mut st, &f.pc_range, new_range, cx)
+    let body = if dead {
+        plan_value(&mut st, &f.pc_range, 0, cx)
+    } else {
+        plan_shrink(data, f, cx).map(|s| st.extend(s)).is_some()
+    };
+    let ok = body
+        && plan_ptr(&mut st, &f.pc_begin, cx.map(f.begin), None, cx)
         && f.lsda.map_or(true, |l| plan_target(&mut st, &l, None, cx));
-    if !ok {
-        return false;
+    if ok {
+        commit(data, &st, cx.be);
     }
-    if !dead && new_range != old_range {
-        st.extend(plan_cfa(data, f, cx).unwrap_or_default());
+    ok && dead
+}
+
+/// Stores giving a live FDE its new `pc_range` and re-spaced CFA
+/// program; empty when its code keeps its length (it only moves).
+/// None if either cannot be encoded.
+fn plan_shrink(data: &[u8], f: &Fde, cx: &Ctx) -> Option<Vec<Store>> {
+    let old_range = f.pc_range.raw;
+    let end = f.begin.wrapping_add(old_range);
+    let new_range =
+        cx.map_end(end).wrapping_sub(cx.map(f.begin)).min(old_range);
+    if new_range == old_range {
+        return Some(Vec::new());
     }
-    commit(data, &st, cx.be);
-    dead
+    let mut st = Vec::new();
+    if !plan_value(&mut st, &f.pc_range, new_range, cx) {
+        return None;
+    }
+    st.extend(plan_cfa(data, f, cx)?);
+    Some(st)
+}
+
+/// The compaction `intervals` narrowed so that every live function's
+/// FDE can follow it. A live function whose range would shrink while
+/// its new `pc_range` or re-spaced CFA program cannot be encoded
+/// (DW_CFA_set_loc, an unknown opcode, a shift that is not a multiple of
+/// the code alignment factor) keeps all its bytes: its range is cut out
+/// of the intervals, so its dead blocks stay and it moves as a whole,
+/// needing only a new `pc_begin`. The pieces left keep a multiple of
+/// `align` bytes. Repeats until no such FDE is left; each round makes at
+/// least one more FDE whole, so it ends.
+pub fn unwind_safe_intervals(
+    data: &[u8],
+    sections: &[Section],
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+    align: u64,
+) -> Vec<(u64, u64)> {
+    let fdes = code_fdes(data, sections);
+    let mut ivs = intervals.to_vec();
+    for _ in 0..=fdes.len() {
+        let stuck = stuck_ranges(data, &fdes, &Ctx::new(data, &ivs, ts, te));
+        if stuck.is_empty() {
+            break;
+        }
+        for r in stuck {
+            ivs = cut_range(&ivs, r, align.max(1));
+        }
+    }
+    ivs
+}
+
+/// The decodable FDEs of `.eh_frame` that describe code (pc_begin not 0).
+fn code_fdes(data: &[u8], sections: &[Section]) -> Vec<Fde> {
+    let sec = match sections.iter().find(|s| s.name == ".eh_frame") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let cx = Ctx::new(data, &[], 0, 0);
+    parse_eh_frame(data, sec, &cx)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fde(f) if f.begin != 0 => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Code ranges `[begin, end)` of the live FDEs among `fdes` that could
+/// not follow the compaction described by `cx`.
+fn stuck_ranges(data: &[u8], fdes: &[Fde], cx: &Ctx) -> Vec<(u64, u64)> {
+    fdes.iter()
+        .filter(|f| !fde_dead(f, cx) && plan_shrink(data, f, cx).is_none())
+        .map(|f| (f.begin, f.begin.saturating_add(f.pc_range.raw)))
+        .collect()
+}
+
+/// Remove `[lo, hi)` from the sorted `intervals`. A piece left on either
+/// side is shortened to a multiple of `align` bytes from the end it
+/// keeps, so it removes less, never more.
+fn cut_range(intervals: &[(u64, u64)], (lo, hi): (u64, u64), align: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(intervals.len() + 1);
+    for &(s, e) in intervals {
+        if e <= lo || s >= hi {
+            out.push((s, e));
+            continue;
+        }
+        if s < lo {
+            out.push((s, s + (lo - s) / align * align));
+        }
+        if hi < e {
+            out.push((e - (e - hi) / align * align, e));
+        }
+    }
+    out.retain(|&(s, e)| s < e);
+    out
 }
 
 /// Re-space the CFA advance instructions of a live function that lost
@@ -768,9 +891,10 @@ fn skip_cfa_op(data: &[u8], p: usize, end: usize) -> Option<usize> {
 type Row = (u64, u64);
 
 /// Patch .eh_frame_hdr: re-point eh_frame_ptr, then rebuild the search
-/// table without neutralised FDEs, re-sorted by new initial location.
-/// Datarel values are relative to the start of .eh_frame_hdr.
-fn patch_hdr(data: &mut [u8], sec: &Section, gone: &HashSet<u64>, cx: &Ctx) {
+/// table without the rows of removed code (see `FdeSets::keeps`),
+/// re-sorted by new initial location. Datarel values are relative to
+/// the start of .eh_frame_hdr.
+fn patch_hdr(data: &mut [u8], sec: &Section, fdes: &FdeSets, cx: &Ctx) {
     let start = sec.offset as usize;
     let end = start.saturating_add(sec.size as usize).min(data.len());
     let h = match data.get(start..start + 4) {
@@ -804,7 +928,7 @@ fn patch_hdr(data: &mut [u8], sec: &Section, gone: &HashSet<u64>, cx: &Ctx) {
             Some(r) => r,
             None => return,
         };
-    let st = plan_table(&rows, &cnt, tbl, tbl_enc, sec, gone, base.1, cx);
+    let st = plan_table(&rows, &cnt, tbl, tbl_enc, sec, fdes, base.1, cx);
     if let Some(st) = st {
         commit(data, &st, cx.be);
     }
@@ -851,16 +975,14 @@ fn plan_table(
     off: usize,
     enc: u8,
     sec: &Section,
-    gone: &HashSet<u64>,
+    fdes: &FdeSets,
     new_base: u64,
     cx: &Ctx,
 ) -> Option<Vec<Store>> {
     let w = fixed_width(enc & PE_FMT, cx.is64)?;
     let mut kept: Vec<Row> = rows
         .iter()
-        .filter(|&&(loc, fde)| {
-            !gone.contains(&fde) && !in_dead_range(loc, cx.intervals)
-        })
+        .filter(|&&(loc, fde)| fdes.keeps(loc, fde, cx))
         .map(|&(loc, fde)| (cx.map(loc), cx.map(fde)))
         .collect();
     kept.sort_unstable();
@@ -1019,4 +1141,390 @@ fn lsda_ranges(data: &[u8], sections: &[Section]) -> Vec<(u64, u64)> {
 fn overlaps(ranges: &[(u64, u64)], lo: u64, hi: u64) -> bool {
     let i = ranges.partition_point(|r| r.0 < hi);
     i > 0 && ranges[i - 1].1 > lo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// File offset of the test `.eh_frame_hdr` and `.eh_frame`; every
+    /// file offset `o` of the test image has vaddr `VA + o`.
+    const HDR_OFF: usize = 0x40;
+    const EH_OFF: usize = 0x100;
+    const VA: u64 = 0x2000;
+    /// .text bounds of the test image (unwind tables lie after it).
+    const TS: u64 = 0x800;
+    const TE: u64 = 0x1800;
+    /// 'zR' augmentation data: FDE pointers are pc-relative sdata4.
+    const ZR: &[u8] = &[0x1b];
+    /// CFA program: two rows, at begin + 4 and begin + 0x14.
+    const TWO_ROWS: &[u8] = &[0x44, 0x0e, 0x10, 0x50, 0x0e, 0x08];
+
+    /// A little-endian ELF64 image under construction: `e_ident`, room
+    /// for `.eh_frame_hdr`, then `.eh_frame` records from `EH_OFF`.
+    struct Img {
+        data: Vec<u8>,
+    }
+
+    impl Img {
+        /// An empty image.
+        fn new() -> Self {
+            let mut data = vec![0u8; EH_OFF];
+            data[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            Img { data }
+        }
+
+        /// Append a record holding `id` and `body`; returns its offset.
+        fn record(&mut self, id: u32, body: &[u8]) -> usize {
+            let at = self.data.len();
+            let len = u32::try_from(body.len() + 4).expect("small record");
+            self.data.extend(len.to_le_bytes());
+            self.data.extend(id.to_le_bytes());
+            self.data.extend(body);
+            at
+        }
+
+        /// A version 1 CIE with augmentation `aug`, code alignment
+        /// factor `caf`, data alignment -8, return column 16 and
+        /// augmentation data `aug_data` (for a 'z' augmentation).
+        fn cie(&mut self, aug: &[u8], caf: u8, aug_data: &[u8]) -> usize {
+            let mut b = vec![1];
+            b.extend(aug);
+            b.extend([0, caf, 0x78, 16]);
+            if aug.first() == Some(&b'z') {
+                b.push(aug_data.len() as u8);
+                b.extend(aug_data);
+            }
+            b.extend([0x0c, 7, 8]); // DW_CFA_def_cfa r7, 8
+            self.record(0, &b)
+        }
+
+        /// An FDE of the 'z' CIE at `cie` storing `raw` as its sdata4
+        /// pc_begin, then `range`, augmentation data `aug` and the CFA
+        /// program `cfa`.
+        fn fde_raw(
+            &mut self,
+            cie: usize,
+            raw: u32,
+            range: u32,
+            aug: &[u8],
+            cfa: &[u8],
+        ) -> usize {
+            let at = self.data.len();
+            let mut b = Vec::new();
+            b.extend(raw.to_le_bytes());
+            b.extend(range.to_le_bytes());
+            b.push(aug.len() as u8);
+            b.extend(aug);
+            b.extend(cfa);
+            let id = u32::try_from(at + 4 - cie).expect("CIE before FDE");
+            self.record(id, &b)
+        }
+
+        /// An FDE describing `[begin, begin + range)` (pc-relative).
+        fn fde(&mut self, cie: usize, begin: u64, range: u32, cfa: &[u8]) -> usize {
+            let raw = begin.wrapping_sub(self.next_field()) as u32;
+            self.fde_raw(cie, raw, range, &[], cfa)
+        }
+
+        /// Vaddr of the pc_begin field of the next record.
+        fn next_field(&self) -> u64 {
+            VA + self.data.len() as u64 + 8
+        }
+
+        /// Close `.eh_frame` with its zero terminator.
+        fn finish(mut self) -> (Vec<u8>, Vec<Section>) {
+            self.data.extend([0; 4]);
+            let size = (self.data.len() - EH_OFF) as u64;
+            (self.data, vec![section(".eh_frame", EH_OFF, size)])
+        }
+    }
+
+    /// A section at file offset `off` (vaddr `VA + off`).
+    fn section(name: &str, off: usize, size: u64) -> Section {
+        let vaddr = VA + off as u64;
+        Section { name: name.into(), size, vaddr, offset: off as u64, align: 4 }
+    }
+
+    /// Little-endian u32 at `off`.
+    fn u32_at(d: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(d[off..off + 4].try_into().expect("4 bytes"))
+    }
+
+    /// Store `v` little-endian at `off`.
+    fn put_u32(d: &mut [u8], off: usize, v: u32) {
+        d[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Vaddr designated by the sdata4 value at `off`, relative to `base`.
+    fn rel_at(d: &[u8], off: usize, base: u64) -> u64 {
+        base.wrapping_add(u32_at(d, off) as i32 as i64 as u64)
+    }
+
+    /// Code start the FDE at `rec` designates.
+    fn begin_of(d: &[u8], rec: usize) -> u64 {
+        rel_at(d, rec + 8, VA + rec as u64 + 8)
+    }
+
+    /// The pc_range of the FDE at `rec`.
+    fn range_of(d: &[u8], rec: usize) -> u32 {
+        u32_at(d, rec + 12)
+    }
+
+    /// Fill in an `.eh_frame_hdr` (pc-relative eh_frame_ptr, udata4
+    /// count, datarel sdata4 table) indexing the FDEs `rows`, given as
+    /// `(initial location, record offset)`.
+    fn add_hdr(d: &mut [u8], secs: &mut Vec<Section>, rows: &[(u64, usize)]) {
+        let base = VA + HDR_OFF as u64;
+        d[HDR_OFF..HDR_OFF + 4].copy_from_slice(&[1, 0x1b, 0x03, 0x3b]);
+        let ptr = (VA + EH_OFF as u64).wrapping_sub(base + 4);
+        put_u32(d, HDR_OFF + 4, ptr as u32);
+        put_u32(d, HDR_OFF + 8, rows.len() as u32);
+        for (i, &(loc, rec)) in rows.iter().enumerate() {
+            let at = HDR_OFF + 12 + 8 * i;
+            put_u32(d, at, loc.wrapping_sub(base) as u32);
+            put_u32(d, at + 4, (VA + rec as u64).wrapping_sub(base) as u32);
+        }
+        let size = 12 + 8 * rows.len() as u64;
+        secs.push(section(".eh_frame_hdr", HDR_OFF, size));
+    }
+
+    /// The search-table rows of the test `.eh_frame_hdr`, as addresses.
+    fn hdr_rows(d: &[u8]) -> Vec<(u64, u64)> {
+        let base = VA + HDR_OFF as u64;
+        let n = u32_at(d, HDR_OFF + 8) as usize;
+        (0..n)
+            .map(|i| {
+                let at = HDR_OFF + 12 + 8 * i;
+                (rel_at(d, at, base), rel_at(d, at + 4, base))
+            })
+            .collect()
+    }
+
+    // ---- Parser ----------------------------------------------------------
+
+    /// A 'zR' CIE and its FDEs decode to their code ranges.
+    #[test]
+    fn parses_fde_ranges() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        img.fde(c, 0x1000, 0x40, &[]);
+        img.fde(c, 0x1040, 0x20, &[]);
+        let (d, secs) = img.finish();
+        assert_eq!(fde_ranges(&d, &secs), vec![(0x1000, 0x40), (0x1040, 0x20)]);
+    }
+
+    /// FDEs the linker discarded (pc_begin 0) or that describe no code
+    /// (pc_range 0) are left out.
+    #[test]
+    fn skips_discarded_and_empty_fdes() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        img.fde_raw(c, 0, 0x40, &[], &[]);
+        img.fde(c, 0x1100, 0, &[]);
+        img.fde(c, 0x1200, 0x10, &[]);
+        let (d, secs) = img.finish();
+        assert_eq!(fde_ranges(&d, &secs), vec![(0x1200, 0x10)]);
+    }
+
+    /// Parsing stops at a record whose length runs past the section; the
+    /// records before it are kept.
+    #[test]
+    fn stops_at_an_overlong_record() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        img.fde(c, 0x1000, 0x40, &[]);
+        let bad = img.fde(c, 0x1040, 0x20, &[]);
+        img.fde(c, 0x1060, 0x20, &[]);
+        let (mut d, secs) = img.finish();
+        put_u32(&mut d, bad, 0x1000);
+        assert_eq!(fde_ranges(&d, &secs), vec![(0x1000, 0x40)]);
+    }
+
+    /// A 64-bit extended length (0xffffffff, then 8 bytes) is followed.
+    #[test]
+    fn follows_an_extended_length() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        let at = img.data.len();
+        let id = u32::try_from(at + 12 - c).expect("small offset");
+        let field = VA + at as u64 + 16;
+        let mut body = Vec::new();
+        body.extend(id.to_le_bytes());
+        body.extend((0x1300u64.wrapping_sub(field) as u32).to_le_bytes());
+        body.extend(0x30u32.to_le_bytes());
+        body.push(0);
+        img.data.extend(0xffff_ffffu32.to_le_bytes());
+        img.data.extend((body.len() as u64).to_le_bytes());
+        img.data.extend(body);
+        let (d, secs) = img.finish();
+        assert_eq!(fde_ranges(&d, &secs), vec![(0x1300, 0x30)]);
+    }
+
+    /// An FDE whose CIE has an unknown augmentation letter before one it
+    /// needs, or whose CIE pointer leaves the section, is skipped.
+    #[test]
+    fn skips_fdes_without_a_usable_cie() {
+        let mut img = Img::new();
+        let bad_cie = img.cie(b"zXR", 1, &[0, 0x1b]);
+        img.fde(bad_cie, 0x1000, 0x40, &[]);
+        let c = img.cie(b"zR", 1, ZR);
+        let stray = img.fde(c, 0x1100, 0x40, &[]);
+        img.fde(c, 0x1200, 0x40, &[]);
+        let (mut d, secs) = img.finish();
+        put_u32(&mut d, stray + 4, (stray + 4 - EH_OFF + 8) as u32);
+        assert_eq!(fde_ranges(&d, &secs), vec![(0x1200, 0x40)]);
+    }
+
+    /// 'zPLR': the personality pointer and each FDE's LSDA decode.
+    #[test]
+    fn parses_personality_and_lsda() {
+        let mut img = Img::new();
+        let mut aug = vec![0x00];
+        aug.extend(0x1500u64.to_le_bytes());
+        aug.extend([0x1b, 0x1b]);
+        let c = img.cie(b"zPLR", 1, &aug);
+        let raw = 0x1000u64.wrapping_sub(img.next_field()) as u32;
+        img.fde_raw(c, raw, 0x40, &0x10u32.to_le_bytes(), &[]);
+        img.fde_raw(c, 0, 0x20, &0u32.to_le_bytes(), &[]);
+        let (d, secs) = img.finish();
+        assert_eq!(personality_targets(&d, &secs), vec![0x1500]);
+        assert_eq!(lsda_ranges(&d, &secs), vec![(0x1000, 0x1040)]);
+    }
+
+    // ---- Patching --------------------------------------------------------
+
+    /// A live function that lost 8 internal bytes gets the shorter range,
+    /// and its CFA advance across the hole shrinks by 8.
+    #[test]
+    fn respaces_the_cfa_of_a_shrunk_function() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        let f = img.fde(c, 0x1000, 0x40, TWO_ROWS);
+        let (mut d, secs) = img.finish();
+        patch_eh_frame(&mut d, &secs, &[(0x1008, 0x1010)], TS, TE);
+        assert_eq!(begin_of(&d, f), 0x1000);
+        assert_eq!(range_of(&d, f), 0x38);
+        assert_eq!(&d[f + 17..f + 23], &[0x44, 0x0e, 0x10, 0x48, 0x0e, 0x08]);
+    }
+
+    /// A function wholly inside a removed range is neutralised and its
+    /// search-table row dropped; the next one moves down.
+    #[test]
+    fn neutralises_a_removed_function() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        let f = img.fde(c, 0x1000, 0x40, TWO_ROWS);
+        let g = img.fde(c, 0x1080, 0x20, &[]);
+        let (mut d, mut secs) = img.finish();
+        add_hdr(&mut d, &mut secs, &[(0x1000, f), (0x1080, g)]);
+        patch_eh_frame(&mut d, &secs, &[(0x1000, 0x1040)], TS, TE);
+        assert_eq!(range_of(&d, f), 0);
+        assert_eq!(begin_of(&d, g), 0x1040);
+        assert_eq!(hdr_rows(&d), vec![(0x1040, VA + g as u64)]);
+    }
+
+    /// Padding absorbed next to a removed function swallowed the first
+    /// bytes of a live one: its FDE and search-table row stay, re-pointed
+    /// at its new start with the shorter range.
+    #[test]
+    fn keeps_a_live_function_whose_start_was_absorbed() {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        let dead = img.fde(c, 0x1000, 0x40, &[]);
+        let live = img.fde(c, 0x1040, 0x20, TWO_ROWS);
+        let (mut d, mut secs) = img.finish();
+        add_hdr(&mut d, &mut secs, &[(0x1000, dead), (0x1040, live)]);
+        patch_eh_frame(&mut d, &secs, &[(0x1000, 0x1044)], TS, TE);
+        assert_eq!(range_of(&d, dead), 0);
+        assert_eq!(begin_of(&d, live), 0x1000);
+        assert_eq!(range_of(&d, live), 0x1c);
+        let cfa = &d[live + 17..live + 23];
+        assert_eq!(cfa, &[0x40, 0x0e, 0x10, 0x50, 0x0e, 0x08]);
+        assert_eq!(hdr_rows(&d), vec![(0x1000, VA + live as u64)]);
+    }
+
+    /// A shrunk function whose CFA program cannot be re-spaced (it uses
+    /// DW_CFA_set_loc) is left untouched: no half-patched FDE.
+    #[test]
+    fn leaves_an_unrespaceable_fde_untouched() {
+        let (mut d, secs, f) = set_loc_image();
+        let before = d.clone();
+        patch_eh_frame(&mut d, &secs, &[(0x1008, 0x1010)], TS, TE);
+        assert_eq!(range_of(&d, f), 0x40);
+        assert_eq!(d, before);
+    }
+
+    /// One function at 0x1000..0x1040 whose CFA program uses
+    /// DW_CFA_set_loc; also returns the offset of its FDE.
+    fn set_loc_image() -> (Vec<u8>, Vec<Section>, usize) {
+        let mut img = Img::new();
+        let c = img.cie(b"zR", 1, ZR);
+        let mut cfa = vec![0x44, 0x01];
+        cfa.extend(0x1014u64.to_le_bytes());
+        cfa.extend([0x0e, 0x10]);
+        let f = img.fde(c, 0x1000, 0x40, &cfa);
+        let (d, secs) = img.finish();
+        (d, secs, f)
+    }
+
+    /// Intervals narrowed to what the unwind tables can follow.
+    mod clip {
+        use super::*;
+
+        /// A dead block inside a function whose CFA program cannot be
+        /// re-spaced is kept; intervals elsewhere are not touched.
+        #[test]
+        fn keeps_blocks_of_unrespaceable_functions() {
+            let (d, secs, _) = set_loc_image();
+            let ivs = [(0x1008, 0x1010), (0x1100, 0x1110)];
+            let got = unwind_safe_intervals(&d, &secs, &ivs, TS, TE, 1);
+            assert_eq!(got, vec![(0x1100, 0x1110)]);
+        }
+
+        /// Padding absorbed into such a function is cut back to its start.
+        #[test]
+        fn cuts_absorbed_padding_back() {
+            let (d, secs, _) = set_loc_image();
+            let ivs = [(0xff0, 0x1008)];
+            let got = unwind_safe_intervals(&d, &secs, &ivs, TS, TE, 1);
+            assert_eq!(got, vec![(0xff0, 0x1000)]);
+        }
+
+        /// A removed function and a re-spaceable one keep their intervals.
+        #[test]
+        fn keeps_intervals_the_tables_can_follow() {
+            let mut img = Img::new();
+            let c = img.cie(b"zR", 1, ZR);
+            img.fde(c, 0x1000, 0x40, TWO_ROWS);
+            img.fde(c, 0x1040, 0x20, &[0x01]);
+            let (d, secs) = img.finish();
+            let ivs = [(0x1008, 0x1010), (0x1040, 0x1060)];
+            let got = unwind_safe_intervals(&d, &secs, &ivs, TS, TE, 1);
+            assert_eq!(got, ivs.to_vec());
+        }
+
+        /// A shift that is not a multiple of the code alignment factor
+        /// cannot be expressed in CFA advances: the function stays whole.
+        #[test]
+        fn keeps_functions_whose_shift_breaks_alignment() {
+            let mut img = Img::new();
+            let c = img.cie(b"zR", 4, ZR);
+            img.fde(c, 0x1000, 0x40, &[0x41, 0x0e, 0x10, 0x44]);
+            let (d, secs) = img.finish();
+            let ivs = [(0x1008, 0x100a)];
+            let got = unwind_safe_intervals(&d, &secs, &ivs, TS, TE, 2);
+            assert!(got.is_empty());
+        }
+
+        /// Pieces left by a cut keep a multiple of the alignment, counted
+        /// from the end they keep.
+        #[test]
+        fn cut_range_keeps_alignment() {
+            let ivs = [(0x100, 0x200), (0x300, 0x310)];
+            let got = cut_range(&ivs, (0x10e, 0x1f2), 4);
+            assert_eq!(got, vec![(0x100, 0x10c), (0x1f4, 0x200), (0x300, 0x310)]);
+            assert!(cut_range(&ivs, (0, 0x1000), 4).is_empty());
+        }
+    }
 }

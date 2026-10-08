@@ -70,6 +70,14 @@ pub fn analyze_elf_full(
         Err(_) => return empty_full(),
     };
     let sections = sections::get_sections(&elf);
+    if let Some(name) = code_outside_file(data.len(), &sections) {
+        eprintln!(
+            "  note: code section {} runs past the end of the file; \
+             left unchanged",
+            name
+        );
+        return empty_full();
+    }
     let (ts, te) = match sections::text_bounds(&sections) {
         Some(b) => b,
         None => return empty_full(),
@@ -284,6 +292,22 @@ fn managed_funcs(funcs: &FuncMap, sections: &[Section]) -> Vec<String> {
         .collect()
 }
 
+/// Name of the first code section trim decodes (.text and
+/// `EXTRA_CODE_SECTIONS`) whose file range is not wholly inside a file
+/// of `len` bytes (crafted or truncated input). Its instructions cannot
+/// be read, so references from it would be missed and its branches left
+/// unpatched: such a file is left unchanged.
+fn code_outside_file(len: usize, sections: &[Section]) -> Option<&str> {
+    let decoded = |s: &&Section| {
+        s.name == ".text" || EXTRA_CODE_SECTIONS.contains(&s.name.as_str())
+    };
+    sections
+        .iter()
+        .filter(decoded)
+        .find(|s| s.offset.checked_add(s.size).map_or(true, |e| e > len as u64))
+        .map(|s| s.name.as_str())
+}
+
 /// Return empty results tuple for early-exit paths.
 fn empty_full() -> (
     FuncMap,
@@ -362,6 +386,11 @@ fn compact_or_fill(
         crate::arch::padding_fn(arch),
         crate::arch::instr_align(arch),
     );
+    // Live functions whose unwind rows cannot follow a shrink stay whole.
+    let intervals = ehframe::unwind_safe_intervals(
+        data, sections, &intervals, ts, te, crate::arch::instr_align(arch),
+    );
+    let dead_blocks = &blocks_removed(dead_blocks, &intervals);
     let instrs = decode_sections(data, sections);
     if instrs.is_empty() || !compaction_fits(data.len(), sections, &intervals)
     {
@@ -500,6 +529,19 @@ fn blocks_within(blocks: &[DeadBlock], ts: u64, te: u64) -> Vec<DeadBlock> {
     blocks
         .iter()
         .filter(|b| lies_within(b.addr, b.size, ts, te))
+        .cloned()
+        .collect()
+}
+
+/// The dead blocks lying wholly inside one of `intervals`: those a
+/// compaction by `intervals` removes. Blocks of functions kept whole by
+/// `ehframe::unwind_safe_intervals` are left out.
+fn blocks_removed(blocks: &[DeadBlock], intervals: &[(u64, u64)]) -> Vec<DeadBlock> {
+    blocks
+        .iter()
+        .filter(|b| {
+            intervals.iter().any(|&(s, e)| lies_within(b.addr, b.size, s, e))
+        })
         .cloned()
         .collect()
 }

@@ -1058,6 +1058,37 @@ jt_split_got=$(/work/test-jt-split-patch 2>&1) || true
         "expected [$jt_split_expected] got [$jt_split_got]"
 
 # =============================================
+# Prefixed relative branches: addr32 / notrack / bnd
+# =============================================
+printf '\n--- Prefixed relative branches: addr32 / notrack / bnd ---\n'
+# Each probe branches across dead code through a prefixed call, jmp or
+# jcc (67 E8, 3E E9, F2 E9, F2 E8, 3E 0F 85; one call goes backwards).
+# trim removes the dead code, so every rel32 must be re-pointed one
+# prefix byte into its instruction. Built as PIE and static.
+for pb_mode in pie static; do
+    pb_bin=/work/test-prefixed-$pb_mode
+    case $pb_mode in
+        pie) pb_flags= ;;
+        static) pb_flags=-static ;;
+    esac
+    gcc -O0 $pb_flags -o "$pb_bin" /tests/prefixed-branch.c
+    pb_expected=$("$pb_bin" 2>&1) || true
+    echo "$pb_expected" | grep -q '^prefixed-branch: ok$' && \
+        pass "Prefixed $pb_mode: original self-check ok" || \
+        fail "Prefixed $pb_mode: original" "got: $pb_expected"
+    pb_out=$(trim --in-place "$pb_bin" 2>&1) || true
+    echo "$pb_out" | grep -q 'dead_head: ' && \
+        echo "$pb_out" | grep -q 'dead_middle: ' && \
+        echo "$pb_out" | grep -q 'reassembled: [1-9]' && \
+        pass "Prefixed $pb_mode: dead code between the branches removed" || \
+        fail "Prefixed $pb_mode: compaction" "$pb_out"
+    pb_got=$("$pb_bin" 2>&1) || true
+    [ "$pb_got" = "$pb_expected" ] && \
+        pass "Prefixed $pb_mode: patched binary output identical" || \
+        fail "Prefixed $pb_mode: output" "got: $pb_got"
+done
+
+# =============================================
 # Stream mode: output file
 # =============================================
 printf '\n--- Stream mode: output file ---\n'
@@ -1204,6 +1235,28 @@ set -e
 echo "$output" | grep -q 'skipped\|no function\|0 dead' && \
     pass "[SEC] 4-byte file: handled gracefully" || \
     pass "[SEC] 4-byte file: no crash (exit $rc)"
+
+# =============================================
+# [SEC] Code section past the end of the file
+# =============================================
+printf '\n--- [SEC] Code section past the end of the file ---\n'
+# A crafted or truncated ELF can name a code section whose file offset
+# lies past the end of the file while its headers still parse. Besides
+# .text, trim decodes .init, .fini and .plt*: slicing them panicked. It
+# cannot read that code, so it must leave the file unchanged.
+for eof_case in dyn:.fini dyn:.init dyn:.plt dyn:.text static:.init; do
+    eof_src=/work/hello-${eof_case%%:*}
+    eof_sec=${eof_case#*:}
+    eof_bin=/work/test-eof-${eof_case%%:*}$eof_sec
+    python3 /tests/elf_past_eof.py "$eof_src" "$eof_bin" "$eof_sec" > /dev/null
+    eof_rc=0
+    eof_out=$(trim "$eof_bin" "$eof_bin-out" 2>&1) || eof_rc=$?
+    echo "$eof_out" | grep 'note\|panicked' || true
+    [ "$eof_rc" -eq 0 ] && cmp -s "$eof_bin" "$eof_bin-out" && \
+        echo "$eof_out" | grep -q "code section $eof_sec runs past the end" && \
+        pass "[SEC] $eof_case past EOF: no panic, file left unchanged" || \
+        fail "[SEC] $eof_case past EOF" "rc=$eof_rc: $eof_out"
+done
 
 # =============================================
 # Stream mode: output file is executable

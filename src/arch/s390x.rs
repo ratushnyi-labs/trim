@@ -17,9 +17,7 @@ pub fn decode_text_s390x(
     text_vaddr: u64,
     text_size: u64,
 ) -> Vec<DecodedInstr> {
-    let end = text_offset as usize + text_size as usize;
-    let slice =
-        &data[text_offset as usize..end.min(data.len())];
+    let slice = super::section_bytes(data, text_offset, text_size);
     let mut instrs = Vec::new();
     let mut offset = 0usize;
     while offset < slice.len() {

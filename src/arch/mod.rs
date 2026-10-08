@@ -70,6 +70,20 @@ pub fn decode_text(
     }
 }
 
+/// The file bytes of a code section, `[offset, offset + size)` clipped
+/// to the end of `data`. Empty when the section starts past the end of
+/// the file or its offset does not fit a `usize` (crafted or truncated
+/// input), so a decoder never slices outside `data`.
+pub fn section_bytes(data: &[u8], offset: u64, size: u64) -> &[u8] {
+    let start = match usize::try_from(offset) {
+        Ok(s) => s,
+        Err(_) => return &[],
+    };
+    let len = usize::try_from(size).unwrap_or(usize::MAX);
+    let end = start.saturating_add(len).min(data.len());
+    data.get(start..end).unwrap_or(&[])
+}
+
 /// Get the padding check function for a given architecture.
 pub fn padding_fn(arch: Arch) -> fn(u8) -> bool {
     match arch {
@@ -114,4 +128,42 @@ fn detect_mips_endian(data: &[u8]) -> bool {
         return data[5] == 2;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every architecture `decode_text` dispatches on.
+    const ARCHES: &[Arch] = &[
+        Arch::X86_64, Arch::X86_32, Arch::Aarch64, Arch::Arm32,
+        Arch::RiscV64, Arch::RiscV32, Arch::Mips32, Arch::Mips64,
+        Arch::S390x, Arch::LoongArch64,
+    ];
+
+    /// A section range is clipped to the file; one starting past the end
+    /// of the file (or beyond any usize) yields no bytes.
+    #[test]
+    fn section_bytes_stays_inside_the_file() {
+        let data = [0x90u8; 64];
+        assert_eq!(section_bytes(&data, 60, 16).len(), 4);
+        assert_eq!(section_bytes(&data, 8, u64::MAX).len(), 56);
+        assert!(section_bytes(&data, 64, 16).is_empty());
+        assert!(section_bytes(&data, 65, 16).is_empty());
+        assert!(section_bytes(&data, u64::MAX, u64::MAX).is_empty());
+    }
+
+    /// No decoder panics on a code section that starts past the end of
+    /// the file or whose end overflows; each decodes nothing there.
+    #[test]
+    fn decoders_never_slice_outside_the_file() {
+        let data = [0u8; 64];
+        for &arch in ARCHES {
+            assert!(decode_text(&data, 65, 0x1000, 16, arch).is_empty());
+            assert!(decode_text(&data, 64, 0x1000, 16, arch).is_empty());
+            let far = decode_text(&data, u64::MAX, 0x1000, u64::MAX, arch);
+            assert!(far.is_empty(), "{:?}", arch);
+            assert!(!decode_text(&data, 32, 0x1000, u64::MAX, arch).is_empty());
+        }
+    }
 }
