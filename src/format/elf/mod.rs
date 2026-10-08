@@ -3,7 +3,8 @@
 //! Parses ELF headers, section tables, and symbol tables to build a function
 //! map. After dead code analysis, physically compacts the .text section by
 //! removing dead regions and patching all affected metadata (relocations,
-//! symbols, program headers, entry point, unwind tables).
+//! symbols, program headers, entry point, unwind tables). Dead functions in
+//! other executable sections are zero-filled in place: only .text moves.
 
 pub mod ehframe;
 pub mod patch;
@@ -15,7 +16,7 @@ use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
 use crate::analysis::cfg::DeadBlock;
-use crate::patch::compact::compact_text;
+use crate::patch::compact::{compact_text, compaction_fits};
 use crate::patch::data_ptrs::patch_data_ptrs;
 use crate::patch::relocs::{
     block_intervals, combine_intervals, dead_intervals,
@@ -143,13 +144,37 @@ fn run_analysis(
         .iter()
         .map(|(n, fi)| (fi.addr, n.as_str()))
         .collect();
-    let data_names: HashSet<String> = data_refs
+    let mut data_names: HashSet<String> = data_refs
         .iter()
         .filter_map(|a| by_addr.get(a).map(|n| n.to_string()))
         .collect();
+    if is_nativeaot(sections) {
+        data_names.extend(managed_funcs(funcs, sections));
+    }
     let roots = determine_roots(funcs, &data_names, &orphan_refs);
     let live = compute_live_set(&roots, &graph, funcs);
     find_dead(funcs, &live)
+}
+
+/// Names of the functions inside NativeAOT managed code sections; all of
+/// them count as live. The runtime reaches managed methods through
+/// MethodTable vtables stored dehydrated (compressed, relative pointers)
+/// and rebuilt at startup into the NOBITS `.hydrated` section, so the
+/// file holds no reference to them that trim can see.
+fn managed_funcs(funcs: &FuncMap, sections: &[Section]) -> Vec<String> {
+    let managed: Vec<&Section> = sections
+        .iter()
+        .filter(|s| NATIVEAOT_CODE.contains(&s.name.as_str()))
+        .collect();
+    funcs
+        .iter()
+        .filter(|(_, fi)| {
+            managed.iter().any(|s| {
+                fi.addr >= s.vaddr && fi.addr - s.vaddr < s.size
+            })
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 /// Return empty results tuple for early-exit paths.
@@ -163,6 +188,11 @@ fn empty_full() -> (
 }
 
 /// Reassemble: patch refs, compact .text, update ELF metadata.
+/// Only .text is compacted (compacting the other executable sections is
+/// future work), so dead functions elsewhere are zero-filled in place
+/// and never reach the interval and drain math, which assumes every
+/// interval lies inside .text. Dead code that lies in no single
+/// executable section is left untouched.
 /// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_elf(
     data: &mut Vec<u8>,
@@ -174,21 +204,47 @@ pub fn reassemble_elf(
     // Landing pads are reachable only through the unwinder (LSDA).
     let dead_blocks =
         &ehframe::retain_unwindable_blocks(data, sections, dead_blocks);
-    if is_nativeaot(sections) {
-        return zero_fill_in_place(
-            data, dead, dead_blocks, sections, arch,
+    let bounds = sections::text_bounds(sections);
+    let split = split_dead(dead, bounds, &other_code_spans(data));
+    if split.skipped > 0 {
+        eprintln!(
+            "  note: {} dead functions lie in no single code section; \
+             left in place",
+            split.skipped
         );
     }
+    let (oc, os) = zero_fill_ranges(data, &split.other);
+    let (fc, fs, bc, bs) = if is_nativeaot(sections) {
+        zero_fill_in_place(data, &split.text, dead_blocks, sections, arch)
+    } else {
+        compact_or_fill(data, &split.text, dead_blocks, sections, arch)
+    };
+    (fc + oc, fs + os, bc, bs)
+}
+
+/// Compact .text by the dead functions and blocks lying wholly inside
+/// it (`dead` holds only such functions). Falls back to zero-filling
+/// them in place when there is no .text, nothing decodes, or the plan
+/// does not fit the file; that check runs before any patching.
+fn compact_or_fill(
+    data: &mut Vec<u8>,
+    dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
+    sections: &[Section],
+    arch: Arch,
+) -> (usize, u64, usize, u64) {
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
-        None => {
-            let (fc, fs) = zero_fill(data, dead, sections);
-            let (bc, bs) = zero_fill_blocks(
-                data, dead_blocks, sections, arch,
-            );
-            return (fc, fs, bc, bs);
-        }
+        None => return fill_in_place(data, dead, dead_blocks, sections, arch),
     };
+    let all_blocks = dead_blocks.len();
+    let dead_blocks = &blocks_within(dead_blocks, ts, te);
+    if dead_blocks.len() < all_blocks {
+        eprintln!(
+            "  note: {} dead branches lie outside .text; left in place",
+            all_blocks - dead_blocks.len()
+        );
+    }
     let func_ivs = dead_intervals(dead);
     let blk_ivs = block_intervals(dead_blocks);
     let combined = combine_intervals(&func_ivs, &blk_ivs);
@@ -200,11 +256,9 @@ pub fn reassemble_elf(
         crate::arch::instr_align(arch),
     );
     let instrs = decode_sections(data, sections);
-    if instrs.is_empty() {
-        let (fc, fs) = zero_fill(data, dead, sections);
-        let (bc, bs) =
-            zero_fill_blocks(data, dead_blocks, sections, arch);
-        return (fc, fs, bc, bs);
+    if instrs.is_empty() || !compaction_fits(data.len(), sections, &intervals)
+    {
+        return fill_in_place(data, dead, dead_blocks, sections, arch);
     }
     apply_patches(
         data, &instrs, &intervals, sections, ts, te, arch,
@@ -214,6 +268,133 @@ pub fn reassemble_elf(
         dead_blocks.iter().map(|b| b.size).sum();
     let func_saved = saved.saturating_sub(blk_bytes);
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
+}
+
+/// Zero-fill dead functions and blocks in place, moving nothing.
+fn fill_in_place(
+    data: &mut [u8],
+    dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
+    sections: &[Section],
+    arch: Arch,
+) -> (usize, u64, usize, u64) {
+    let (fc, fs) = zero_fill(data, dead, sections);
+    let (bc, bs) = zero_fill_blocks(data, dead_blocks, sections, arch);
+    (fc, fs, bc, bs)
+}
+
+/// Dead functions sorted by where trim may remove them.
+struct DeadSplit {
+    /// Lying wholly inside .text: compacted (or zero-filled in place).
+    text: HashMap<String, (u64, u64)>,
+    /// Lying wholly inside another executable section: the file ranges
+    /// `(offset, len)` to zero-fill in place.
+    other: Vec<(usize, usize)>,
+    /// Lying in no single executable section: left untouched.
+    skipped: usize,
+}
+
+/// A file-backed executable section other than .text.
+struct CodeSpan {
+    /// First vaddr.
+    start: u64,
+    /// End vaddr (exclusive).
+    end: u64,
+    /// File offset of `start`.
+    offset: u64,
+}
+
+/// File-backed (PROGBITS) executable sections other than .text, read
+/// from the section headers. Sections whose address or file range
+/// overflows or runs past the end of the file are left out.
+fn other_code_spans(data: &[u8]) -> Vec<CodeSpan> {
+    use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS};
+    let elf = match goblin::elf::Elf::parse(data) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let flags = u64::from(SHF_ALLOC | SHF_EXECINSTR);
+    elf.section_headers
+        .iter()
+        .filter(|sh| sh.sh_type == SHT_PROGBITS && sh.sh_flags & flags == flags)
+        .filter(|sh| elf.shdr_strtab.get_at(sh.sh_name) != Some(".text"))
+        .filter_map(|sh| {
+            let end = sh.sh_addr.checked_add(sh.sh_size)?;
+            let file_end = sh.sh_offset.checked_add(sh.sh_size)?;
+            (file_end <= data.len() as u64).then_some(CodeSpan {
+                start: sh.sh_addr,
+                end,
+                offset: sh.sh_offset,
+            })
+        })
+        .collect()
+}
+
+/// True if `[addr, addr + size)` lies within `[lo, hi)`.
+fn lies_within(addr: u64, size: u64, lo: u64, hi: u64) -> bool {
+    addr >= lo && addr.checked_add(size).map_or(false, |e| e <= hi)
+}
+
+/// Split the dead functions by place: wholly inside .text (`bounds`),
+/// wholly inside one of `spans`, or neither (skipped: never touched).
+fn split_dead(
+    dead: &HashMap<String, (u64, u64)>,
+    bounds: Option<(u64, u64)>,
+    spans: &[CodeSpan],
+) -> DeadSplit {
+    let mut split = DeadSplit {
+        text: HashMap::new(),
+        other: Vec::new(),
+        skipped: 0,
+    };
+    for (name, &(addr, size)) in dead {
+        let in_text = bounds
+            .map_or(false, |(ts, te)| lies_within(addr, size, ts, te));
+        if in_text {
+            split.text.insert(name.clone(), (addr, size));
+        } else if let Some(r) = span_range(spans, addr, size) {
+            split.other.push(r);
+        } else {
+            split.skipped += 1;
+        }
+    }
+    split
+}
+
+/// File range `(offset, len)` of `[addr, addr + size)` if it lies
+/// wholly inside one of `spans`.
+fn span_range(spans: &[CodeSpan], addr: u64, size: u64) -> Option<(usize, usize)> {
+    let s = spans
+        .iter()
+        .find(|s| lies_within(addr, size, s.start, s.end))?;
+    let off = usize::try_from(s.offset + (addr - s.start)).ok()?;
+    Some((off, usize::try_from(size).ok()?))
+}
+
+/// Zero-fill the file ranges `(offset, len)` in place, skipping any that
+/// fall outside `data`. Returns (count, total_bytes).
+fn zero_fill_ranges(data: &mut [u8], ranges: &[(usize, usize)]) -> (usize, u64) {
+    let mut count = 0;
+    let mut total = 0u64;
+    for &(off, len) in ranges {
+        let hit = off.checked_add(len).and_then(|e| data.get_mut(off..e));
+        if let Some(bytes) = hit {
+            bytes.fill(0x00);
+            count += 1;
+            total += len as u64;
+        }
+    }
+    (count, total)
+}
+
+/// The dead blocks lying wholly inside .text `[ts, te)`; compaction
+/// never sees any other.
+fn blocks_within(blocks: &[DeadBlock], ts: u64, te: u64) -> Vec<DeadBlock> {
+    blocks
+        .iter()
+        .filter(|b| lies_within(b.addr, b.size, ts, te))
+        .cloned()
+        .collect()
 }
 
 /// True for a .NET NativeAOT image: it has the `__modules` section and
@@ -240,9 +421,7 @@ fn zero_fill_in_place(
         "  note: NativeAOT image detected; dead code zero-filled in \
          place (no compaction)"
     );
-    let (fc, fs) = zero_fill(data, dead, sections);
-    let (bc, bs) = zero_fill_blocks(data, dead_blocks, sections, arch);
-    (fc, fs, bc, bs)
+    fill_in_place(data, dead, dead_blocks, sections, arch)
 }
 
 /// Decode instructions from all ELF code sections (.text and extras).

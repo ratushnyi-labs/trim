@@ -10,11 +10,14 @@ use crate::types::Section;
 use std::collections::HashMap;
 
 /// Build sorted dead intervals [(start_vaddr, end_vaddr)] from the dead map.
+/// Sizes come from the file, so the end saturates instead of wrapping.
 pub fn dead_intervals(
     dead: &HashMap<String, (u64, u64)>,
 ) -> Vec<(u64, u64)> {
-    let mut v: Vec<(u64, u64)> =
-        dead.values().map(|&(a, s)| (a, a + s)).collect();
+    let mut v: Vec<(u64, u64)> = dead
+        .values()
+        .map(|&(a, s)| (a, a.saturating_add(s)))
+        .collect();
     v.sort();
     v
 }
@@ -25,7 +28,7 @@ pub fn block_intervals(
 ) -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = blocks
         .iter()
-        .map(|b| (b.addr, b.addr + b.size))
+        .map(|b| (b.addr, b.addr.saturating_add(b.size)))
         .collect();
     v.sort();
     v
@@ -50,7 +53,7 @@ pub fn shift_at(addr: u64, intervals: &[(u64, u64)]) -> u64 {
     let mut total = 0u64;
     for &(start, end) in intervals {
         if start < addr {
-            total += end.min(addr) - start;
+            total += end.min(addr).saturating_sub(start);
         }
     }
     total
@@ -70,7 +73,7 @@ const PAGE_SIZE: u64 = 4096;
 
 /// Total dead bytes across all intervals.
 pub fn total_dead(intervals: &[(u64, u64)]) -> u64 {
-    intervals.iter().map(|&(s, e)| e - s).sum()
+    intervals.iter().map(|&(s, e)| e.saturating_sub(s)).sum()
 }
 
 /// Page-aligned dead bytes that can be physically removed.
@@ -176,13 +179,11 @@ fn merge_intervals(
         return Vec::new();
     }
     intervals.sort();
-    let mut merged = vec![intervals[0]];
-    for &(start, end) in &intervals[1..] {
-        let last = merged.last_mut().unwrap();
-        if start <= last.1 {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for &(start, end) in intervals.iter() {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
         }
     }
     merged

@@ -703,6 +703,112 @@ new_sz_drain=$(stat -c%s /work/test-nat-drain)
     fail "NativeAOT without __modules" "note or size: $orig_sz_drain -> $new_sz_drain"
 
 # =============================================
+# Dead code outside .text: zero-filled in place
+# =============================================
+printf '\n--- Dead code outside .text: zero-filled in place ---\n'
+# Unstripped, the symtab holds dead functions in executable sections after
+# .text (__managedcode without __modules, and a custom `trimcode`). They
+# outweigh the dead code in .text by more than a page: fed into the .text
+# drain math they reversed the drain range (panic). Only .text is
+# compacted; they must be zero-filled in place and their FDEs follow them.
+gcc -g -O0 -fno-inline -o /work/test-xsd /tests/exec-section-dead.c
+cp /work/test-xsd /work/test-xsd-orig
+orig_sz_xsd=$(stat -c%s /work/test-xsd)
+printf 'Built: test-xsd (%d bytes)\n' "$orig_sz_xsd"
+
+xsd_rc=0
+xsd_out=$(trim --in-place /work/test-xsd 2>&1) || xsd_rc=$?
+echo "$xsd_out" | grep -v '^    ' || true
+[ "$xsd_rc" -eq 0 ] && ! echo "$xsd_out" | grep -q 'panicked' && \
+    pass "ExecSection: trim completes without panic" || \
+    fail "ExecSection: trim" "rc=$xsd_rc"
+echo "$xsd_out" | grep -q '91 dead functions removed' && \
+    pass "ExecSection: 91 dead functions removed (30 in .text, 61 outside)" || \
+    fail "ExecSection: count" "not reported"
+
+new_sz_xsd=$(stat -c%s /work/test-xsd)
+[ "$new_sz_xsd" -lt "$orig_sz_xsd" ] && \
+    pass "ExecSection: .text compacted ($orig_sz_xsd -> $new_sz_xsd)" || \
+    fail "ExecSection: file size" "not reduced ($orig_sz_xsd -> $new_sz_xsd)"
+
+output=$(/work/test-xsd 2>&1) && \
+    pass "ExecSection: patched binary executes" || \
+    fail "ExecSection: execution" "crashed"
+echo "$output" | grep -q 'result: 21' && \
+    pass "ExecSection: managed->.text branch patched" || \
+    fail "ExecSection: output" "got: $output"
+
+# Print "dirty total" for the dead functions outside .text in $1 (dead_m*
+# in __managedcode, dead_c* in trimcode): how many hold a nonzero byte.
+# File offsets come from $1's own symtab and section headers.
+xsd_dirty() {
+    xd_n=0
+    xd_d=0
+    for xd_sec in __managedcode:dead_m trimcode:dead_c; do
+        xd_loc=$(readelf -SW "$1" | sed -n \
+            "s/.*\] ${xd_sec%%:*} *PROGBITS *\([0-9a-f]*\) \([0-9a-f]*\) .*/\1 \2/p")
+        read -r xd_va xd_off <<EOF
+$xd_loc
+EOF
+        nm -S "$1" | grep " ${xd_sec#*:}[0-9]*\$" > /work/xsd-syms || true
+        while read -r addr size _ _; do
+            lo=$((0x$addr - 0x$xd_va + 0x$xd_off))
+            xd_n=$((xd_n + 1))
+            if od -An -v -tx1 -j "$lo" -N $((0x$size)) "$1" | \
+                grep -q '[1-9a-f]'; then
+                xd_d=$((xd_d + 1))
+            fi
+        done < /work/xsd-syms
+    done
+    echo "$xd_d $xd_n"
+}
+xsd_before=$(xsd_dirty /work/test-xsd-orig)
+xsd_after=$(xsd_dirty /work/test-xsd)
+[ "$xsd_before" = "61 61" ] && [ "$xsd_after" = "0 61" ] && \
+    pass "ExecSection: dead code outside .text zero-filled (61)" || \
+    fail "ExecSection: zeroed" "dirty/total before: $xsd_before, after: $xsd_after"
+
+# The zero-filled functions move with their section by the page-aligned
+# drain; each FDE must cover exactly the function's new symbol range.
+nm -S /work/test-xsd | grep ' dead_[mc][0-9]*$' > /work/xsd-syms || true
+readelf --debug-dump=frames /work/test-xsd > /work/xsd-frames
+xsd_nofde=0
+while read -r addr size _ _; do
+    end=$(printf '%016x' $((0x$addr + 0x$size)))
+    if ! grep -q "pc=$addr\.\.$end\$" /work/xsd-frames; then
+        xsd_nofde=$((xsd_nofde + 1))
+    fi
+done < /work/xsd-syms
+[ "$(wc -l < /work/xsd-syms)" -eq 61 ] && [ "$xsd_nofde" -eq 0 ] && \
+    pass "ExecSection: FDEs follow the zero-filled functions" || \
+    fail "ExecSection: FDEs" "$xsd_nofde functions without a matching FDE"
+
+# With __modules (NativeAOT image) every managed function is live:
+# managed_hidden is reached only through a 32-bit self-relative pointer,
+# as NativeAOT reaches managed methods through dehydrated MethodTables.
+gcc -g -O0 -fno-inline -DWITH_MODULES \
+    -o /work/test-xsdm /tests/exec-section-dead.c
+orig_sz_xsdm=$(stat -c%s /work/test-xsdm)
+xsdm_out=$(trim --in-place /work/test-xsdm 2>&1) || true
+echo "$xsdm_out" | grep -q 'managed_hidden\|rt_hidden\|dead_m01' && \
+    fail "ExecSection NativeAOT: false positive" "managed code flagged dead" || \
+    pass "ExecSection NativeAOT: managed functions kept live"
+echo "$xsdm_out" | grep -q '31 dead functions removed' && \
+    pass "ExecSection NativeAOT: 31 dead functions zero-filled" || \
+    fail "ExecSection NativeAOT: zero-fill" "not reported"
+new_sz_xsdm=$(stat -c%s /work/test-xsdm)
+[ "$new_sz_xsdm" -eq "$orig_sz_xsdm" ] && \
+    pass "ExecSection NativeAOT: file size unchanged ($new_sz_xsdm)" || \
+    fail "ExecSection NativeAOT: file size" "$orig_sz_xsdm -> $new_sz_xsdm"
+output=$(/work/test-xsdm 2>&1) && \
+    pass "ExecSection NativeAOT: patched binary executes" || \
+    fail "ExecSection NativeAOT: execution" "crashed"
+echo "$output" | grep -q 'result: 21' && \
+    echo "$output" | grep -q 'hidden: 206' && \
+    pass "ExecSection NativeAOT: output correct" || \
+    fail "ExecSection NativeAOT: output" "got: $output"
+
+# =============================================
 # Switch jump-table: hoisted table base
 # =============================================
 printf '\n--- Switch jump-table: hoisted table base ---\n'
