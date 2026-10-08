@@ -88,7 +88,7 @@ pub fn analyze_elf_full(
     if instrs.is_empty() {
         return empty_full();
     }
-    let funcs =
+    let (funcs, links) =
         build_func_map(&elf, data, &sections, &instrs, ts, te);
     if funcs.is_empty() {
         return empty_full();
@@ -100,11 +100,15 @@ pub fn analyze_elf_full(
     // become orphan references, i.e. roots.
     let mut instrs = instrs;
     instrs.extend(decode_named(data, &sections, EXTRA_CODE_SECTIONS));
+    instrs.extend(links);
     let dead = run_analysis(&funcs, &instrs, data, &sections);
     (funcs, dead, sections, plt_names)
 }
 
-/// Build the function map from symtab; fall back to inference if stripped.
+/// Build the function map from symtab; fall back to inference if stripped,
+/// refined by `.eh_frame` FDE boundaries where `fde_hints` allows. Also
+/// returns extra references (synthetic instructions) the reference graph
+/// must include: fall-through and jump-table edges between functions.
 fn build_func_map(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -112,17 +116,108 @@ fn build_func_map(
     instrs: &[DecodedInstr],
     ts: u64,
     te: u64,
-) -> FuncMap {
-    let mut funcs = symbols::get_functions_symtab(elf);
-    if funcs.is_empty() {
-        let dynsyms = symbols::get_dynamic_symbols(elf);
-        let is64 = elf.is_64;
-        funcs = crate::decode::infer::infer_functions(
-            elf.entry, &dynsyms, data, sections, instrs, ts, te,
-            is64,
-        );
+) -> (FuncMap, Vec<DecodedInstr>) {
+    use crate::decode::infer;
+    let funcs = symbols::get_functions_symtab(elf);
+    if !funcs.is_empty() {
+        return (funcs, Vec::new());
     }
-    funcs
+    let dynsyms = symbols::get_dynamic_symbols(elf);
+    match fde_hints(elf, data, sections) {
+        Some(h) => infer::infer_functions_fde(
+            elf.entry, &dynsyms, data, sections, instrs, ts, te, &h,
+        ),
+        None => {
+            let funcs = infer::infer_functions(
+                elf.entry, &dynsyms, data, sections, instrs, ts, te,
+                elf.is_64,
+            );
+            (funcs, Vec::new())
+        }
+    }
+}
+
+/// FDE boundary hints for a stripped x86-64 image with `.eh_frame`.
+/// None for other architectures: their decoders do not resolve address
+/// formation exactly (ADRP/ADD, AUIPC, LUI pairs, GOT-relative offsets),
+/// so a function split off at its FDE could lose references it has.
+fn fde_hints(
+    elf: &goblin::elf::Elf,
+    data: &[u8],
+    sections: &[Section],
+) -> Option<crate::decode::infer::FdeHints> {
+    if detect_arch(data) != Arch::X86_64 {
+        return None;
+    }
+    let fdes = ehframe::fde_ranges(data, sections);
+    if fdes.is_empty() {
+        return None;
+    }
+    let fixed = elf.header.e_type == goblin::elf::header::ET_EXEC;
+    let (data_secs, ptr_secs, code_secs) =
+        alloc_sections(elf, fixed || has_textrel(elf));
+    Some(crate::decode::infer::FdeHints {
+        fdes,
+        personalities: ehframe::personality_targets(data, sections),
+        data_secs,
+        ptr_secs,
+        code_secs,
+        fixed,
+    })
+}
+
+/// True if the image has text relocations (DT_TEXTREL or DF_TEXTREL):
+/// dynamic relocations may then write absolute addresses anywhere.
+fn has_textrel(elf: &goblin::elf::Elf) -> bool {
+    use goblin::elf::dynamic::DF_TEXTREL;
+    elf.dynamic.as_ref().is_some_and(|d| {
+        d.info.textrel || d.info.flags as u64 & DF_TEXTREL != 0
+    })
+}
+
+/// Allocated, file-backed sections as (data, pointer, code) lists. The
+/// unwind tables are left out of the data: their FDE pointers name every
+/// function. Pointer sections are the data sections that can hold an
+/// absolute code address: all of them when `all_ptrs` (fixed-address
+/// image, text relocations); otherwise only those dynamic relocations
+/// write (writable sections) and the relocation tables (addends).
+fn alloc_sections(
+    elf: &goblin::elf::Elf,
+    all_ptrs: bool,
+) -> (Vec<Section>, Vec<Section>, Vec<Section>) {
+    use goblin::elf::section_header::{
+        SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_REL, SHT_RELA,
+    };
+    let (mut data, mut ptrs, mut code) = (Vec::new(), Vec::new(), Vec::new());
+    for sh in &elf.section_headers {
+        let flags = sh.sh_flags;
+        if flags & SHF_ALLOC as u64 == 0 || sh.sh_type == SHT_NOBITS {
+            continue;
+        }
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        let sec = Section {
+            name: name.to_string(),
+            size: sh.sh_size,
+            vaddr: sh.sh_addr,
+            offset: sh.sh_offset,
+            align: sh.sh_addralign,
+        };
+        if flags & SHF_EXECINSTR as u64 != 0 {
+            code.push(sec);
+            continue;
+        }
+        if name.starts_with(".eh_frame") {
+            continue;
+        }
+        let relocated = flags & SHF_WRITE as u64 != 0
+            || sh.sh_type == SHT_RELA
+            || sh.sh_type == SHT_REL;
+        if all_ptrs || relocated {
+            ptrs.push(sec.clone());
+        }
+        data.push(sec);
+    }
+    (data, ptrs, code)
 }
 
 /// Run reachability analysis: build call graph, determine roots, find dead.

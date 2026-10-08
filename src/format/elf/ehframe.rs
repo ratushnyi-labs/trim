@@ -881,6 +881,66 @@ fn plan_table(
     plan_value(&mut st, cnt, kept.len() as u64, cx).then_some(st)
 }
 
+// ---- Read-only accessors ------------------------------------------------
+
+/// Code ranges `(pc_begin, pc_range)` of the FDEs in `.eh_frame`, in
+/// record order. FDEs the linker discarded (`pc_begin` 0), FDEs that
+/// describe no code (`pc_range` 0, e.g. neutralised by an earlier trim
+/// run) and records the parser cannot decode are left out.
+pub fn fde_ranges(data: &[u8], sections: &[Section]) -> Vec<(u64, u64)> {
+    let sec = match sections.iter().find(|s| s.name == ".eh_frame") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let cx = Ctx::new(data, &[], 0, 0);
+    parse_eh_frame(data, sec, &cx)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fde(f) if f.begin != 0 && f.pc_range.raw != 0 => {
+                Some((f.begin, f.pc_range.raw))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Code addresses of the personality routines named by the CIEs of
+/// `.eh_frame`. The unwinder calls them through these pointers only.
+pub fn personality_targets(data: &[u8], sections: &[Section]) -> Vec<u64> {
+    let sec = match sections.iter().find(|s| s.name == ".eh_frame") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let cx = Ctx::new(data, &[], 0, 0);
+    parse_eh_frame(data, sec, &cx)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Personality(p) => {
+                personality_target(data, sections, &p, &cx)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Address designated by personality field `p`. A DW_EH_PE_indirect
+/// pointer designates a slot: its in-place value is returned (None when
+/// the slot is null or outside the file).
+fn personality_target(
+    data: &[u8],
+    sections: &[Section],
+    p: &EncPtr,
+    cx: &Ctx,
+) -> Option<u64> {
+    let a = apply(p.enc, p.raw, p.vaddr, None, cx).filter(|&a| a != 0)?;
+    if p.enc & PE_INDIRECT == 0 {
+        return Some(a);
+    }
+    let off = crate::types::vaddr_to_offset(a, sections)?;
+    let width = if cx.is64 { 8 } else { 4 };
+    read_un(data, usize::try_from(off).ok()?, width, cx.be).filter(|&v| v != 0)
+}
+
 // ---- Dead-block filter -------------------------------------------------
 
 /// Drop dead blocks lying in functions whose FDE has an LSDA. Their

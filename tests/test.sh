@@ -471,6 +471,77 @@ echo "$output" | grep -q 'result: 25' && \
     fail "BigDead: file size" "not reduced ($orig_sz_big -> $new_sz_big)"
 
 # =============================================
+# FDE function boundaries: stripped -O2 binary
+# =============================================
+printf '\n--- FDE function boundaries: stripped -O2 ---\n'
+# A stripped image marks no start for a function nothing calls, so
+# inference merged each dead_fde_* into the live function before it.
+# The .eh_frame FDEs now delimit functions exactly: the dead ones must
+# be found and removed (their 0x5EAD100n markers gone), while every
+# probe_* path (fall-through into the next FDE, code past an FDE's end,
+# a jump table into other FDEs, a sibling-call target, a pointer table,
+# a qsort callback) stays live. Built as PIE, non-PIE and static.
+fde_want='^probes: ft=6 gap=15 jt=70,71 tail=31 fp=14 sort=13579$'
+fde_live='probe_ft_head probe_ft_tail probe_gap probe_jt jt_case0 jt_case1
+    probe_tail probe_tail_target probe_fp_a probe_fp_b probe_cmp
+    live_a live_b live_c'
+fde_markers() {
+    python3 -c 'import sys
+d = open(sys.argv[1], "rb").read()
+print(sum(d.count((0x5EAD1000 + k).to_bytes(4, "little"))
+          for k in range(1, 5)))' "$1"
+}
+for fde_mode in pie nopie static; do
+    case $fde_mode in
+        pie) fde_flags= ;;
+        nopie) fde_flags='-fno-pie -no-pie' ;;
+        static) fde_flags=-static ;;
+    esac
+    fde_bin=/work/test-fde-$fde_mode
+    gcc -O2 $fde_flags -o "$fde_bin" /tests/fde-bounds.c
+    fde_syms=$(nm "$fde_bin")
+    cp "$fde_bin" "$fde_bin-s"
+    strip --strip-all "$fde_bin-s"
+    fde_expected=$("$fde_bin-s" 2>&1)
+    echo "$fde_expected" | grep -q "$fde_want" && \
+        pass "FdeBounds $fde_mode: original output correct" || \
+        fail "FdeBounds $fde_mode: original" "got: $fde_expected"
+
+    fde_dry=$(trim --dry-run "$fde_bin-s" 2>&1)
+    echo "$fde_dry"
+    fde_dead=0
+    fde_kept=0
+    for n in dead_fde_1 dead_fde_2 dead_fde_3 dead_fde_4 $fde_live; do
+        a=$(echo "$fde_syms" | awk -v n="$n" '$3 == n {
+            sub(/^0+/, "", $1); print $1 }')
+        if echo "$fde_dry" | grep -q "@ 0x$a\$"; then
+            case $n in dead_*) fde_dead=$((fde_dead + 1)) ;; esac
+        else
+            case $n in dead_*) ;; *) fde_kept=$((fde_kept + 1)) ;; esac
+        fi
+    done
+    [ "$fde_dead" -eq 4 ] && \
+        pass "FdeBounds $fde_mode: dead FDE-only functions found" || \
+        fail "FdeBounds $fde_mode: detection" "$fde_dead of 4 found"
+    [ "$fde_kept" -eq 14 ] && \
+        pass "FdeBounds $fde_mode: probe and live functions kept" || \
+        fail "FdeBounds $fde_mode: false positive" \
+            "$((14 - fde_kept)) live functions flagged"
+
+    trim --in-place "$fde_bin-s" 2>&1 | grep 'reassembled' || true
+    fde_out=$("$fde_bin-s" 2>&1) && \
+        pass "FdeBounds $fde_mode: patched binary executes" || \
+        fail "FdeBounds $fde_mode: execution" "crashed"
+    [ "$fde_out" = "$fde_expected" ] && \
+        pass "FdeBounds $fde_mode: patched output matches original" || \
+        fail "FdeBounds $fde_mode: output" "got: $fde_out"
+    fde_left=$(fde_markers "$fde_bin-s")
+    [ "$(fde_markers "$fde_bin")" -gt 0 ] && [ "$fde_left" -eq 0 ] && \
+        pass "FdeBounds $fde_mode: dead code removed from the file" || \
+        fail "FdeBounds $fde_mode: removal" "$fde_left markers left"
+done
+
+# =============================================
 # Static printf: constant-flag branch folding
 # =============================================
 printf '\n--- Static printf: constant-flag branch folding ---\n'
