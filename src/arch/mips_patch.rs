@@ -59,6 +59,18 @@ fn write_word(
     data[off..off + 4].copy_from_slice(&b);
 }
 
+/// True if the encoded target of an instruction with opcode `op` must
+/// change: J/JAL hold an absolute target, which changes whenever the
+/// target moves, even when the jump moves with it; a relative branch
+/// changes only when its source and target move apart.
+fn target_moved(op: u32, shift_src: u64, shift_tgt: u64) -> bool {
+    if matches!(op, 0x02 | 0x03) {
+        shift_tgt != 0
+    } else {
+        shift_src != shift_tgt
+    }
+}
+
 /// Patch a single MIPS instruction's branch target for address shifts.
 fn patch_one(
     data: &mut [u8],
@@ -80,8 +92,9 @@ fn patch_one(
         total_shift(instr.addr, intervals, ts, te);
     let shift_tgt =
         total_shift(target, intervals, ts, te);
-    let delta = shift_src as i64 - shift_tgt as i64;
-    if delta == 0 {
+    let w = read_word(&instr.raw, big_endian);
+    let op = w >> 26;
+    if !target_moved(op, shift_src, shift_tgt) {
         return;
     }
     let foff = match vaddr_to_offset(instr.addr, sections) {
@@ -91,8 +104,6 @@ fn patch_one(
     if foff + 4 > data.len() {
         return;
     }
-    let w = read_word(&instr.raw, big_endian);
-    let op = w >> 26;
     match op {
         // J / JAL — 26-bit region target
         0x02 | 0x03 => {
@@ -134,5 +145,21 @@ fn patch_one(
             write_word(data, foff, new_w, big_endian);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// J/JAL targets are absolute: they change whenever the target
+    /// moves; relative branches change only when the distance does.
+    #[test]
+    fn absolute_jumps_follow_their_target() {
+        assert!(target_moved(0x03, 60, 60));
+        assert!(target_moved(0x02, 0, 8));
+        assert!(!target_moved(0x03, 8, 0));
+        assert!(!target_moved(0x05, 60, 60));
+        assert!(target_moved(0x05, 60, 0));
     }
 }

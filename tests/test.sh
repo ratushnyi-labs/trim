@@ -2117,6 +2117,39 @@ echo "$patch_out_x32" | grep -q 'dead functions removed' && \
     fail "x86-32: compaction" "not reported"
 
 # =============================================
+# Dead-branch folding paused: ARM32, RISC-V, MIPS, LoongArch, s390x
+# =============================================
+printf '\n--- Dead-branch folding paused: ARM32, RISC-V, MIPS, LoongArch, s390x ---\n'
+# Dead branches are folded only on architectures whose constant model
+# passed a soundness audit (x86 and AArch64); the others are paused
+# until theirs lands. Their fixtures report no dead branch, while dead
+# functions are still found.
+for pa in arm32 riscv64 mips s390x loongarch64; do
+    pa_out=$(trim --dry-run /work/hello-$pa 2>&1) || true
+    ! echo "$pa_out" | grep -q 'dead branch:' && \
+        echo "$pa_out" | grep -q 'found 2 dead functions' && \
+        pass "Paused $pa: no dead branch; dead functions still found" || \
+        fail "Paused $pa" "$pa_out"
+done
+# MIPS: $t0 = 0 is overwritten by lw (1 at run time) and tested with
+# bnez; the constant model ignored the load and folded the live path
+# away (mips-fold.c). The trimmed binary must print what it printed.
+# Its dead function lies before put and __start, so the absolute JAL
+# targets to them must follow even where the JAL itself moves too.
+clang-19 --target=mips-linux-gnu -nostdlib -static -O0 -fno-pic \
+    -fuse-ld=lld -o /work/test-mips-fold /tests/mips-fold.c 2>/dev/null
+mf_expected=$(qemu-mips /work/test-mips-fold 2>&1) || true
+mf_out=$(trim --in-place /work/test-mips-fold 2>&1) || true
+echo "$mf_out"
+mf_got=$(qemu-mips /work/test-mips-fold 2>&1) || true
+[ "$mf_expected" = 'probes: 1' ] && \
+    ! echo "$mf_out" | grep -q 'dead branch:' && \
+    echo "$mf_out" | grep -q 'dead_unused: ' && \
+    [ "$mf_got" = "$mf_expected" ] && \
+    pass "Paused MIPS: lw/bnez probe kept; trimmed output identical" || \
+    fail "Paused MIPS: lw/bnez probe" "got: $mf_got"
+
+# =============================================
 # Dead code detection: WebAssembly
 # =============================================
 printf '\n--- Dead code detection: WebAssembly ---\n'

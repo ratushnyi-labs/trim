@@ -75,6 +75,10 @@ pub fn analyze(
 
 /// Run SCCP (Sparse Conditional Constant Propagation) on all eligible
 /// live functions and collect dead blocks where branches resolve statically.
+/// Nothing on an architecture whose folding is paused
+/// (`regstate::folds_branches`): SCCP also reports the blocks its CFG
+/// never reaches, such as the code after an ECALL or SYSCALL that the
+/// decoders treat as halting although most system calls return.
 fn run_sccp_analysis(
     funcs: &FuncMap,
     instrs: &[types::DecodedInstr],
@@ -83,6 +87,9 @@ fn run_sccp_analysis(
     max_instrs: usize,
     big_endian: bool,
 ) -> (Vec<analysis::cfg::DeadBlock>, Vec<(String, usize)>) {
+    if !analysis::regstate::folds_branches(arch) {
+        return (Vec::new(), Vec::new());
+    }
     let mut all_dead = Vec::new();
     let mut skipped = Vec::new();
     for (name, fi) in funcs {

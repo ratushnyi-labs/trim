@@ -546,16 +546,29 @@ pub struct BranchTest {
     pub src: TestSrc,
 }
 
-/// What a conditional branch tests, or None when it is not decoded.
-/// AArch64 branches may test FLAGS or a register (`a64_branch_test`);
-/// elsewhere they test FLAGS. Outside x86 only equality branches are
-/// decoded, and only those whose FLAGS value comes from the matching
-/// compare effect.
+/// Architectures whose dead-branch folding has passed a soundness audit.
+/// Folding is paused on the others (ARM32, RISC-V, MIPS, LoongArch and
+/// s390x) until theirs lands; each audit adds its architecture here.
+const FOLD_AUDITED: &[Arch] = &[Arch::X86_64, Arch::X86_32, Arch::Aarch64];
+
+/// True if dead branches may be folded on `arch` (see `FOLD_AUDITED`).
+pub fn folds_branches(arch: Arch) -> bool {
+    FOLD_AUDITED.contains(&arch)
+}
+
+/// What a conditional branch tests, or None when it is not decoded or
+/// folding is paused on `arch` (`folds_branches`). AArch64 branches may
+/// test FLAGS or a register (`a64_branch_test`); elsewhere they test
+/// FLAGS. Outside x86 only equality branches are decoded, and only
+/// those whose FLAGS value comes from the matching compare effect.
 pub fn branch_test(
     raw: &[u8],
     arch: Arch,
     big_endian: bool,
 ) -> Option<BranchTest> {
+    if !folds_branches(arch) {
+        return None;
+    }
     let cc = match arch {
         Arch::Aarch64 => return a64_branch_test(word_le(raw)?),
         Arch::X86_64 | Arch::X86_32 => x86_branch_cond(raw)?.cc,
