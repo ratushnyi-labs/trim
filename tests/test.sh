@@ -811,6 +811,51 @@ new_sz_drain=$(stat -c%s /work/test-nat-drain)
     fail "NativeAOT without __modules" "note or size: $orig_sz_drain -> $new_sz_drain"
 
 # =============================================
+# NativeAOT ReadyToRun references: kept live
+# =============================================
+printf '\n--- NativeAOT ReadyToRun references: kept live ---\n'
+# No .NET SDK in this image, so the fixture builds a minimal ReadyToRun
+# header behind __modules: a module initializer list (213) and an
+# ExternalReferences table (308) of 32-bit self-relative pointers to two
+# static functions nothing else references. main() calls through them
+# like the runtime: zero-filling them crashed it. r2r_unused stays dead.
+gcc -g -O0 -fno-inline -o /work/test-r2r /tests/nativeaot-r2r.c
+cp /work/test-r2r /work/test-r2r-strip
+strip --strip-all /work/test-r2r-strip
+r2r_out=$(trim --dry-run /work/test-r2r 2>&1) || true
+echo "$r2r_out"
+echo "$r2r_out" | \
+    grep -q 'note: NativeAOT: 2 ReadyToRun references into code' && \
+    pass "R2R refs: 2 references into code found" || \
+    fail "R2R refs: model" "note not printed"
+! echo "$r2r_out" | grep -q 'r2r_module_init\|r2r_external_ref' && \
+    pass "R2R refs: referenced functions kept live" || \
+    fail "R2R refs: false positive" "referenced function flagged dead"
+echo "$r2r_out" | grep -q 'r2r_unused' && \
+    pass "R2R refs: unreferenced function still dead" || \
+    fail "R2R refs: detection" "r2r_unused not found"
+trim --in-place /work/test-r2r 2>/dev/null || true
+output=$(/work/test-r2r 2>&1) || true
+echo "$output" | grep -q 'r2r: 51' && \
+    pass "R2R refs: patched binary calls through the references" || \
+    fail "R2R refs: execution" "got: $output"
+# Stripped: functions inferred from FDEs.
+trim --in-place /work/test-r2r-strip 2>/dev/null || true
+output=$(/work/test-r2r-strip 2>&1) || true
+echo "$output" | grep -q 'r2r: 51' && \
+    pass "R2R refs stripped: patched binary output correct" || \
+    fail "R2R refs stripped: output" "got: $output"
+# An unverified header version: the model is refused and nothing may be
+# called dead (fail closed).
+gcc -g -O0 -fno-inline -DR2R_MAJOR=15 \
+    -o /work/test-r2r-v15 /tests/nativeaot-r2r.c
+r2r_out=$(trim --dry-run /work/test-r2r-v15 2>&1) || true
+echo "$r2r_out" | grep -q 'ReadyToRun version 15.0 not verified' && \
+    ! echo "$r2r_out" | grep -q 'dead functions' && \
+    pass "R2R refs: unverified version fails closed (nothing dead)" || \
+    fail "R2R refs: fail closed" "got: $r2r_out"
+
+# =============================================
 # Dead code outside .text: zero-filled in place
 # =============================================
 printf '\n--- Dead code outside .text: zero-filled in place ---\n'

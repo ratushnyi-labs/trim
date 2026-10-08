@@ -923,6 +923,29 @@ pub fn personality_targets(data: &[u8], sections: &[Section]) -> Vec<u64> {
         .collect()
 }
 
+/// LSDA addresses named by the FDEs of `.eh_frame`, as
+/// `(pc_begin, lsda)` in record order. FDEs the linker discarded
+/// (`pc_begin` 0), FDEs without an LSDA or with a null one, and
+/// DW_EH_PE_indirect LSDA pointers are left out.
+pub fn fde_lsdas(data: &[u8], sections: &[Section]) -> Vec<(u64, u64)> {
+    let sec = match sections.iter().find(|s| s.name == ".eh_frame") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let cx = Ctx::new(data, &[], 0, 0);
+    parse_eh_frame(data, sec, &cx)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fde(f) if f.begin != 0 => {
+                let l = f.lsda.filter(|l| l.enc & PE_INDIRECT == 0)?;
+                let a = apply(l.enc, l.raw, l.vaddr, None, &cx)?;
+                (a != 0).then_some((f.begin, a))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Address designated by personality field `p`. A DW_EH_PE_indirect
 /// pointer designates a slot: its in-place value is returned (None when
 /// the slot is null or outside the file).

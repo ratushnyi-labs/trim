@@ -7,6 +7,7 @@
 //! other executable sections are zero-filled in place: only .text moves.
 
 pub mod ehframe;
+pub mod nativeaot;
 pub mod patch;
 pub mod relr;
 pub mod sections;
@@ -143,9 +144,11 @@ fn build_func_map(
 /// resolve address formation exactly (ADRP/ADD, AUIPC, LUI pairs,
 /// GOT-relative offsets), so a function split off at its FDE could lose
 /// references it has. None for x32 (ELFCLASS32), whose pointer scans
-/// assume 8-byte pointers. None for NativeAOT images: code they reach
-/// only through 32-bit self-relative pointers in ReadyToRun data is not
-/// a root, so it must stay merged into the function before it.
+/// assume 8-byte pointers. None for NativeAOT images: split at FDEs,
+/// code reached only through 32-bit self-relative pointers in
+/// ReadyToRun data would depend on `nativeaot::root_names` alone; it
+/// stays merged into the function before it until that model is
+/// accepted as the only guard.
 fn fde_hints(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -253,6 +256,7 @@ fn run_analysis(
         .collect();
     if is_nativeaot(sections) {
         data_names.extend(managed_funcs(funcs, sections));
+        data_names.extend(nativeaot::root_names(data, funcs));
     }
     let roots = determine_roots(funcs, &data_names, &orphan_refs);
     let live = compute_live_set(&roots, &graph, funcs);
