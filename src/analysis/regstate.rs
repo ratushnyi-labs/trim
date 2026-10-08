@@ -9,9 +9,11 @@
 use crate::analysis::lattice::{BinOp, CondCode};
 use crate::types::Arch;
 
-/// Abstract register ID (arch-independent).
-/// GPR 0..15 for x86 (RAX=0 .. R15=15), 0..30 for ARM.
-/// FLAGS = 16.
+/// Abstract register ID (arch-independent): the architecture's own
+/// register number for the GPRs 0..15 that are tracked (x86 RAX=0 ..
+/// R15=15, AArch64 X0..X15, ARM32 R0..R15, s390x R0..R15; RISC-V, MIPS
+/// and LoongArch 1..15, register 0 being hard-wired zero). Higher
+/// registers are never tracked. FLAGS = 16.
 pub type RegId = u8;
 
 pub const FLAGS_REG: RegId = 16;
@@ -545,41 +547,25 @@ pub struct BranchTest {
 }
 
 /// What a conditional branch tests, or None when it is not decoded.
+/// AArch64 branches may test FLAGS or a register (`a64_branch_test`);
+/// elsewhere they test FLAGS. Outside x86 only equality branches are
+/// decoded, and only those whose FLAGS value comes from the matching
+/// compare effect.
 pub fn branch_test(
     raw: &[u8],
     arch: Arch,
     big_endian: bool,
 ) -> Option<BranchTest> {
-    if arch == Arch::Aarch64 {
-        return a64_branch_test(word_le(raw)?);
-    }
-    let cc = branch_cond(raw, arch, big_endian)?;
+    let cc = match arch {
+        Arch::Aarch64 => return a64_branch_test(word_le(raw)?),
+        Arch::X86_64 | Arch::X86_32 => x86_branch_cond(raw)?.cc,
+        Arch::Arm32 => arm32_branch_cond(word_le(raw)?)?,
+        Arch::RiscV64 | Arch::RiscV32 => rv_branch_cond(raw)?,
+        Arch::Mips32 | Arch::Mips64 => mips_branch_cond(raw, big_endian)?,
+        Arch::S390x => s390x_branch_cond(raw)?,
+        Arch::LoongArch64 => la_branch_cond(word_le(raw)?)?,
+    };
     Some(BranchTest { cc, src: TestSrc::Flags })
-}
-
-/// FLAGS condition tested by a conditional branch, or None when it is
-/// not decoded. Outside x86 only equality branches are decoded, and
-/// only those whose FLAGS value comes from the matching compare effect.
-fn branch_cond(
-    raw: &[u8],
-    arch: Arch,
-    big_endian: bool,
-) -> Option<CondCode> {
-    match arch {
-        Arch::X86_64 | Arch::X86_32 => {
-            x86_branch_cond(raw).map(|b| b.cc)
-        }
-        Arch::Aarch64 => a64_branch_cond(word_le(raw)?),
-        Arch::Arm32 => arm32_branch_cond(word_le(raw)?),
-        Arch::RiscV64 | Arch::RiscV32 => {
-            rv_branch_cond(raw)
-        }
-        Arch::Mips32 | Arch::Mips64 => {
-            mips_branch_cond(raw, big_endian)
-        }
-        Arch::S390x => s390x_branch_cond(raw),
-        Arch::LoongArch64 => la_branch_cond(word_le(raw)?),
-    }
 }
 
 /// Read a little-endian 32-bit instruction word.
@@ -690,10 +676,17 @@ fn s390x_branch_cond(raw: &[u8]) -> Option<CondCode> {
 
 // ===== AArch64 =====
 
-/// AArch64 caller-saved: X0-X15 and FLAGS, i.e. every tracked AArch64
-/// register. A call also clobbers X16-X18 and X30, which are never
-/// tracked (see `aarch64_reg_id`).
+/// AArch64 caller-saved: X0-X15 and FLAGS. A call also clobbers
+/// X16-X18 and X30, which are never tracked (see `aarch64_reg_id`).
 pub const AARCH64_CALLER_SAVED: &[RegId] = &[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    FLAGS_REG,
+];
+
+/// Every AArch64 register the constant model tracks: X0-X15 (those
+/// `aarch64_reg_id` maps) and FLAGS. An unknown instruction clobbers
+/// all of them, whatever the calling convention says.
+const AARCH64_TRACKED: &[RegId] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     FLAGS_REG,
 ];
@@ -730,7 +723,7 @@ fn aarch64_effects(raw: &[u8]) -> Vec<SsaEffect> {
 
 /// Clobber every tracked AArch64 register and FLAGS.
 fn a64_clobber_all() -> Vec<SsaEffect> {
-    AARCH64_CALLER_SAVED
+    AARCH64_TRACKED
         .iter()
         .map(|&r| SsaEffect::Clobber(r))
         .collect()
@@ -910,7 +903,9 @@ fn a64_movwide(w: u32) -> Vec<SsaEffect> {
 // ----- AArch64 branches, exception generation and system -----
 
 /// Branches, exception generation and system instructions. MSR and
-/// PSTATE writes may change NZCV; MRS writes Rt. SVC, SYS/SYSL,
+/// PSTATE writes may change NZCV; MRS writes Rt, and MRS of RNDR or
+/// RNDRRS also writes NZCV (Z set when no random number was returned),
+/// so every MRS clobbers FLAGS. SVC, SYS/SYSL,
 /// register branches (BLRAA, ...) and anything unknown clobber all
 /// tracked registers and FLAGS. BL/BLR get the call clobber before
 /// effects are extracted.
@@ -923,9 +918,9 @@ fn a64_branch_sys(w: u32) -> Vec<SsaEffect> {
     {
         return vec![SsaEffect::Clobber(FLAGS_REG)];
     }
-    // MRS Xt, <sysreg>
+    // MRS Xt, <sysreg> (RNDR, RNDRRS: also NZCV)
     if w & 0xFFF0_0000 == 0xD530_0000 {
-        return a64_clobber_rd(w, false);
+        return a64_clobber_rd(w, true);
     }
     a64_clobber_all()
 }
@@ -1097,12 +1092,18 @@ fn a64_logical_reg(w: u32) -> Vec<SsaEffect> {
 
 // ----- AArch64 scalar floating-point and Advanced SIMD -----
 
-/// Scalar FP and Advanced SIMD. Only FP-to-integer conversions and
-/// FMOV to a GPR (scalar FP class, bit 21 clear or bits 15:10 zero)
-/// and SMOV/UMOV write a GPR; only the scalar FP class (FCMP, FCCMP,
-/// FJCVTZS) writes NZCV. Rd of other matches is a SIMD register, so
-/// clobbering it as a GPR only loses precision.
+/// Scalar FP and Advanced SIMD. Only conversions to a GPR (FCVT*,
+/// FJCVTZS), FMOV to a GPR and SMOV/UMOV write a GPR, and only FCMP,
+/// FCMPE, FCCMP, FCCMPE and FJCVTZS write NZCV. Bits 28:24 = 11110
+/// select the scalar FP classes (bit 30 clear) and the Advanced SIMD
+/// scalar classes (bit 30 set) alike. Within them, every conversion
+/// form (bit 21 clear: fixed-point; bits 15:10 zero: integer, FMOV)
+/// clobbers Rd and FLAGS, and every other form FLAGS; SMOV/UMOV and
+/// the other Advanced SIMD copies clobber Rd. Rd of most of these
+/// matches is a SIMD register and most write no NZCV, so the extra
+/// clobbers only lose precision.
 fn a64_fp_simd(w: u32) -> Vec<SsaEffect> {
+    // Scalar FP or Advanced SIMD scalar (bits 28:24 = 11110).
     let scalar_fp = (w >> 24) & 0x1F == 0b11110;
     let to_gpr = scalar_fp
         && ((w >> 21) & 1 == 0 || (w >> 10) & 0x3F == 0);
@@ -2297,5 +2298,38 @@ fn la_branch_1r(w: u32) -> Vec<SsaEffect> {
         vec![SsaEffect::CmpImm(id, 0)]
     } else {
         vec![SsaEffect::Clobber(FLAGS_REG)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registers an effect list clobbers.
+    fn clobbered(effects: &[SsaEffect]) -> Vec<RegId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                SsaEffect::Clobber(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// MRS of RNDR (d53b2409: mrs x9, s3_3_c2_c4_0) writes x9 and NZCV.
+    #[test]
+    fn mrs_rndr_clobbers_rt_and_flags() {
+        let got = clobbered(&aarch64_effects(&0xd53b_2409u32.to_le_bytes()));
+        assert_eq!(got, vec![9, FLAGS_REG]);
+    }
+
+    /// The clobber-everything effect covers exactly the registers the
+    /// model tracks: every register `aarch64_reg_id` maps, and FLAGS.
+    #[test]
+    fn a64_clobber_all_covers_every_tracked_register() {
+        let mut want: Vec<RegId> =
+            (0..32).filter_map(aarch64_reg_id).collect();
+        want.push(FLAGS_REG);
+        assert_eq!(clobbered(&a64_clobber_all()), want);
     }
 }

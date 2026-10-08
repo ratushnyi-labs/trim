@@ -368,6 +368,22 @@ static int probe_mrs(long one) {
     return (int)r;
 }
 
+/* MRS of RNDR (s3_3_c2_c4_0) writes x9 and NZCV: Z is clear when a
+ * random number was returned, so the EQ left by the compare before it
+ * must not decide the branch. */
+__attribute__((noinline, used))
+static int probe_mrs_rndr(void) {
+    long r;
+    __asm__ volatile(
+        "mov %0, #-2\n\t"
+        "mov x10, #0\n\t"
+        "cmp x10, #0\n\t"
+        "mrs x9, s3_3_c2_c4_0\n\t"
+        LIVE_IF_TAKEN("b.ne")
+        : "=&r"(r) : : "x9", "x10", "cc");
+    return (int)r;
+}
+
 /* ADRP overwrites a constant with a page address. */
 __attribute__((noinline, used))
 static int probe_adrp(void) {
@@ -499,6 +515,65 @@ static int probe_dead_wrap(void) {
     return (int)r;
 }
 
+/* Provably dead: the bitmask immediate 0x8000000180000001 (MOV, i.e.
+ * ORR from XZR; a 32-bit element replicated) has bit 32 set, so TBNZ
+ * is always taken. */
+__attribute__((noinline, used))
+static int probe_dead_bitmask(void) {
+    long r;
+    __asm__ volatile(
+        "mov %0, #-2\n\t"
+        "mov x9, #0x8000000180000001\n\t"
+        "add x9, x9, #0\n\t"
+        LIVE_IF_TAKEN("tbnz x9, #32,")
+        : "=&r"(r) : : "x9", "cc");
+    return (int)r;
+}
+
+/* Provably dead: MOVK keeps the other fields, so 1 with 0x8000 put in
+ * bits 63:48 equals the bitmask immediate 0x8000000000000001. */
+__attribute__((noinline, used))
+static int probe_dead_movk(void) {
+    long r;
+    __asm__ volatile(
+        "mov %0, #-2\n\t"
+        "mov x9, #1\n\t"
+        "movk x9, #0x8000, lsl #48\n\t"
+        "mov x10, #0x8000000000000001\n\t"
+        "cmp x9, x10\n\t"
+        LIVE_IF_TAKEN("b.eq")
+        : "=&r"(r) : : "x9", "x10", "cc");
+    return (int)r;
+}
+
+/* Provably dead: CMN adds, so -5 + 5 sets Z and B.EQ is always taken. */
+__attribute__((noinline, used))
+static int probe_dead_cmn(void) {
+    long r;
+    __asm__ volatile(
+        "mov %0, #-2\n\t"
+        "mov x9, #-5\n\t"
+        "cmn x9, #5\n\t"
+        LIVE_IF_TAKEN("b.eq")
+        : "=&r"(r) : : "x9", "cc");
+    return (int)r;
+}
+
+/* Provably dead: ANDS on W registers tests only the low 32 bits of
+ * 2^32 against 0x80000000 (not sign-extended), so Z is set and B.EQ is
+ * always taken. */
+__attribute__((noinline, used))
+static int probe_dead_ands_w(void) {
+    long r;
+    __asm__ volatile(
+        "mov %0, #-2\n\t"
+        "movz x10, #1, lsl #32\n\t"
+        "ands w9, w10, #0x80000000\n\t"
+        LIVE_IF_TAKEN("b.eq")
+        : "=&r"(r) : : "x9", "x10", "cc");
+    return (int)r;
+}
+
 /* Write a buffer to stdout. */
 static void put(const char *s, long n) {
     register long x0 __asm__("x0") = 1;
@@ -541,6 +616,7 @@ void _start(void) {
     put_result(probe_fmov(one));
     put_result(probe_umov(one));
     put_result(probe_mrs(one));
+    put_result(probe_mrs_rndr());
     put_result(probe_adrp());
     put_result(probe_svc());
     put_result(probe_bl());
@@ -551,6 +627,10 @@ void _start(void) {
     put_result(probe_dead_cbz_w());
     put_result(probe_dead_tbnz());
     put_result(probe_dead_wrap());
+    put_result(probe_dead_bitmask());
+    put_result(probe_dead_movk());
+    put_result(probe_dead_cmn());
+    put_result(probe_dead_ands_w());
     put("\n", 1);
     __asm__ volatile("mov x0, #0\n\tmov x8, #93\n\tsvc #0" ::: "memory");
     __builtin_unreachable();
