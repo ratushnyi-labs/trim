@@ -1047,25 +1047,34 @@ pub fn personality_targets(data: &[u8], sections: &[Section]) -> Vec<u64> {
 
 /// LSDA addresses named by the FDEs of `.eh_frame`, as
 /// `(pc_begin, lsda)` in record order. FDEs the linker discarded
-/// (`pc_begin` 0), FDEs without an LSDA or with a null one, and
-/// DW_EH_PE_indirect LSDA pointers are left out.
-pub fn fde_lsdas(data: &[u8], sections: &[Section]) -> Vec<(u64, u64)> {
+/// (`pc_begin` 0) and FDEs without an LSDA or with a null one are left
+/// out. `Err(pc_begin)` for the first FDE whose LSDA pointer cannot be
+/// located: DW_EH_PE_indirect (the LSDA address sits in a slot) or an
+/// application that does not resolve without a base. Callers needing
+/// every LSDA must then give up rather than miss it.
+pub fn fde_lsdas(data: &[u8], sections: &[Section]) -> Result<Vec<(u64, u64)>, u64> {
     let sec = match sections.iter().find(|s| s.name == ".eh_frame") {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let cx = Ctx::new(data, &[], 0, 0);
-    parse_eh_frame(data, sec, &cx)
-        .into_iter()
-        .filter_map(|r| match r {
-            Record::Fde(f) if f.begin != 0 => {
-                let l = f.lsda.filter(|l| l.enc & PE_INDIRECT == 0)?;
-                let a = apply(l.enc, l.raw, l.vaddr, None, &cx)?;
-                (a != 0).then_some((f.begin, a))
-            }
-            _ => None,
-        })
-        .collect()
+    let mut out = Vec::new();
+    for r in parse_eh_frame(data, sec, &cx) {
+        let f = match r {
+            Record::Fde(f) if f.begin != 0 => f,
+            _ => continue,
+        };
+        let Some(l) = f.lsda else { continue };
+        if l.enc & PE_INDIRECT != 0 && l.raw != 0 {
+            return Err(f.begin);
+        }
+        match apply(l.enc, l.raw, l.vaddr, None, &cx) {
+            Some(0) => {}
+            Some(a) => out.push((f.begin, a)),
+            None => return Err(f.begin),
+        }
+    }
+    Ok(out)
 }
 
 /// Address designated by personality field `p`. A DW_EH_PE_indirect
@@ -1390,6 +1399,32 @@ mod tests {
         let (d, secs) = img.finish();
         assert_eq!(personality_targets(&d, &secs), vec![0x1500]);
         assert_eq!(lsda_ranges(&d, &secs), vec![(0x1000, 0x1040)]);
+    }
+
+    /// An image with one 'zRL' FDE at 0x1000 whose LSDA field, encoded
+    /// as `lsda_enc`, holds 0x10; returns it with the field's vaddr.
+    fn lsda_image(lsda_enc: u8) -> (Vec<u8>, Vec<Section>, u64) {
+        let mut img = Img::new();
+        let c = img.cie(b"zRL", 1, &[0x1b, lsda_enc]);
+        let raw = 0x1000u64.wrapping_sub(img.next_field()) as u32;
+        // pc_begin, pc_range and the augmentation length come first.
+        let field = img.next_field() + 9;
+        img.fde_raw(c, raw, 0x40, &0x10u32.to_le_bytes(), &[]);
+        let (d, secs) = img.finish();
+        (d, secs, field)
+    }
+
+    /// A pc-relative LSDA is listed; an indirect one (its address sits
+    /// in a slot) or one that does not resolve without a base (datarel)
+    /// is refused with the FDE's pc_begin.
+    #[test]
+    fn lists_lsdas_and_refuses_unlocatable_ones() {
+        let (d, secs, field) = lsda_image(0x1b);
+        assert_eq!(fde_lsdas(&d, &secs), Ok(vec![(0x1000, field + 0x10)]));
+        let (d, secs, _) = lsda_image(0x9b);
+        assert_eq!(fde_lsdas(&d, &secs), Err(0x1000));
+        let (d, secs, _) = lsda_image(0x3b);
+        assert_eq!(fde_lsdas(&d, &secs), Err(0x1000));
     }
 
     // ---- Patching --------------------------------------------------------

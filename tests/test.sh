@@ -577,6 +577,21 @@ output=$(/work/dynsym-loader /work/libdynsym.so 2>&1) || true
 echo "$output" | grep -q "$dyn_want" && \
     pass "DynsymExports: exports still bound and correct after trim" || \
     fail "DynsymExports: patched" "got: $output"
+# Unstripped (the usual gcc -shared output) the function map comes from
+# .symtab, which holds STT_FUNC symbols only: the IFUNC's resolver is a
+# local function nothing calls, so it and the implementation it returns
+# were removed. The .symtab function holding each .dynsym entry is a root.
+gcc -g -O0 -fno-inline -fPIC -shared \
+    -o /work/libdynsym-u.so /tests/dynsym-exports.c
+dyn_out=$(trim --in-place /work/libdynsym-u.so 2>&1) || true
+echo "$dyn_out" | grep -q '4 dead functions removed' && \
+    ! echo "$dyn_out" | grep -q 'ifunc_resolver\|ifunc_impl' && \
+    pass "DynsymExports unstripped: only the 4 dead functions removed" || \
+    fail "DynsymExports unstripped: removal" "got: $dyn_out"
+output=$(/work/dynsym-loader /work/libdynsym-u.so 2>&1) || true
+echo "$output" | grep -q "$dyn_want" && \
+    pass "DynsymExports unstripped: exports still bound and correct after trim" || \
+    fail "DynsymExports unstripped: patched" "got: $output"
 
 # =============================================
 # Static printf: constant-flag branch folding

@@ -119,6 +119,8 @@ pub fn analyze_elf_full(
 /// refined by `.eh_frame` FDE boundaries where `fde_hints` allows. Also
 /// returns extra references (synthetic instructions) the reference graph
 /// must include: fall-through and jump-table edges between functions.
+/// Either way every `.dynsym` code entry point is a root: on the symtab
+/// path through the function holding it (`root_dynamic_exports`).
 fn build_func_map(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -128,8 +130,9 @@ fn build_func_map(
     te: u64,
 ) -> (FuncMap, Vec<DecodedInstr>) {
     use crate::decode::infer;
-    let funcs = symbols::get_functions_symtab(elf);
+    let mut funcs = symbols::get_functions_symtab(elf);
     if !funcs.is_empty() {
+        symbols::root_dynamic_exports(elf, &mut funcs);
         return (funcs, Vec::new());
     }
     let dynsyms = symbols::get_dynamic_symbols(elf);

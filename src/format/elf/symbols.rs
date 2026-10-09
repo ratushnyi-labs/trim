@@ -7,7 +7,8 @@ use crate::types::{FuncInfo, FuncMap, Section};
 use goblin::elf::section_header::SHN_UNDEF;
 use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_TLS};
 use goblin::elf::Elf;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 /// Extract defined text functions from the static symbol table (.symtab).
 pub fn get_functions_symtab(elf: &Elf) -> FuncMap {
@@ -78,6 +79,57 @@ pub fn get_dynamic_symbols(elf: &Elf) -> FuncMap {
         funcs.insert(key, fi);
     }
     funcs
+}
+
+/// Make every `.symtab` function of `funcs` that holds a code entry
+/// point of `.dynsym` (`get_dynamic_symbols`) a liveness root, by
+/// marking it global. `get_functions_symtab` keeps STT_FUNC symbols
+/// only, so an export of another type (an IFUNC whose value is a local
+/// resolver, an untyped assembly label) names code that no root reaches
+/// otherwise: the dynamic linker calls it through `st_value` alone. An
+/// entry point inside no function needs nothing: code outside every
+/// function is never removed. Returns the number of functions rooted.
+pub fn root_dynamic_exports(elf: &Elf, funcs: &mut FuncMap) -> usize {
+    let entries: Vec<u64> = get_dynamic_symbols(elf).values().map(|f| f.addr).collect();
+    let mut rooted = 0;
+    for name in funcs_containing(funcs, &entries) {
+        if let Some(fi) = funcs.get_mut(&name).filter(|fi| !fi.is_global) {
+            fi.is_global = true;
+            rooted += 1;
+        }
+    }
+    rooted
+}
+
+/// Names of the functions of `funcs` whose range `[addr, addr + size)`
+/// holds one of `addrs`. Ranges may nest or overlap (aliases, inner
+/// symbols with a size): every function holding an address is named,
+/// not only the closest one starting below it. One sweep over both
+/// lists sorted by address; a range leaves the open set once named.
+pub fn funcs_containing(funcs: &FuncMap, addrs: &[u64]) -> BTreeSet<String> {
+    let mut ranges: Vec<(u64, u64, &String)> = funcs
+        .iter()
+        .map(|(n, f)| (f.addr, f.addr.saturating_add(f.size), n))
+        .collect();
+    ranges.sort_unstable();
+    let mut addrs = addrs.to_vec();
+    addrs.sort_unstable();
+    let mut open: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
+    let mut next = 0;
+    let mut names = BTreeSet::new();
+    for a in addrs {
+        while let Some(&(start, end, _)) = ranges.get(next).filter(|r| r.0 <= a) {
+            if start < end {
+                open.push(Reverse((end, next)));
+            }
+            next += 1;
+        }
+        while open.peek().is_some_and(|Reverse((end, _))| *end <= a) {
+            open.pop();
+        }
+        names.extend(open.drain().map(|Reverse((_, i))| ranges[i].2.clone()));
+    }
+    names
 }
 
 /// Address ranges `[lo, hi)` of the allocated executable sections, or
@@ -154,5 +206,34 @@ fn plt_entry_size(sec: &Section) -> u64 {
         ".plt" => 16,
         ".plt.sec" => 8,
         _ => 16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local function of `size` bytes at `addr`.
+    fn func(addr: u64, size: u64) -> FuncInfo {
+        FuncInfo { addr, size, is_global: false }
+    }
+
+    /// Every range holding an address is named, nested ones included;
+    /// empty ranges and addresses past every end name nothing.
+    #[test]
+    fn names_every_containing_range() {
+        let mut funcs = FuncMap::new();
+        funcs.insert("outer".into(), func(0x100, 0x100));
+        funcs.insert("inner".into(), func(0x120, 0x10));
+        funcs.insert("after".into(), func(0x140, 0x20));
+        funcs.insert("empty".into(), func(0x150, 0));
+        funcs.insert("far".into(), func(0x300, 0x10));
+        let names = funcs_containing(&funcs, &[0x150, 0x124, 0x2ff]);
+        let want: BTreeSet<String> =
+            ["after", "inner", "outer"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, want);
+        let tail = funcs_containing(&funcs, &[0x1f0]);
+        assert_eq!(tail.into_iter().collect::<Vec<_>>(), vec!["outer".to_string()]);
+        assert!(funcs_containing(&funcs, &[0x200, 0x50]).is_empty());
     }
 }

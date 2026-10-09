@@ -27,6 +27,17 @@
 //! reaches only through MethodTable fields; they point at MethodTables,
 //! never at code.
 //!
+//! Stack trace data is not modelled: an image whose stack trace method
+//! mapping (section 327) is not empty is refused, and then every function
+//! is kept live. .NET compiles that data in by default; only images
+//! published with `StackTraceSupport` set to false have an empty one.
+//!
+//! The parser is bounded for crafted input: it reads only file-backed
+//! bytes of `__modules`, each header once; ReadyToRun rows must not
+//! overlap; the references found may not outnumber the 4-byte fields of
+//! the file; the rebuilt dehydrated data may not exceed a small multiple
+//! of the file size; MethodTables and EH info blocks must not overlap.
+//!
 //! Layouts follow the .NET runtime sources (ModuleHeaders.h,
 //! StartupCodeHelpers.cs, DehydratedData.cs, ExternalReferencesTable.cs,
 //! MethodTable.cs, UnixNativeCodeManager.cpp). They are verified for
@@ -88,6 +99,12 @@ const CMD_INLINE_PTR_RELOC: u8 = 5;
 /// Largest payload a command byte holds by itself; larger payloads
 /// follow in 1 to 3 extra bytes.
 const MAX_SHORT_PAYLOAD: usize = 28;
+/// Most bytes the dehydrated data may rebuild per byte of the file. Its
+/// destination is usually a NOBITS section, whose size the file does not
+/// bound; real images rebuild less than the file holds (.NET 10: about
+/// 0.4 bytes per file byte), so this only stops crafted zero runs from
+/// exhausting memory.
+const HYDRATED_PER_FILE_BYTE: u64 = 4;
 
 /// MethodTable fixed part: flags, base size, related type, vtable and
 /// interface counts, hash code.
@@ -191,8 +208,10 @@ impl RelPtr {
 /// Why the model could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
-    /// `__modules` names no ReadyToRun header: nothing to model.
-    NoHeader,
+    /// `__modules` names no ReadyToRun header: nothing to model. Holds
+    /// the number of non-null `__modules` slots (pointers to something
+    /// that is not a ReadyToRun header).
+    NoHeader(usize),
     /// A structure does not parse the way the runtime reads it, or is
     /// not modelled: the list would be incomplete.
     Malformed(String),
@@ -360,30 +379,82 @@ struct R2rSection {
     start: u64,
     /// End address (exclusive); `start` for rows without an end pointer.
     end: u64,
+    /// The row has an end pointer (`ROW_HAS_END`).
+    has_end: bool,
 }
 
-/// The ReadyToRun headers `__modules` names: (header address, rows).
-/// `NoHeader` if `__modules` is absent or names no header.
+/// The ReadyToRun headers `__modules` names, each once, by address:
+/// (header address, rows). Only the file-backed bytes of `__modules`
+/// are read, one pointer per 8 bytes; a `__modules` that is not
+/// file-backed (NOBITS, past the end of the file) is refused, as what
+/// it holds at run time is unknown. `NoHeader` if `__modules` is absent
+/// or names no header. The non-empty rows of all headers must not
+/// overlap (`check_disjoint`).
 fn read_headers(img: &Image) -> Result<Vec<(u64, Vec<R2rSection>)>, ModelError> {
-    let m = img.named("__modules").ok_or(ModelError::NoHeader)?;
-    let mut out = Vec::new();
-    let mut slot = m.start;
-    while slot + 8 <= m.end {
-        let h = img.ptr(slot).unwrap_or(0);
-        if h != 0 && img.u32_at(h) == Some(R2R_SIGNATURE) {
-            out.push((h, read_rows(img, h)?));
+    let m = img.named("__modules").ok_or(ModelError::NoHeader(0))?;
+    if !m.file {
+        return Err(malformed("__modules is not file-backed"));
+    }
+    let mut headers = BTreeSet::new();
+    let mut non_null = 0;
+    for i in 0..(m.end - m.start) / 8 {
+        let h = img.ptr(m.start + 8 * i).unwrap_or(0);
+        if h == 0 {
+            continue;
         }
-        slot += 8;
+        non_null += 1;
+        if img.u32_at(h) == Some(R2R_SIGNATURE) {
+            headers.insert(h);
+        }
     }
-    if out.is_empty() {
-        return Err(ModelError::NoHeader);
+    if headers.is_empty() {
+        return Err(ModelError::NoHeader(non_null));
     }
+    let out = headers
+        .into_iter()
+        .map(|h| Ok((h, read_rows(img, h)?)))
+        .collect::<Result<Vec<_>, ModelError>>()?;
+    check_disjoint(&out)?;
     Ok(out)
 }
 
+/// Refuse headers whose non-empty rows overlap: each byte belongs to at
+/// most one ReadyToRun section, so the work per byte stays bounded and
+/// no structure is read twice under two meanings.
+fn check_disjoint(headers: &[(u64, Vec<R2rSection>)]) -> Result<(), ModelError> {
+    let mut spans: Vec<(u64, u64, u32)> = headers
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .filter(|s| s.start < s.end)
+        .map(|s| (s.start, s.end, s.id))
+        .collect();
+    spans.sort_unstable();
+    for w in spans.windows(2) {
+        if w[1].0 < w[0].1 {
+            return Err(ModelError::Malformed(format!(
+                "ReadyToRun sections {} and {} overlap",
+                w[0].2, w[1].2
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rows of the ReadyToRun header at `h`. Refuses versions other than
-/// the verified one and rows too small for two pointers.
+/// the verified one, rows too small for two pointers and a section id
+/// listed twice (the model reads one section per id).
 fn read_rows(img: &Image, h: u64) -> Result<Vec<R2rSection>, ModelError> {
+    let rows = read_table(img, h)?;
+    let ids: BTreeSet<u32> = rows.iter().map(|s| s.id).collect();
+    if ids.len() != rows.len() {
+        return Err(malformed("R2R section id listed twice"));
+    }
+    Ok(rows)
+}
+
+/// The section table of the ReadyToRun header at `h`, as `read_rows`
+/// describes it but for repeated ids.
+fn read_table(img: &Image, h: u64) -> Result<Vec<R2rSection>, ModelError> {
     let hdr = img.bytes(h, R2R_HEADER_SIZE).ok_or(malformed("R2R header"))?;
     let major = u16::from_le_bytes([hdr[4], hdr[5]]);
     let minor = u16::from_le_bytes([hdr[6], hdr[7]]);
@@ -398,17 +469,22 @@ fn read_rows(img: &Image, h: u64) -> Result<Vec<R2rSection>, ModelError> {
         return Err(malformed("R2R section row size"));
     }
     (0..count)
-        .map(|i| read_row(img, h + R2R_HEADER_SIZE + i * size))
+        .map(|i| {
+            let row = h.checked_add(R2R_HEADER_SIZE + i * size);
+            read_row(img, row.ok_or(malformed("R2R section row"))?)
+        })
         .collect()
 }
 
 /// The section table row at `row`.
 fn read_row(img: &Image, row: u64) -> Result<R2rSection, ModelError> {
     let bad = || malformed("R2R section row");
+    img.bytes(row, 24).ok_or_else(bad)?;
     let id = img.u32_at(row).ok_or_else(bad)?;
     let flags = img.u32_at(row + 4).ok_or_else(bad)?;
     let start = img.ptr(row + 8).ok_or_else(bad)?;
-    let end = if flags & ROW_HAS_END != 0 {
+    let has_end = flags & ROW_HAS_END != 0;
+    let end = if has_end {
         img.ptr(row + 16).ok_or_else(bad)?
     } else {
         start
@@ -416,7 +492,7 @@ fn read_row(img: &Image, row: u64) -> Result<R2rSection, ModelError> {
     if end < start {
         return Err(bad());
     }
-    Ok(R2rSection { id, start, end })
+    Ok(R2rSection { id, start, end, has_end })
 }
 
 // ---- Entry points ------------------------------------------------------------
@@ -429,12 +505,29 @@ pub fn nativeaot_refs(data: &[u8]) -> Result<Vec<RelPtr>, ModelError> {
 
 /// `nativeaot_refs` on a parsed image.
 fn refs_of(img: &Image) -> Result<Vec<RelPtr>, ModelError> {
+    let cap = img.data.len() / 4;
     let mut out = Vec::new();
     for (h, rows) in read_headers(img)? {
         module_refs(img, h, &rows, &mut out)?;
+        within_cap(&out, cap)?;
     }
     unwind_refs(img, &mut out)?;
+    within_cap(&out, cap)?;
     Ok(dedup(out))
+}
+
+/// Refuse more references than the file has 4-byte fields (`cap`): each
+/// is a distinct 32-bit field of the file, so more means structures
+/// were read more than once.
+fn within_cap(out: &[RelPtr], cap: usize) -> Result<(), ModelError> {
+    if out.len() > cap {
+        return Err(ModelError::Malformed(format!(
+            "{} references for a file of {} 4-byte fields",
+            out.len(),
+            cap
+        )));
+    }
+    Ok(())
 }
 
 /// Targets of `nativeaot_refs` that lie in executable sections: code
@@ -451,9 +544,10 @@ pub fn nativeaot_code_refs(data: &[u8]) -> Result<Vec<u64>, ModelError> {
 
 /// Liveness roots for a NativeAOT image: the functions holding a code
 /// target of `nativeaot_code_refs`. If `__modules` names no ReadyToRun
-/// header there is nothing to add. If the model cannot be built
-/// exactly, every function is returned: what the runtime can reach is
-/// then unknown, so nothing may be called dead (fail closed).
+/// header there is nothing to add (noted when it holds pointers to
+/// something else). If the model cannot be built exactly, every
+/// function is returned: what the runtime can reach is then unknown, so
+/// nothing may be called dead (fail closed).
 pub fn root_names(data: &[u8], funcs: &FuncMap) -> Vec<String> {
     match nativeaot_code_refs(data) {
         Ok(targets) => {
@@ -466,7 +560,17 @@ pub fn root_names(data: &[u8], funcs: &FuncMap) -> Vec<String> {
             );
             names
         }
-        Err(ModelError::NoHeader) => Vec::new(),
+        Err(ModelError::NoHeader(slots)) => {
+            if slots > 0 {
+                eprintln!(
+                    "  note: NativeAOT: __modules holds {} non-null slots \
+                     but none names a ReadyToRun header; no ReadyToRun \
+                     references modelled",
+                    slots
+                );
+            }
+            Vec::new()
+        }
         Err(ModelError::Malformed(why)) => {
             eprintln!(
                 "  note: NativeAOT: ReadyToRun data not modelled ({}); \
@@ -478,23 +582,10 @@ pub fn root_names(data: &[u8], funcs: &FuncMap) -> Vec<String> {
     }
 }
 
-/// Names of the functions whose range holds one of `targets`.
+/// Names of the functions whose range holds one of `targets`, nested
+/// and overlapping ranges included (`symbols::funcs_containing`).
 fn containing_funcs(funcs: &FuncMap, targets: &[u64]) -> Vec<String> {
-    let mut by_addr: Vec<(u64, u64, &String)> = funcs
-        .iter()
-        .map(|(n, f)| (f.addr, f.addr.saturating_add(f.size), n))
-        .collect();
-    by_addr.sort();
-    let mut names = BTreeSet::new();
-    for &t in targets {
-        let i = by_addr.partition_point(|e| e.0 <= t);
-        if let Some(&(_, end, n)) = i.checked_sub(1).and_then(|j| by_addr.get(j)) {
-            if t < end {
-                names.insert(n.clone());
-            }
-        }
-    }
-    names.into_iter().collect()
+    super::symbols::funcs_containing(funcs, targets).into_iter().collect()
 }
 
 /// Sort by location and drop repeats of a location.
@@ -531,12 +622,20 @@ fn module_refs(
 }
 
 /// The references a ReadyToRun section holds directly, by section id.
-/// Ids known to hold none are skipped; unknown ids are refused.
+/// Ids known to hold none are skipped; unknown ids are refused, and so
+/// are rows of the sections read by length (`sized_section`) that have
+/// no end pointer: their extent would be unknown.
 fn section_refs(
     img: &Image,
     s: &R2rSection,
     out: &mut Vec<RelPtr>,
 ) -> Result<(), ModelError> {
+    if sized_section(s.id) && !s.has_end {
+        return Err(ModelError::Malformed(format!(
+            "ReadyToRun section {} has no end pointer",
+            s.id
+        )));
+    }
     match s.id {
         SEC_GC_STATIC_REGION => gc_static_region(img, s, out),
         SEC_EAGER_CCTOR => relptr_array(img, s, RefKind::EagerCctor, out),
@@ -559,8 +658,24 @@ fn section_refs(
     }
 }
 
+/// True for the sections the model reads from start to end: the RELPTR32
+/// arrays, the dehydrated data and the stack trace method mapping.
+fn sized_section(id: u32) -> bool {
+    matches!(
+        id,
+        SEC_GC_STATIC_REGION
+            | SEC_EAGER_CCTOR
+            | SEC_MODULE_INITIALIZERS
+            | SEC_DEHYDRATED_DATA
+            | SEC_STACK_TRACE_MAPPING
+    ) || SEC_EXTERNAL_REFERENCES.contains(&id)
+}
+
 /// The stack trace method mapping: accepted only when empty (a zero
-/// entry count), as compiled without stack trace data.
+/// entry count), as compiled without stack trace data. A non-empty one
+/// (.NET's default, `StackTraceSupport` true) holds RELPTR32s to
+/// methods in a layout not modelled: the model is refused and every
+/// function kept live.
 fn stack_trace_mapping(img: &Image, s: &R2rSection) -> Result<(), ModelError> {
     let len = s.end - s.start;
     let empty = len == 0 || (len == 4 && img.u32_at(s.start) == Some(0));
@@ -671,7 +786,9 @@ impl Hydrated {
 
 /// Decode the dehydrated data of section `s`: list its references
 /// (destination, inline pointers, fixup table) and rebuild the memory
-/// it describes.
+/// it describes. The rebuilt bytes may fill the destination section
+/// up to its end, but no more than `HYDRATED_PER_FILE_BYTE` times the
+/// file size.
 fn dehydrate(
     img: &Image,
     s: &R2rSection,
@@ -680,10 +797,11 @@ fn dehydrate(
     let bad = |w: &str| ModelError::Malformed(format!("dehydrated data: {}", w));
     let owner = Owner::R2r(s.id);
     let dest = img.relptr(s.start).ok_or_else(|| bad("destination"))?;
+    let cap = (img.data.len() as u64).saturating_mul(HYDRATED_PER_FILE_BYTE);
     let room = img
         .region(dest)
         .filter(|r| !r.exec)
-        .map(|r| r.end - dest)
+        .map(|r| (r.end - dest).min(cap))
         .ok_or_else(|| bad("destination"))?;
     out.push(RelPtr::new(s.start, dest, RefKind::DehydratedDest, owner));
     let len = s.end.checked_sub(s.start + 4).ok_or_else(|| bad("length"))?;
@@ -716,7 +834,7 @@ fn run_commands(
         let size =
             command_output(cmd, payload).ok_or_else(|| bad("command"))?;
         if hyd.bytes.len() as u64 + size > room {
-            return Err(bad("output overruns its section"));
+            return Err(bad("output overruns its section or the size cap"));
         }
         match cmd {
             CMD_COPY => {
@@ -811,12 +929,16 @@ fn resolve_fixups(
 /// MethodTable holds a RELPTR32 to the type manager indirection `tmi`
 /// right after its vtable and interface list; its flags then say which
 /// optional RELPTR32 fields follow: writable data (always), dispatch
-/// map, finalizer, sealed vtable.
+/// map, finalizer, sealed vtable. MethodTables do not overlap, so each
+/// starts above the type manager field of the one before it; that floor
+/// keeps the search linear in the rebuilt size.
 fn sealed_vtables(hyd: &Hydrated, tmi: u64) -> Result<BTreeSet<u64>, ModelError> {
     let mut starts = BTreeSet::new();
     let anchors = hyd.writes.iter().filter(|w| w.1 == 4 && w.2 == tmi);
+    let mut floor = hyd.base;
     for &(field, _, _) in anchors {
-        let m = method_table_start(hyd, field).ok_or(malformed("MethodTable"))?;
+        let m = method_table_start(hyd, field, floor).ok_or(malformed("MethodTable"))?;
+        floor = field + 4;
         let flags = hyd.uint(m, 4).ok_or(malformed("MethodTable"))? as u32;
         if flags & MT_HAS_SEALED_VTABLE == 0 {
             continue;
@@ -840,17 +962,24 @@ fn sealed_vtables(hyd: &Hydrated, tmi: u64) -> Result<BTreeSet<u64>, ModelError>
 /// word, and only pointers or null from the related type to the field.
 /// Between `m` and the field the only plain non-zero words are the two
 /// header words, so the only other `m` that can pass is 16 bytes above
-/// the real one (two slots, the second null); the lower one wins.
-fn method_table_start(hyd: &Hydrated, field: u64) -> Option<u64> {
+/// the real one (two slots, the second null); the lower one wins. No
+/// `m` below `floor` is considered. Candidates are tried from the field
+/// down; once a word below the field is neither a pointer nor null no
+/// lower candidate can pass (it would be one of its slots).
+fn method_table_start(hyd: &Hydrated, field: u64, floor: u64) -> Option<u64> {
     for n in 0..=MT_MAX_SLOTS {
         let m = field.checked_sub(MT_FIXED + 8 * n)?;
-        if m < hyd.base {
+        if m < floor {
             return None;
         }
-        if is_method_table(hyd, m, n) {
-            let below = m.checked_sub(16).filter(|&b| b >= hyd.base);
+        // The n words below the field are pointers or null (see below).
+        if mt_header(hyd, m, n) {
+            let below = m.checked_sub(16).filter(|&b| b >= floor);
             let lower = below.filter(|&b| is_method_table(hyd, b, n + 2));
             return Some(lower.unwrap_or(m));
+        }
+        if !hyd.ptr_or_null(field - 8 * (n + 1)) {
+            return None;
         }
     }
     None
@@ -859,6 +988,13 @@ fn method_table_start(hyd: &Hydrated, field: u64) -> Option<u64> {
 /// True if a MethodTable with `n` vtable plus interface slots starts at
 /// `m` (see `method_table_start`).
 fn is_method_table(hyd: &Hydrated, m: u64, n: u64) -> bool {
+    mt_header(hyd, m, n) && (0..n).all(|j| hyd.ptr_or_null(m + MT_FIXED + 8 * j))
+}
+
+/// `is_method_table` but for the slots: the slot counts say `n`, the
+/// first word is plain and non-zero, the count word plain and the
+/// related type a pointer or null.
+fn mt_header(hyd: &Hydrated, m: u64, n: u64) -> bool {
     let slots = hyd.uint(m + 16, 2).zip(hyd.uint(m + 18, 2));
     if slots.map(|(v, i)| v + i) != Some(n) {
         return false;
@@ -867,7 +1003,6 @@ fn is_method_table(hyd: &Hydrated, m: u64, n: u64) -> bool {
         && hyd.plain(m, 8)
         && hyd.plain(m + 16, 8)
         && hyd.ptr_or_null(m + 8)
-        && (0..n).all(|j| hyd.ptr_or_null(m + MT_FIXED + 8 * j))
 }
 
 /// Addresses, inside the sections holding the sealed vtables `starts`,
@@ -923,7 +1058,10 @@ fn sealed_slots(
 // ---- Unwind info ------------------------------------------------------------------
 
 /// References in `.dotnet_eh_table` LSDAs (named by `.eh_frame` FDEs)
-/// and in the associated data and EH info they point at.
+/// and in the associated data and EH info they point at. An FDE whose
+/// LSDA cannot be located (DW_EH_PE_indirect, or an encoding that does
+/// not resolve) is refused: it could name an LSDA of the table. EH info
+/// blocks must not overlap, which keeps the walk linear in their size.
 fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
     let eh = match img.named(EH_TABLE) {
         Some(r) => (r.start, r.end),
@@ -932,6 +1070,12 @@ fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
     let mut assoc = BTreeSet::new();
     let mut infos = BTreeSet::new();
     let lsdas: BTreeSet<u64> = ehframe::fde_lsdas(img.data, &img.sections)
+        .map_err(|pc| {
+            ModelError::Malformed(format!(
+                "the LSDA of the FDE at {:#x} is indirect or does not resolve",
+                pc
+            ))
+        })?
         .into_iter()
         .map(|(_, l)| l)
         .filter(|&l| eh.0 <= l && l < eh.1)
@@ -942,8 +1086,12 @@ fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
     for a in assoc {
         associated_refs(img, a, out)?;
     }
+    let mut prev_end = 0;
     for i in infos {
-        eh_info_refs(img, i, out)?;
+        if i < prev_end {
+            return Err(malformed("EH info blocks overlap"));
+        }
+        prev_end = eh_info_refs(img, i, out)?;
     }
     Ok(())
 }
@@ -996,8 +1144,8 @@ fn associated_refs(img: &Image, a: u64, out: &mut Vec<RelPtr>) -> Result<(), Mod
 /// (try length << 2 | kind); a typed clause adds the handler offset and
 /// a RELPTR32 to the caught type, a fault clause the handler offset, a
 /// filter clause the handler and filter offsets. Offsets are NativeFormat
-/// unsigned integers.
-fn eh_info_refs(img: &Image, i: u64, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
+/// unsigned integers. Returns the address just past the block.
+fn eh_info_refs(img: &Image, i: u64, out: &mut Vec<RelPtr>) -> Result<u64, ModelError> {
     let bad = || malformed("EH info");
     let mut p = i;
     let count = read_unsigned(img, &mut p).ok_or_else(bad)?;
@@ -1018,15 +1166,20 @@ fn eh_info_refs(img: &Image, i: u64, out: &mut Vec<RelPtr>) -> Result<(), ModelE
             _ => return Err(bad()),
         }
     }
-    Ok(())
+    Ok(p)
 }
 
 /// Read a NativeFormat unsigned integer at `*p` and advance past it.
 /// The low bits of the first byte give the length: x0 one byte, x01
-/// two, x011 three, x0111 four, 1111 a full 32-bit value after it.
+/// two, x011 three, x0111 four, 01111 a full 32-bit value after it.
+/// A first byte ending in five ones (11111) is invalid, as in the
+/// runtime's decoder.
 fn read_unsigned(img: &Image, p: &mut u64) -> Option<u32> {
     let b0 = img.u8_at(*p)? as u32;
-    let len = (b0.trailing_ones() + 1).min(5) as u64;
+    if b0.trailing_ones() >= 5 {
+        return None;
+    }
+    let len = (b0.trailing_ones() + 1) as u64;
     let v = if len == 5 {
         img.u32_at(*p + 1)?
     } else {
@@ -1077,7 +1230,7 @@ mod tests {
             bytes,
             writes: vec![(0x1018, 8, 0x500), (0x1028, 4, 0x9000)],
         };
-        assert_eq!(method_table_start(&hyd, 0x1028), Some(0x1000));
+        assert_eq!(method_table_start(&hyd, 0x1028, hyd.base), Some(0x1000));
         assert!(!hyd.plain(0x101c, 4));
         assert!(hyd.ptr_or_null(0x1020));
     }
@@ -1091,5 +1244,292 @@ mod tests {
         funcs.insert("b".into(), f(0x120, 0x8));
         let names = containing_funcs(&funcs, &[0x105, 0x118, 0x120]);
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Crafted images: each must be refused or read safely, and quickly.
+    mod crafted {
+        use super::super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        /// Vaddr of file offset 0 in the crafted images.
+        const VA: u64 = 0x40_0000;
+        /// `.text`: 0x1000 bytes of code.
+        const TEXT: u64 = VA + 0x1000;
+        /// `__modules`, when file-backed.
+        const MODULES: u64 = VA + 0x2000;
+        /// `.data`: the ReadyToRun header, then its sections from `ARRAYS`.
+        const DATA: u64 = VA + 0x4000;
+        /// Where the ReadyToRun sections of `.data` start.
+        const ARRAYS: u64 = DATA + 0x100;
+        /// Address of a NOBITS section, past every file-backed one.
+        const NOBITS: u64 = VA + 0x100_0000;
+
+        /// Contents of a crafted section.
+        enum Body {
+            /// File-backed bytes at file offset `addr - VA`.
+            Bits(Vec<u8>),
+            /// NOBITS of this size.
+            NoBits(u64),
+        }
+
+        /// A section of a crafted image.
+        struct Sec {
+            /// Section name.
+            name: &'static str,
+            /// Vaddr.
+            addr: u64,
+            /// Executable (else writable data).
+            exec: bool,
+            /// Contents.
+            body: Body,
+        }
+
+        /// A writable data section.
+        fn data_sec(name: &'static str, addr: u64, bytes: Vec<u8>) -> Sec {
+            Sec { name, addr, exec: false, body: Body::Bits(bytes) }
+        }
+
+        /// `.text`, filled with `ret`.
+        fn text() -> Sec {
+            Sec { name: ".text", addr: TEXT, exec: true, body: Body::Bits(vec![0xc3; 0x1000]) }
+        }
+
+        /// A 64-bit little-endian x86-64 ET_DYN ELF holding `secs`, then
+        /// its section name table and section headers; no segments.
+        fn elf(secs: &[Sec]) -> Vec<u8> {
+            let mut data = vec![0u8; 0x40];
+            for s in secs {
+                if let Body::Bits(b) = &s.body {
+                    let off = (s.addr - VA) as usize;
+                    if data.len() < off + b.len() {
+                        data.resize(off + b.len(), 0);
+                    }
+                    data[off..off + b.len()].copy_from_slice(b);
+                }
+            }
+            let mut names = vec![0u8];
+            let mut name_at = Vec::new();
+            for n in secs.iter().map(|s| s.name).chain([".shstrtab"]) {
+                name_at.push(names.len() as u32);
+                names.extend(n.as_bytes());
+                names.push(0);
+            }
+            let names_off = data.len() as u64;
+            data.extend(&names);
+            data.resize(data.len().next_multiple_of(8), 0);
+            let shoff = data.len() as u64;
+            data.extend([0u8; 64]);
+            for (s, &name) in secs.iter().zip(&name_at) {
+                let (ty, off, size) = match &s.body {
+                    Body::Bits(b) => (1, s.addr - VA, b.len() as u64),
+                    Body::NoBits(n) => (8, 0, *n),
+                };
+                let flags = if s.exec { 2 | 4 } else { 2 | 1 };
+                data.extend(shdr(name, ty, flags, s.addr, off, size));
+            }
+            let strtab = name_at[secs.len()];
+            data.extend(shdr(strtab, 3, 0, 0, names_off, names.len() as u64));
+            let shnum = secs.len() as u16 + 2;
+            ehdr(&mut data, shoff, shnum);
+            data
+        }
+
+        /// A 64-byte ELF64 section header.
+        fn shdr(name: u32, ty: u32, flags: u64, addr: u64, off: u64, size: u64) -> Vec<u8> {
+            let mut h = Vec::with_capacity(64);
+            h.extend(name.to_le_bytes());
+            h.extend(ty.to_le_bytes());
+            h.extend(flags.to_le_bytes());
+            h.extend(addr.to_le_bytes());
+            h.extend(off.to_le_bytes());
+            h.extend(size.to_le_bytes());
+            h.extend([0u8; 8]);
+            h.extend(8u64.to_le_bytes());
+            h.extend(0u64.to_le_bytes());
+            h
+        }
+
+        /// Fill in the ELF header: section headers at `shoff`, `shnum` of
+        /// them, the name table last.
+        fn ehdr(d: &mut [u8], shoff: u64, shnum: u16) {
+            d[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\x00");
+            d[16..18].copy_from_slice(&3u16.to_le_bytes());
+            d[18..20].copy_from_slice(&62u16.to_le_bytes());
+            d[20..24].copy_from_slice(&1u32.to_le_bytes());
+            d[40..48].copy_from_slice(&shoff.to_le_bytes());
+            d[52..54].copy_from_slice(&64u16.to_le_bytes());
+            d[54..56].copy_from_slice(&56u16.to_le_bytes());
+            d[58..60].copy_from_slice(&64u16.to_le_bytes());
+            d[60..62].copy_from_slice(&shnum.to_le_bytes());
+            d[62..64].copy_from_slice(&(shnum - 1).to_le_bytes());
+        }
+
+        /// A version 16 ReadyToRun header with section rows
+        /// `(id, flags, start, end)`.
+        fn header(rows: &[(u32, u32, u64, u64)]) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend(0x0052_5452u32.to_le_bytes());
+            b.extend([16, 0, 0, 0, 0, 0, 0, 0]);
+            b.extend((rows.len() as u16).to_le_bytes());
+            b.extend([24, 1]);
+            for &(id, flags, start, end) in rows {
+                b.extend(id.to_le_bytes());
+                b.extend(flags.to_le_bytes());
+                b.extend(start.to_le_bytes());
+                b.extend(end.to_le_bytes());
+            }
+            b
+        }
+
+        /// RELPTR32 bytes at `loc` designating `target`.
+        fn rel(loc: u64, target: u64) -> [u8; 4] {
+            (target.wrapping_sub(loc) as i32).to_le_bytes()
+        }
+
+        /// `.data`: `header` at `DATA`, then `arrays` at `ARRAYS`.
+        fn data_with(header: Vec<u8>, arrays: Vec<u8>) -> Sec {
+            let mut b = header;
+            b.resize((ARRAYS - DATA) as usize, 0);
+            b.extend(arrays);
+            data_sec(".data", DATA, b)
+        }
+
+        /// `__modules` holding the pointers `slots`.
+        fn modules(slots: &[u64]) -> Sec {
+            data_sec("__modules", MODULES, slots.iter().flat_map(|s| s.to_le_bytes()).collect())
+        }
+
+        /// `n` RELPTR32s from `at` on, each designating .text.
+        fn code_relptrs(at: u64, n: u64) -> Vec<u8> {
+            (0..n).flat_map(|i| rel(at + 4 * i, TEXT)).collect()
+        }
+
+        /// Run `f` on another thread; panic if it takes over 10 seconds.
+        fn quickly<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(Duration::from_secs(10)).expect("returns within 10 seconds")
+        }
+
+        /// The model of `data`, computed under `quickly`.
+        fn model(data: Vec<u8>) -> Result<Vec<RelPtr>, ModelError> {
+            quickly(move || nativeaot_refs(&data))
+        }
+
+        /// True if `r` is a refusal (not a model, not "no header").
+        fn refused(r: &Result<Vec<RelPtr>, ModelError>) -> bool {
+            matches!(r, Err(ModelError::Malformed(_)))
+        }
+
+        /// A well-formed image: one module initializer into .text.
+        #[test]
+        fn models_a_well_formed_image() {
+            let rows = [(213, 1, ARRAYS, ARRAYS + 4)];
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), code_relptrs(ARRAYS, 1))]);
+            let refs = model(d).expect("modelled");
+            assert_eq!(refs.len(), 1);
+            assert_eq!((refs[0].location, refs[0].target), (ARRAYS, TEXT));
+        }
+
+        /// A NOBITS `__modules` of 2^60 bytes: its contents are unknown,
+        /// so the model is refused, without walking its slots.
+        #[test]
+        fn refuses_a_huge_nobits_modules() {
+            let m = Sec { name: "__modules", addr: NOBITS, exec: false, body: Body::NoBits(1 << 60) };
+            let rows = [(213, 1, ARRAYS, ARRAYS + 4)];
+            let d = elf(&[text(), m, data_with(header(&rows), code_relptrs(ARRAYS, 1))]);
+            assert!(refused(&model(d)));
+        }
+
+        /// Two `__modules` slots naming one header: it is read once.
+        #[test]
+        fn reads_a_duplicate_header_once() {
+            let rows = [(213, 1, ARRAYS, ARRAYS + 8)];
+            let d = elf(&[text(), modules(&[DATA, DATA]), data_with(header(&rows), code_relptrs(ARRAYS, 2))]);
+            let headers = quickly(move || {
+                let img = Image::parse(&d).expect("parses");
+                read_headers(&img).map(|h| h.len())
+            });
+            assert_eq!(headers.ok(), Some(1));
+        }
+
+        /// Rows whose ranges overlap are refused.
+        #[test]
+        fn refuses_overlapping_rows() {
+            let rows = [(213, 1, ARRAYS, ARRAYS + 8), (308, 1, ARRAYS + 4, ARRAYS + 12)];
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), code_relptrs(ARRAYS, 3))]);
+            assert!(refused(&model(d)));
+        }
+
+        /// A section id listed twice is refused.
+        #[test]
+        fn refuses_a_repeated_section_id() {
+            let rows = [(213, 1, ARRAYS, ARRAYS + 4), (213, 1, ARRAYS + 4, ARRAYS + 8)];
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), code_relptrs(ARRAYS, 2))]);
+            assert!(refused(&model(d)));
+        }
+
+        /// A RELPTR32 array row without an end pointer has no known
+        /// extent: refused, not read as empty.
+        #[test]
+        fn refuses_an_array_row_without_end() {
+            let rows = [(213, 0, ARRAYS, 0)];
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), code_relptrs(ARRAYS, 1))]);
+            assert!(refused(&model(d)));
+        }
+
+        /// Dehydrated data rebuilt into a 2^40-byte NOBITS section by 16
+        /// zero fills of 16 MiB each: far more than the file could
+        /// describe, refused before any of it is allocated.
+        #[test]
+        fn refuses_a_giant_rebuild() {
+            let hyd = Sec { name: ".hydrated", addr: NOBITS, exec: false, body: Body::NoBits(1 << 40) };
+            let mut stream = rel(ARRAYS, NOBITS).to_vec();
+            for _ in 0..16 {
+                stream.extend([(31 << 3) | CMD_ZERO_FILL, 0xff, 0xff, 0xff]);
+            }
+            let end = ARRAYS + stream.len() as u64;
+            let rows = [(207, 1, ARRAYS, end), (204, 0, DATA, 0)];
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), stream), hyd]);
+            assert!(refused(&model(d)));
+        }
+
+        /// NativeFormat: a first byte ending in five ones is invalid; one
+        /// ending in 01111 takes the next four bytes.
+        #[test]
+        fn rejects_the_invalid_unsigned_prefix() {
+            let bytes = vec![0x1f, 1, 2, 3, 4, 0x0f, 1, 2, 3, 4];
+            let d = elf(&[text(), data_sec(".data", DATA, bytes)]);
+            let img = Image::parse(&d).expect("parses");
+            let mut p = DATA;
+            assert_eq!(read_unsigned(&img, &mut p), None);
+            let mut p = DATA + 5;
+            assert_eq!(read_unsigned(&img, &mut p), Some(0x0403_0201));
+            assert_eq!(p, DATA + 10);
+        }
+
+        /// `__modules` slots that name no ReadyToRun header are counted,
+        /// so the caller can note them; an empty one counts none.
+        #[test]
+        fn counts_slots_naming_no_header() {
+            let d = elf(&[text(), modules(&[TEXT, 0]), data_sec(".data", DATA, vec![0; 16])]);
+            assert_eq!(model(d), Err(ModelError::NoHeader(1)));
+            let d = elf(&[text(), modules(&[0, 0])]);
+            assert_eq!(model(d), Err(ModelError::NoHeader(0)));
+        }
+
+        /// A target inside an outer function, past the end of a function
+        /// nested in it, maps to the outer one.
+        #[test]
+        fn maps_targets_in_nested_ranges() {
+            let mut funcs = FuncMap::new();
+            let f = |addr, size| crate::types::FuncInfo { addr, size, is_global: false };
+            funcs.insert("outer".into(), f(0x100, 0x100));
+            funcs.insert("inner".into(), f(0x120, 0x10));
+            assert_eq!(containing_funcs(&funcs, &[0x150]), vec!["outer".to_string()]);
+        }
     }
 }
