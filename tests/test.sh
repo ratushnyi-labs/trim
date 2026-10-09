@@ -900,6 +900,56 @@ echo "$output" | grep -q 'r2r: 51' && \
     pass "R2R compaction: calls through the RELPTR32s still resolve" || \
     fail "R2R compaction: execution" "got: $output"
 
+# The same fixture as a static-pie: compacted, then its RELATIVE
+# relocations packed into RELR (--relr-static) in the same run. The
+# re-pointed RELPTR32s and the packed pointers must both hold.
+gcc -g -O0 -fno-inline -static-pie -o /work/test-r2rs /tests/nativeaot-r2r.c
+r2rs_out=$(trim --relr-static /work/test-r2rs /work/test-r2rs-relr 2>&1) || true
+echo "$r2rs_out" | grep -v '^    '
+echo "$r2rs_out" | grep -q 'note: NativeAOT: .text compacted; 2 ReadyToRun references re-pointed' && \
+    echo "$r2rs_out" | grep -q 'relr: packed' && \
+    pass "R2R compaction + --relr-static: compacted and packed" || \
+    fail "R2R compaction + --relr-static: notes" "got: $r2rs_out"
+output=$(/work/test-r2rs-relr 2>&1) || true
+echo "$output" | grep -q 'r2r: 51' && \
+    pass "R2R compaction + --relr-static: patched binary output correct" || \
+    fail "R2R compaction + --relr-static: execution" "got: $output"
+
+# =============================================
+# NativeAOT ReadyToRun image: compaction refused
+# =============================================
+printf '\n--- NativeAOT ReadyToRun image: compaction refused ---\n'
+# Each variant holds something compaction could not keep valid, so trim
+# must fall back to zero-filling dead code in place (the file keeps its
+# size) and the binary must still run. Compacted, the first two crash.
+# - R2R_SWITCH: a switch dispatch whose table base is loaded from memory;
+#   trim cannot find its table, whose entries would go stale.
+# - R2R_STRAY: a self-relative pointer in .rodata to a moved function
+#   that no ReadyToRun table lists.
+# - lld layout: .rodata lies before .text, so data the model does not
+#   list could not move as one block with the rest.
+gcc -g -O0 -fno-inline -DR2R_SWITCH -o /work/test-r2r-sw /tests/nativeaot-r2r.c
+gcc -g -O0 -fno-inline -DR2R_STRAY -o /work/test-r2r-st /tests/nativeaot-r2r.c
+clang-19 -g -O0 -fno-inline -fuse-ld=lld -o /work/test-r2r-lld /tests/nativeaot-r2r.c
+for rr in sw:'jump table dispatches unresolved':'switch: 30' \
+          st:'self-relative pointers to moved functions':'stray: 55' \
+          lld:'section .rodata lies before .text':'r2r: 51'; do
+    rr_bin=/work/test-r2r-${rr%%:*}
+    rr_why=$(echo "$rr" | cut -d: -f2)
+    rr_exp=$(echo "$rr" | cut -d: -f3-)
+    rr_sz=$(stat -c%s "$rr_bin")
+    rr_out=$(trim --in-place "$rr_bin" 2>&1) || true
+    echo "$rr_out" | grep 'no compaction' || true
+    echo "$rr_out" | grep -q "no compaction: .*$rr_why" && \
+        [ "$(stat -c%s "$rr_bin")" -eq "$rr_sz" ] && \
+        pass "R2R refused (${rr%%:*}): $rr_why; zero-filled in place" || \
+        fail "R2R refused (${rr%%:*})" "got: $rr_out"
+    output=$("$rr_bin" 2>&1) || true
+    echo "$output" | grep -q 'r2r: 51' && echo "$output" | grep -q "$rr_exp" && \
+        pass "R2R refused (${rr%%:*}): binary output correct" || \
+        fail "R2R refused (${rr%%:*}): execution" "got: $output"
+done
+
 # =============================================
 # Dead code outside .text: zero-filled in place
 # =============================================

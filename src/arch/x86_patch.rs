@@ -212,6 +212,41 @@ enum RegDef {
     Other,
 }
 
+/// The switch jump tables of the code, and the dispatches whose table
+/// is not known: patching cannot keep those valid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableScan {
+    /// [(base, count)], one entry per table base (`find_jump_tables`).
+    pub tables: Vec<(u64, Option<usize>)>,
+    /// Dispatches matched (`movsxd`, `add`, `jmp reg`) whose base
+    /// register is not loaded by one and the same LEA on every path: their
+    /// table is not found, so its entries would not be patched.
+    pub unresolved: usize,
+    /// Other `jmp reg` whose target is computed from a 4-byte scaled
+    /// entry load just before it (`entry_fed_jump`): the shape of a table
+    /// dispatch the pattern does not recognise. Counted only when the
+    /// jump lies in the code that moves, or a RIP-relative operand near
+    /// it designates that code (`touches`): elsewhere, code and the base
+    /// its entries are relative to move together. (.NET's RyuJIT emits
+    /// such dispatches, with entries relative to a label of the method,
+    /// in its managed code sections.)
+    pub unrecognised: usize,
+}
+
+impl TableScan {
+    /// Why the tables cannot all be patched: dispatches unresolved or not
+    /// recognised. None if every dispatch has a known table.
+    pub fn blocker(&self) -> Option<String> {
+        if self.unresolved == 0 && self.unrecognised == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} jump table dispatches unresolved, {} not recognised",
+            self.unresolved, self.unrecognised
+        ))
+    }
+}
+
 /// Find switch jump tables: [(base, count)], one entry per table base.
 /// `count` is None when no bounding CMP was found near the dispatch.
 /// Entries are read through `sections` (see `table_span`).
@@ -220,14 +255,31 @@ pub fn find_jump_tables(
     instrs: &[DecodedInstr],
     sections: &[Section],
 ) -> Vec<(u64, Option<usize>)> {
+    scan_jump_tables(data, instrs, sections, (0, 0)).tables
+}
+
+/// `find_jump_tables`, counting the dispatches whose table is not found
+/// (`TableScan`). `moving` is the code range `[start, end)` compaction
+/// moves (.text).
+pub fn scan_jump_tables(
+    data: &[u8],
+    instrs: &[DecodedInstr],
+    sections: &[Section],
+    moving: (u64, u64),
+) -> TableScan {
     let mut tables: BTreeMap<u64, Option<usize>> = BTreeMap::new();
+    let mut scan = TableScan::default();
     for run in code_runs(instrs) {
-        for (base, count) in run_tables(data, sections, run) {
+        let found = run_tables(data, sections, run, moving);
+        for (base, count) in found.tables {
             let e = tables.entry(base).or_insert(count);
             *e = (*e).max(count);
         }
+        scan.unresolved += found.unresolved;
+        scan.unrecognised += found.unrecognised;
     }
-    tables.into_iter().collect()
+    scan.tables = tables.into_iter().collect();
+    scan
 }
 
 /// Split decoded instructions into runs of address-contiguous code (one
@@ -249,17 +301,22 @@ fn code_runs(instrs: &[DecodedInstr]) -> Vec<&[DecodedInstr]> {
 /// Jump tables of one code run. A lenient first pass proposes a base per
 /// dispatch; the case targets of those tables become indirect CFG edges
 /// for the exact second pass, which keeps a table only if its base
-/// register is loaded by one and the same LEA on every path.
+/// register is loaded by one and the same LEA on every path. Dispatches
+/// it does not keep are counted unresolved; other `jmp reg` shaped like
+/// a dispatch (`entry_fed_jump`) that touch the `moving` code are
+/// counted unrecognised.
 fn run_tables(
     data: &[u8],
     sections: &[Section],
     run: &[DecodedInstr],
-) -> Vec<(u64, Option<usize>)> {
+    moving: (u64, u64),
+) -> TableScan {
     let dispatches: Vec<Dispatch> = (0..run.len())
         .filter_map(|i| match_dispatch(run, i))
         .collect();
+    let unrecognised = unrecognised_dispatches(run, &dispatches, moving);
     if dispatches.is_empty() {
-        return Vec::new();
+        return TableScan { unrecognised, ..TableScan::default() };
     }
     let cfg = RunCfg::new(run);
     let mut edges = CaseEdges::new();
@@ -271,13 +328,105 @@ fn run_tables(
             }
         }
     }
-    dispatches
+    let tables: Vec<(u64, Option<usize>)> = dispatches
         .iter()
         .filter_map(|d| {
             let base = reaching_lea(run, &cfg, Some(&edges), d)?;
             Some((base, table_count(run, d.load)))
         })
-        .collect()
+        .collect();
+    let unresolved = dispatches.len() - tables.len();
+    TableScan { tables, unresolved, unrecognised }
+}
+
+/// Number of `jmp reg` in `run` that are not the jump of one of
+/// `dispatches` but whose target comes from a 4-byte scaled entry load
+/// (`entry_fed_jump`), and that touch the `moving` code (`touches`).
+fn unrecognised_dispatches(
+    run: &[DecodedInstr],
+    dispatches: &[Dispatch],
+    moving: (u64, u64),
+) -> usize {
+    let matched: HashSet<usize> = dispatches.iter().map(|d| d.jmp).collect();
+    (0..run.len())
+        .filter(|&j| run[j].flow == FlowType::IndirectBranch && !matched.contains(&j))
+        .filter(|&j| touches(run, j, moving) && entry_fed_jump(run, j))
+        .count()
+}
+
+/// True if `run[j]` lies in `[start, end)`, or one of the
+/// MAX_DISPATCH_GAP instructions before it has a RIP-relative operand
+/// designating that range.
+fn touches(run: &[DecodedInstr], j: usize, (start, end): (u64, u64)) -> bool {
+    let inside = |a: u64| start <= a && a < end;
+    inside(run[j].addr)
+        || run[j.saturating_sub(MAX_DISPATCH_GAP)..j]
+            .iter()
+            .any(|i| i.pc_rel_target.is_some_and(inside))
+}
+
+/// True if `run[j]` is a `jmp reg` whose register, traced back over at
+/// most MAX_DISPATCH_GAP straight-line instructions, is computed from a
+/// 4-byte load indexed with scale 4 (`loads_scaled_entry`): how switch
+/// dispatches through relative tables look. Registers are tracked as the
+/// 64-bit GPRs a value flows through (reads of the writing instruction).
+fn entry_fed_jump(run: &[DecodedInstr], j: usize) -> bool {
+    let Some(r) = jmp_reg(&run[j].raw) else {
+        return false;
+    };
+    let mut live: u16 = 1 << r;
+    for k in (j.saturating_sub(MAX_DISPATCH_GAP)..j).rev() {
+        if run[k].flow != FlowType::Normal {
+            return false;
+        }
+        let Some(ins) = decode_one(&run[k].raw) else {
+            return false;
+        };
+        let (reads, writes) = gpr_flow(&ins);
+        if writes & live == 0 {
+            continue;
+        }
+        if loads_scaled_entry(&ins) {
+            return true;
+        }
+        live = (live & !writes) | reads;
+    }
+    false
+}
+
+/// GPRs (bit per 64-bit register) `ins` reads, address registers
+/// included, and those it writes. A register written only on some
+/// condition also counts as read: its old value may survive.
+fn gpr_flow(ins: &Instruction) -> (u16, u16) {
+    let (mut reads, mut writes) = (0u16, 0u16);
+    let mut factory = InstructionInfoFactory::new();
+    for used in factory.info(ins).used_registers() {
+        let Some(g) = gpr64_num(used.register()) else {
+            continue;
+        };
+        match used.access() {
+            OpAccess::Write => writes |= 1 << g,
+            OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite => {
+                reads |= 1 << g;
+                writes |= 1 << g;
+            }
+            _ => reads |= 1 << g,
+        }
+    }
+    (reads, writes)
+}
+
+/// True for a 4-byte load from memory indexed with scale 4 into a GPR:
+/// `movsxd reg, [..+idx*4]` or `mov reg32, [..+idx*4]`, the forms that
+/// read a relative jump table entry.
+fn loads_scaled_entry(ins: &Instruction) -> bool {
+    matches!(ins.mnemonic(), Mnemonic::Movsxd | Mnemonic::Mov)
+        && ins.op_count() == 2
+        && ins.op0_kind() == OpKind::Register
+        && ins.op1_kind() == OpKind::Memory
+        && ins.memory_index() != Register::None
+        && ins.memory_index_scale() == 4
+        && ins.memory_size().size() == 4
 }
 
 /// Match the dispatch whose MOVSXD is `run[i]`: within MAX_DISPATCH_GAP
@@ -549,6 +698,68 @@ pub fn patch_jump_tables(
     te: u64,
 ) {
     let tables = find_jump_tables(data, instrs, sections);
+    patch_tables(data, &tables, sections, intervals, ts, te);
+}
+
+/// `patch_jump_tables` for tables already found (`find_jump_tables`).
+pub fn patch_tables(
+    data: &mut [u8],
+    tables: &[(u64, Option<usize>)],
+    sections: &[Section],
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+) {
+    for table in table_extents(tables, sections) {
+        patch_one_table(data, &table, intervals, ts, te);
+    }
+}
+
+/// One entry of a jump table that patching visits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableEntry {
+    /// Vaddr of the 4-byte entry.
+    pub location: u64,
+    /// File offset of the entry.
+    pub offset: usize,
+    /// Table base plus the entry: the case it designates.
+    pub target: u64,
+}
+
+/// The entries of `tables` that `patch_tables` visits, read from `data`
+/// as it is now: up to each table's length, and for a table of unknown
+/// size up to its first entry that does not target .text `[ts, te)`.
+pub fn table_entries(
+    data: &[u8],
+    tables: &[(u64, Option<usize>)],
+    sections: &[Section],
+    ts: u64,
+    te: u64,
+) -> Vec<TableEntry> {
+    let mut out = Vec::new();
+    for t in table_extents(tables, sections) {
+        for idx in 0..t.len {
+            let (Some(entry), Some(r)) = (read_entry(data, t.off, idx), entry_range(t.off, idx))
+            else {
+                break;
+            };
+            let target = (t.base as i64 + entry as i64) as u64;
+            if !t.sized && !(ts <= target && target < te) {
+                break;
+            }
+            let location = t.base + 4 * idx as u64;
+            out.push(TableEntry { location, offset: r.start, target });
+        }
+    }
+    out
+}
+
+/// Where each of `tables` lies and how many entries patching may visit:
+/// never past the start of the next table, the end of the section
+/// holding it, or MAX_TABLE_ENTRIES. Tables no section holds are left
+/// out.
+fn table_extents(tables: &[(u64, Option<usize>)], sections: &[Section]) -> Vec<Table> {
+    let mut out = Vec::new();
     for (i, &(base, count)) in tables.iter().enumerate() {
         let Some((off, fit)) = table_span(sections, base) else {
             continue;
@@ -558,9 +769,9 @@ pub fn patch_jump_tables(
             .map(|&(next, _)| ((next - base) / 4) as usize)
             .unwrap_or(MAX_TABLE_ENTRIES);
         let len = count.unwrap_or(MAX_TABLE_ENTRIES).min(room).min(fit);
-        let table = Table { base, off, len, sized: count.is_some() };
-        patch_one_table(data, &table, intervals, ts, te);
+        out.push(Table { base, off, len, sized: count.is_some() });
     }
+    out
 }
 
 /// Patch entries of a single jump table for address shifts. Only
@@ -896,5 +1107,56 @@ mod tests {
         let dead_ivl = (va + DISPATCH_LEN, table);
         patch(&mut data, &text, &secs, dead_ivl);
         assert_eq!(entries(&data, t), expected(va, table, dead as i64));
+    }
+
+    /// Scan `code` placed at vaddr 0x1000 with sections `secs`, the code
+    /// being the part that moves.
+    fn scan(code: &[u8], secs: &[Section]) -> TableScan {
+        let instrs = crate::arch::decode_text(code, 0, 0x1000, code.len() as u64, Arch::X86_64);
+        scan_jump_tables(code, &instrs, secs, (0x1000, 0x1000 + code.len() as u64))
+    }
+
+    /// A dispatch whose base is loaded by one LEA is resolved; the same
+    /// dispatch with the base loaded from memory is counted unresolved.
+    #[test]
+    fn counts_unresolved_dispatches() {
+        let (data, _) = pe_like(0x1000, 0x3000);
+        let text = &data[0x1000..0x1000 + (0x20 + DISPATCH_LEN) as usize];
+        let found = scan(text, &[]);
+        assert_eq!((found.tables.len(), found.unresolved, found.unrecognised), (1, 0, 0));
+        assert_eq!(found.blocker(), None);
+        let mut moved = text.to_vec();
+        moved[0x20 + 8] = 0x8b; // lea rdx,[rip+T] -> mov rdx,[rip+T]
+        let found = scan(&moved, &[]);
+        assert_eq!((found.tables.len(), found.unresolved, found.unrecognised), (0, 1, 0));
+        assert!(found.blocker().is_some_and(|w| w.contains("1 jump table dispatches unresolved")));
+    }
+
+    /// A `jmp reg` computed from a scaled 4-byte load in a form the
+    /// pattern does not match (LEA instead of ADD) is counted
+    /// unrecognised; one through a plain pointer load is not, nor one in
+    /// code that does not move and designates none that does.
+    #[test]
+    fn counts_unrecognised_dispatch_shapes() {
+        let lea_sum = [0x48, 0x63, 0x0c, 0x8a, 0x48, 0x8d, 0x0c, 0x11, 0xff, 0xe1, 0xc3];
+        let found = scan(&lea_sum, &[]);
+        assert_eq!((found.unresolved, found.unrecognised), (0, 1));
+        let ptr = [0x48, 0x8b, 0x47, 0x08, 0xff, 0xe0, 0xc3];
+        assert_eq!(scan(&ptr, &[]), TableScan::default());
+        let instrs = crate::arch::decode_text(&lea_sum, 0, 0x1000, 11, Arch::X86_64);
+        let elsewhere = scan_jump_tables(&lea_sum, &instrs, &[], (0x8000, 0x9000));
+        assert_eq!(elsewhere, TableScan::default());
+    }
+
+    /// Entries visited: a sized table up to its count; an unsized one up
+    /// to its first entry outside .text.
+    #[test]
+    fn lists_table_entries() {
+        let (data, secs) = pe_like(0x1000, 0x3000);
+        let ents = table_entries(&data, &[(0x3000, Some(4))], &secs, 0x1000, 0x1052);
+        assert_eq!(ents.len(), 4);
+        assert_eq!((ents[1].location, ents[1].offset, ents[1].target), (0x3004, 0x3004, 0x1020 + 0x1d));
+        let ents = table_entries(&data, &[(0x3000, None)], &secs, 0x1000, 0x1044);
+        assert_eq!(ents.len(), 3);
     }
 }

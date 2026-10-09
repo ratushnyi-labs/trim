@@ -40,6 +40,9 @@ pub struct AnalysisResult {
     pub dead_blocks: Vec<DeadBlock>,
     pub sections: Vec<Section>,
     pub sccp_skipped: Vec<(String, usize)>,
+    /// The analysis of a .NET NativeAOT ELF image, computed once and
+    /// reused by reassembly; None for other inputs.
+    pub nativeaot: Option<format::elf::nativeaot::NativeAot>,
 }
 
 /// Analyze a binary, return full analysis result.
@@ -47,7 +50,7 @@ pub fn analyze(
     data: &[u8],
     max_sccp_instrs: usize,
 ) -> AnalysisResult {
-    let (funcs, dead_funcs, sections, import_names) =
+    let (funcs, dead_funcs, sections, import_names, nativeaot) =
         analyze_format(data);
     let live_funcs = compute_live_names(&funcs, &dead_funcs);
     let instrs = decode_for_cfg(data, &sections);
@@ -70,6 +73,7 @@ pub fn analyze(
         dead_blocks,
         sections,
         sccp_skipped,
+        nativeaot,
     }
 }
 
@@ -232,7 +236,8 @@ fn merge_dead_blocks(
 }
 
 /// Detect binary format and run format-specific analysis to discover
-/// functions, dead functions, sections, and import names.
+/// functions, dead functions, sections, import names and, for a .NET
+/// NativeAOT ELF image, its analysis.
 fn analyze_format(
     data: &[u8],
 ) -> (
@@ -240,6 +245,7 @@ fn analyze_format(
     HashMap<String, (u64, u64)>,
     Vec<Section>,
     HashMap<u64, String>,
+    Option<format::elf::nativeaot::NativeAot>,
 ) {
     match format::detect_format(data) {
         Some(format::Format::Elf) => {
@@ -247,33 +253,34 @@ fn analyze_format(
         }
         Some(format::Format::Pe) => {
             let (f, d, s) = format::pe::analyze_pe(data);
-            (f, d, s, HashMap::new())
+            (f, d, s, HashMap::new(), None)
         }
         Some(format::Format::MachO) => {
             let (f, d, s) =
                 format::macho::analyze_macho(data);
-            (f, d, s, HashMap::new())
+            (f, d, s, HashMap::new(), None)
         }
         Some(format::Format::Dotnet) => {
             let (f, d, s) =
                 format::dotnet::analyze_dotnet(data);
-            (f, d, s, HashMap::new())
+            (f, d, s, HashMap::new(), None)
         }
         Some(format::Format::Wasm) => {
             let (f, d, s) =
                 format::wasm::analyze_wasm(data);
-            (f, d, s, HashMap::new())
+            (f, d, s, HashMap::new(), None)
         }
         Some(format::Format::Java) => {
             let (f, d, s) =
                 format::java::analyze_java(data);
-            (f, d, s, HashMap::new())
+            (f, d, s, HashMap::new(), None)
         }
         None => (
             FuncMap::new(),
             HashMap::new(),
             Vec::new(),
             HashMap::new(),
+            None,
         ),
     }
 }
@@ -392,20 +399,22 @@ pub fn reassemble(
     dead_blocks: &[DeadBlock],
     sections: &[Section],
 ) -> (usize, u64, usize, u64) {
-    reassemble_format(data, dead, dead_blocks, sections)
+    reassemble_format(data, dead, dead_blocks, sections, None)
 }
 
 /// Dispatch to the format-specific reassembler to patch the binary.
+/// `nativeaot` is the analysis of a NativeAOT ELF image, if done.
 fn reassemble_format(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
     dead_blocks: &[DeadBlock],
     sections: &[Section],
+    nativeaot: Option<&format::elf::nativeaot::NativeAot>,
 ) -> (usize, u64, usize, u64) {
     match format::detect_format(data) {
         Some(format::Format::Elf) => {
             format::elf::reassemble_elf(
-                data, dead, dead_blocks, sections,
+                data, dead, dead_blocks, sections, nativeaot,
             )
         }
         Some(format::Format::Pe) => {
@@ -575,11 +584,12 @@ fn patch_binary(
     result: &AnalysisResult,
 ) -> Result<Option<Vec<u8>>> {
     let mut mdata = data.to_vec();
-    let (fc, fs, bc, bs) = reassemble(
+    let (fc, fs, bc, bs) = reassemble_format(
         &mut mdata,
         &result.dead_funcs,
         &result.dead_blocks,
         &result.sections,
+        result.nativeaot.as_ref(),
     );
     let total_freed = fs + bs;
     eprintln!(

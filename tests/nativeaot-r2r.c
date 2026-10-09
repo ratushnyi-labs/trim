@@ -11,7 +11,14 @@
  * holding the RELPTR32s: those must be re-pointed for main() to reach
  * them.
  * -DR2R_MAJOR=N writes another header version, which trim must refuse
- * (every function then stays live). */
+ * (every function then stays live).
+ * -DR2R_SWITCH adds a switch dispatch whose table base is loaded from
+ * memory, not by one LEA: trim matches it but cannot find its table, so
+ * compaction must be refused (the entries, relative to the table, would
+ * go stale). Prints "switch: 30".
+ * -DR2R_STRAY adds a self-relative pointer in .rodata to a live function
+ * after the dead code, listed in no ReadyToRun table: compaction must be
+ * refused, as the model does not know it. Prints "stray: 55". */
 #include <stdio.h>
 
 #ifndef R2R_MAJOR
@@ -84,6 +91,46 @@ static __attribute__((noinline, used)) int r2r_unused(int x) {
     return x ^ 0x5a5a;
 }
 
+#ifdef R2R_SWITCH
+/* Two-case switch: case 0 returns 10, case 1 returns 20. The table holds
+ * case - table; its base comes from a pointer in memory. */
+__asm__(".pushsection .text\n"
+        ".type r2r_switch, @function\n"
+        "r2r_switch:\n"
+        "  movq r2r_switch_base(%rip), %rdx\n"
+        "  movl %edi, %ecx\n"
+        "  andl $1, %ecx\n"
+        "  movslq (%rdx,%rcx,4), %rax\n"
+        "  addq %rdx, %rax\n"
+        "  jmp *%rax\n"
+        "1: movl $10, %eax\n"
+        "  ret\n"
+        "2: movl $20, %eax\n"
+        "  ret\n"
+        ".size r2r_switch, .-r2r_switch\n"
+        ".section .rodata\n"
+        ".balign 4\n"
+        "r2r_switch_table: .long 1b - r2r_switch_table, 2b - r2r_switch_table\n"
+        ".section .data.rel.ro,\"aw\"\n"
+        ".balign 8\n"
+        "r2r_switch_base: .quad r2r_switch_table\n"
+        ".popsection\n");
+int r2r_switch(int);
+#endif
+
+#ifdef R2R_STRAY
+/* Called directly (so it is live) and through r2r_stray. */
+static __attribute__((noinline, used)) int r2r_stray_target(int x) {
+    return x * 11;
+}
+
+__asm__(".pushsection .rodata\n"
+        ".balign 4\n"
+        "r2r_stray: .long r2r_stray_target - .\n"
+        ".popsection\n");
+extern const int r2r_stray[];
+#endif
+
 /* NativeAOT managed code section: with __modules, a NativeAOT image. */
 __attribute__((section("__managedcode"), noinline, used))
 int managed_entry(int x) { return x + 1; }
@@ -143,5 +190,11 @@ int main(void) {
             sum += relptr_fn(p)(5);
     }
     printf("r2r: %d\n", sum + managed_entry(1));
+#ifdef R2R_SWITCH
+    printf("switch: %d\n", r2r_switch(0) + r2r_switch(1));
+#endif
+#ifdef R2R_STRAY
+    printf("stray: %d\n", relptr_fn(r2r_stray)(5) + r2r_stray_target(0));
+#endif
     return 0;
 }

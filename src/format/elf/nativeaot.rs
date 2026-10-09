@@ -36,7 +36,12 @@
 //! bytes of `__modules`, each header once; ReadyToRun rows must not
 //! overlap; the references found may not outnumber the 4-byte fields of
 //! the file; the rebuilt dehydrated data may not exceed a small multiple
-//! of the file size; MethodTables and EH info blocks must not overlap.
+//! of the file size; MethodTables, dispatch maps and EH info blocks must
+//! not overlap, and each dispatch map is read once however many types
+//! name it.
+//!
+//! The analysis runs once per image (`NativeAot`): analysis uses it for
+//! liveness and function boundaries, compaction for its plan.
 //!
 //! Layouts follow the .NET runtime sources (ModuleHeaders.h,
 //! StartupCodeHelpers.cs, DehydratedData.cs, ExternalReferencesTable.cs,
@@ -45,10 +50,12 @@
 //! other versions are refused.
 
 use super::ehframe;
+use crate::arch::x86_patch::TableEntry;
 use crate::patch::data_ptrs::PtrSlot;
+use crate::patch::relocs::{in_dead_range, total_shift};
 use crate::patch::relptr::RelField;
 use crate::types::{FuncMap, Section};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// "RTR": ReadyToRun header signature.
 const R2R_SIGNATURE: u32 = 0x0052_5452;
@@ -253,6 +260,8 @@ struct Region {
     file: bool,
     /// Executable.
     exec: bool,
+    /// Section type (`sh_type`).
+    sh_type: u32,
 }
 
 /// What the model reads from the image: allocated sections by address
@@ -369,6 +378,7 @@ fn regions_of(elf: &goblin::elf::Elf, file_len: usize) -> Vec<Region> {
                 offset: sh.sh_offset,
                 file: sh.sh_type != SHT_NOBITS && file_end <= file_len as u64,
                 exec: sh.sh_flags & SHF_EXECINSTR as u64 != 0,
+                sh_type: sh.sh_type,
             })
         })
         .collect();
@@ -526,8 +536,9 @@ pub fn nativeaot_refs(data: &[u8]) -> Result<Vec<RelPtr>, ModelError> {
     refs_of(&Image::parse(data)?).map(|m| m.refs)
 }
 
-/// The model of an image: its references, and the sealed vtables whose
-/// extent no second bound confirms.
+/// The model of an image: its references, the sealed vtables whose
+/// extent no second bound confirms, and the structures read in full.
+#[derive(Debug, Default)]
 struct Model {
     /// Every RELPTR32, sorted by location (`nativeaot_refs`).
     refs: Vec<RelPtr>,
@@ -535,21 +546,132 @@ struct Model {
     /// fewer slots than the vtable runs to (`sealed_slots`): their tail
     /// is bounded by the next known object alone.
     unconfirmed: Vec<(u64, u64)>,
+    /// File extents `[start, end)` of the structures whose layout the
+    /// model knows: ReadyToRun headers and sections, dispatch maps,
+    /// LSDAs, associated data and EH info. Every self-relative pointer
+    /// in them is one of `refs`; their other bytes hold no address.
+    parsed: Vec<(u64, u64)>,
 }
 
 /// `nativeaot_refs` on a parsed image, with the sealed vtables whose
-/// extent is not confirmed.
+/// extent is not confirmed and the structures read.
 fn refs_of(img: &Image) -> Result<Model, ModelError> {
     let cap = img.data.len() / 4;
-    let mut out = Vec::new();
-    let mut unconfirmed = Vec::new();
+    let mut m = Model::default();
     for (h, rows) in read_headers(img)? {
-        module_refs(img, h, &rows, &mut out, &mut unconfirmed)?;
-        within_cap(&out, cap)?;
+        module_refs(img, h, &rows, &mut m)?;
+        within_cap(&m.refs, cap)?;
     }
-    unwind_refs(img, &mut out)?;
-    within_cap(&out, cap)?;
-    Ok(Model { refs: dedup(out), unconfirmed })
+    unwind_refs(img, &mut m.refs, &mut m.parsed)?;
+    within_cap(&m.refs, cap)?;
+    m.refs = dedup(std::mem::take(&mut m.refs));
+    Ok(m)
+}
+
+/// What trim learns of a NativeAOT image, once per run: the model of its
+/// ReadyToRun references (or why there is none), the code the model
+/// reaches, the code with managed unwind info, and the starts of
+/// functions (`.eh_frame` FDEs, then the function map too).
+pub struct NativeAot {
+    /// The model, or why it could not be built.
+    model: Result<Model, ModelError>,
+    /// Targets of the model's references that lie in executable
+    /// sections (`nativeaot_code_refs`).
+    code_targets: Vec<u64>,
+    /// Starts of the code with managed unwind info
+    /// (`managed_unwind_starts`).
+    managed_starts: Vec<u64>,
+    /// Function starts: FDE starts, and those of `add_funcs`. Sorted,
+    /// unique.
+    func_starts: Vec<u64>,
+}
+
+impl NativeAot {
+    /// Analyse the image `data`.
+    pub fn new(data: &[u8]) -> Self {
+        match Image::parse(data) {
+            Ok(img) => Self::of(&img),
+            Err(e) => NativeAot {
+                model: Err(e),
+                code_targets: Vec::new(),
+                managed_starts: Vec::new(),
+                func_starts: Vec::new(),
+            },
+        }
+    }
+
+    /// Analyse the parsed image `img`.
+    fn of(img: &Image) -> Self {
+        let model = refs_of(img);
+        let code_targets = model.as_ref().map_or_else(|_| Vec::new(), |m| code_targets(img, m));
+        let fdes = ehframe::fde_ranges(img.data, &img.sections);
+        let mut func_starts: Vec<u64> = fdes.into_iter().map(|(b, _)| b).collect();
+        func_starts.sort_unstable();
+        func_starts.dedup();
+        let managed_starts = managed_unwind_starts(img);
+        NativeAot { model, code_targets, managed_starts, func_starts }
+    }
+
+    /// True if the ReadyToRun references are modelled exactly.
+    pub fn is_exact(&self) -> bool {
+        self.model.is_ok()
+    }
+
+    /// Count the functions of `funcs` among the function starts.
+    pub fn add_funcs(&mut self, funcs: &FuncMap) {
+        self.func_starts.extend(funcs.values().map(|f| f.addr));
+        self.func_starts.sort_unstable();
+        self.func_starts.dedup();
+    }
+
+    /// Liveness roots: the functions holding a code target of the model
+    /// or code with managed unwind info. If `__modules` names no
+    /// ReadyToRun header there is nothing to add (noted when it holds
+    /// pointers to something else). If the model is not exact, every
+    /// function is returned: what the runtime can reach is then unknown,
+    /// so nothing may be called dead (fail closed).
+    pub fn root_names(&self, funcs: &FuncMap) -> Vec<String> {
+        match &self.model {
+            Ok(_) => {
+                let mut code = self.code_targets.clone();
+                code.extend(&self.managed_starts);
+                let names = containing_funcs(funcs, &code);
+                eprintln!(
+                    "  note: NativeAOT: {} ReadyToRun references into code \
+                     ({} functions kept live)",
+                    self.code_targets.len(),
+                    names.len()
+                );
+                names
+            }
+            Err(ModelError::NoHeader(slots)) => {
+                if *slots > 0 {
+                    eprintln!(
+                        "  note: NativeAOT: __modules holds {} non-null slots \
+                         but none names a ReadyToRun header; no ReadyToRun \
+                         references modelled",
+                        slots
+                    );
+                }
+                Vec::new()
+            }
+            Err(ModelError::Malformed(why)) => {
+                eprintln!(
+                    "  note: NativeAOT: ReadyToRun data not modelled ({}); \
+                     all functions kept live",
+                    why
+                );
+                funcs.keys().cloned().collect()
+            }
+        }
+    }
+}
+
+/// Targets of the references of `m` that lie in executable sections.
+/// Sorted, unique.
+fn code_targets(img: &Image, m: &Model) -> Vec<u64> {
+    let set: BTreeSet<u64> = m.refs.iter().map(|r| r.target).filter(|&t| img.is_exec(t)).collect();
+    set.into_iter().collect()
 }
 
 /// Refuse more references than the file has 4-byte fields (`cap`): each
@@ -570,56 +692,12 @@ fn within_cap(out: &[RelPtr], cap: usize) -> Result<(), ModelError> {
 /// the runtime can reach through ReadyToRun data. Sorted, unique.
 pub fn nativeaot_code_refs(data: &[u8]) -> Result<Vec<u64>, ModelError> {
     let img = Image::parse(data)?;
-    let set: BTreeSet<u64> = refs_of(&img)?
-        .refs
-        .iter()
-        .map(|r| r.target)
-        .filter(|&t| img.is_exec(t))
-        .collect();
-    Ok(set.into_iter().collect())
+    Ok(code_targets(&img, &refs_of(&img)?))
 }
 
-/// Liveness roots for a NativeAOT image: the functions holding a code
-/// target of `nativeaot_code_refs`, and those holding code with managed
-/// unwind info (`managed_unwind_starts`). If `__modules` names no
-/// ReadyToRun header there is nothing to add (noted when it holds
-/// pointers to something else). If the model cannot be built exactly,
-/// every function is returned: what the runtime can reach is then
-/// unknown, so nothing may be called dead (fail closed).
+/// `NativeAot::root_names` for `data`, analysed afresh.
 pub fn root_names(data: &[u8], funcs: &FuncMap) -> Vec<String> {
-    match nativeaot_code_refs(data) {
-        Ok(targets) => {
-            let mut code = targets.clone();
-            code.extend(managed_unwind_starts(data));
-            let names = containing_funcs(funcs, &code);
-            eprintln!(
-                "  note: NativeAOT: {} ReadyToRun references into code \
-                 ({} functions kept live)",
-                targets.len(),
-                names.len()
-            );
-            names
-        }
-        Err(ModelError::NoHeader(slots)) => {
-            if slots > 0 {
-                eprintln!(
-                    "  note: NativeAOT: __modules holds {} non-null slots \
-                     but none names a ReadyToRun header; no ReadyToRun \
-                     references modelled",
-                    slots
-                );
-            }
-            Vec::new()
-        }
-        Err(ModelError::Malformed(why)) => {
-            eprintln!(
-                "  note: NativeAOT: ReadyToRun data not modelled ({}); \
-                 all functions kept live",
-                why
-            );
-            funcs.keys().cloned().collect()
-        }
-    }
+    NativeAot::new(data).root_names(funcs)
 }
 
 // ---- Compaction ----------------------------------------------------------------
@@ -642,36 +720,179 @@ pub struct R2rPlan {
     /// addends (file-backed slot or not) and the targets of `slots`.
     /// None may lie in removed code.
     pub absolute: Vec<u64>,
+    /// Stray words `(location, target)`: data words that, read as a
+    /// RELPTR32, designate the start of a .text function, and that no
+    /// listed field or known structure accounts for (`stray_words`). A
+    /// linker writes such a word for a self-relative reference the model
+    /// does not know; it would go stale if its ends moved apart.
+    pub stray: Vec<(u64, u64)>,
 }
 
-/// The references compacting .text must keep valid, or why this image
-/// cannot be compacted (it is then zero-filled in place). Compaction is
-/// refused unless the image is one whose absolute pointers are all known
-/// (`image_conflict`), the model is exact (no `ModelError`: verified
-/// version, every section modelled, no stack trace data), the ReadyToRun
-/// sections and every listed field lie outside .text, no sealed vtable
-/// whose extent is unconfirmed points into .text (`sealed_conflict`),
-/// and the layout lets the data the model does not list (data to data
-/// RELPTR32s) move as one block (`layout_conflict`). `decoded` names
-/// the code sections besides .text whose branches the compaction patches.
+impl R2rPlan {
+    /// Why the patch sites of the plan and the jump table `entries` do
+    /// not all stand apart: two of them overlap, so patching one would
+    /// corrupt the other. None if no two overlap.
+    pub fn site_overlap(&self, entries: &[TableEntry]) -> Option<String> {
+        let mut sites: Vec<(u64, u64, &str)> = Vec::new();
+        sites.extend(self.relptrs.iter().map(|f| (f.location, 4, "RELPTR32")));
+        sites.extend(self.slots.iter().map(|s| (s.location, 8, "pointer slot")));
+        sites.extend(entries.iter().map(|e| (e.location, 4, "jump table entry")));
+        sites.sort_unstable();
+        sites.windows(2).find(|w| w[1].0 < w[0].0.saturating_add(w[0].1)).map(|w| {
+            format!("{} at {:#x} overlaps {} at {:#x}", w[0].2, w[0].0, w[1].2, w[1].0)
+        })
+    }
+
+    /// Why a stray word (`R2rPlan::stray`) keeps .text `[ts, te)` from
+    /// being compacted by `intervals`: its location and target move
+    /// apart, or its target is removed. Words that overlap a jump table
+    /// entry of `entries` are accounted for by the table.
+    pub fn stray_conflict(
+        &self,
+        entries: &[TableEntry],
+        intervals: &[(u64, u64)],
+        ts: u64,
+        te: u64,
+    ) -> Option<String> {
+        let tables = merged(entries.iter().map(|e| (e.location, e.location + 4)));
+        let stale: Vec<&(u64, u64)> = self
+            .stray
+            .iter()
+            .filter(|&&(loc, _)| !overlaps(&tables, loc, loc + 4))
+            .filter(|&&(loc, t)| {
+                in_dead_range(t, intervals)
+                    || total_shift(loc, intervals, ts, te) != total_shift(t, intervals, ts, te)
+            })
+            .collect();
+        let &&(loc, t) = stale.first()?;
+        Some(format!(
+            "{} data words read as self-relative pointers to moved functions \
+             and are not known references (first at {:#x} designates {:#x})",
+            stale.len(),
+            loc,
+            t
+        ))
+    }
+}
+
+/// `NativeAot::compaction_plan` for `data`, analysed afresh.
 pub fn compaction_plan(data: &[u8], decoded: &[&str]) -> Result<R2rPlan, String> {
-    let img = Image::parse(data).map_err(|e| model_reason(&e))?;
-    let elf = goblin::elf::Elf::parse(data).map_err(|_| "ELF does not parse".to_string())?;
-    if let Some(why) = image_conflict(&elf) {
-        return Err(why);
+    NativeAot::new(data).compaction_plan(data, decoded)
+}
+
+impl NativeAot {
+    /// The references compacting .text must keep valid, or why this
+    /// image cannot be compacted (it is then zero-filled in place).
+    /// `data` is the image analysed. Compaction is refused unless the
+    /// image is one whose absolute pointers are all known
+    /// (`image_conflict`), no dynamic relocation writes into .text, the
+    /// model is exact (no `ModelError`: verified version, every section
+    /// modelled, no stack trace data), the ReadyToRun sections and every
+    /// listed field lie outside .text, no sealed vtable whose extent is
+    /// unconfirmed points into .text (`sealed_conflict`), and the layout
+    /// lets the data the model does not list (data to data RELPTR32s)
+    /// move as one block (`layout_conflict`). `decoded` names the code
+    /// sections besides .text whose branches the compaction patches.
+    pub fn compaction_plan(&self, data: &[u8], decoded: &[&str]) -> Result<R2rPlan, String> {
+        let img = Image::parse(data).map_err(|e| model_reason(&e))?;
+        let elf = goblin::elf::Elf::parse(data).map_err(|_| "ELF does not parse".to_string())?;
+        let text = img.named(".text").ok_or("no .text")?;
+        let (ts, te) = (text.start, text.end);
+        let conflict = image_conflict(&elf)
+            .or_else(|| reloc_in_text(&elf, ts, te))
+            .or_else(|| layout_conflict(&elf, ts, te, decoded));
+        if let Some(why) = conflict {
+            return Err(why);
+        }
+        let model = self.model.as_ref().map_err(model_reason)?;
+        if let Some(why) = r2r_in_text(&img, ts, te).or_else(|| sealed_conflict(model, ts, te)) {
+            return Err(why);
+        }
+        let relptrs = model.refs.iter().map(|r| rel_field(&img, r)).collect::<Result<_, _>>()?;
+        let (slots, absolute) = absolute_pointers(&img, &elf);
+        let stray = stray_words(&img, model, &slots, &self.func_starts, ts, te);
+        Ok(R2rPlan { relptrs, slots, absolute, stray })
     }
-    let text = img.named(".text").ok_or("no .text")?;
-    let (ts, te) = (text.start, text.end);
-    if let Some(why) = layout_conflict(&elf, ts, te, decoded) {
-        return Err(why);
+}
+
+/// Sections whose words `stray_words` does not read: the unwind tables,
+/// which `ehframe` patches, and dynamic-linking metadata
+/// (`metadata_section`, `.dynamic`), whose records hold no self-relative
+/// field.
+fn unscanned(name: &str, sh_type: u32) -> bool {
+    matches!(name, ".eh_frame" | ".eh_frame_hdr" | ".dynamic") || metadata_section(sh_type, name)
+}
+
+/// The stray words of `img` (`R2rPlan::stray`): at every byte of each
+/// file-backed, non-executable section not `unscanned`, a 4-byte word
+/// whose RELPTR32 target is one of `starts` inside .text `[ts, te)`, and
+/// that overlaps no field of `model`, no pointer slot of `slots` and no
+/// structure the model read in full (`Model::parsed`).
+fn stray_words(
+    img: &Image,
+    model: &Model,
+    slots: &[PtrSlot],
+    starts: &[u64],
+    ts: u64,
+    te: u64,
+) -> Vec<(u64, u64)> {
+    let starts: HashSet<u64> = starts.iter().copied().filter(|&a| ts <= a && a < te).collect();
+    let known = merged(
+        model
+            .refs
+            .iter()
+            .map(|r| (r.location, r.location + 4))
+            .chain(slots.iter().map(|s| (s.location, s.location + 8)))
+            .chain(model.parsed.iter().copied()),
+    );
+    let mut out = Vec::new();
+    for r in img.regions.iter().filter(|r| r.file && !r.exec && !unscanned(&r.name, r.sh_type)) {
+        let Some(bytes) = img.bytes(r.start, r.end - r.start) else { continue };
+        for (i, w) in bytes.windows(4).enumerate() {
+            let loc = r.start + i as u64;
+            let t = loc.wrapping_add(i32::from_le_bytes([w[0], w[1], w[2], w[3]]) as i64 as u64);
+            if ts <= t && t < te && starts.contains(&t) && !overlaps(&known, loc, loc + 4) {
+                out.push((loc, t));
+            }
+        }
     }
-    let model = refs_of(&img).map_err(|e| model_reason(&e))?;
-    if let Some(why) = r2r_in_text(&img, ts, te).or_else(|| sealed_conflict(&model, ts, te)) {
-        return Err(why);
+    out
+}
+
+/// `spans` sorted by start, overlapping and touching ones merged.
+fn merged(spans: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = spans.filter(|s| s.0 < s.1).collect();
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+    for (s, e) in v {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
     }
-    let relptrs = model.refs.iter().map(|r| rel_field(&img, r)).collect::<Result<_, _>>()?;
-    let (slots, absolute) = absolute_pointers(&img, &elf);
-    Ok(R2rPlan { relptrs, slots, absolute })
+    out
+}
+
+/// True if `[start, end)` overlaps one of `spans` (`merged`).
+fn overlaps(spans: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let i = spans.partition_point(|s| s.1 <= start);
+    spans.get(i).is_some_and(|s| s.0 < end)
+}
+
+/// True if `a` lies in one of `spans` (`merged`).
+fn in_spans(spans: &[(u64, u64)], a: u64) -> bool {
+    overlaps(spans, a, a + 1)
+}
+
+/// Why a dynamic relocation keeps .text `[ts, te)` from moving: one
+/// writes into it, so its offset would follow the code it patches.
+fn reloc_in_text(elf: &goblin::elf::Elf, ts: u64, te: u64) -> Option<String> {
+    elf.dynrelas
+        .iter()
+        .chain(elf.pltrelocs.iter())
+        .chain(elf.dynrels.iter())
+        .find(|r| ts <= r.r_offset && r.r_offset < te)
+        .map(|r| format!("dynamic relocation at {:#x} lies in .text", r.r_offset))
 }
 
 /// Why the ReadyToRun data keeps .text `[ts, te)` from moving: one of
@@ -720,11 +941,30 @@ fn sealed_conflict(model: &Model, ts: u64, te: u64) -> Option<String> {
         })
 }
 
+/// True if a dynamic tag names relocations other than RELA ones: REL,
+/// RELR (packed RELATIVE) or Android's packed formats, whose slots the
+/// plan does not read. Checked besides the section types, which a
+/// stripped or crafted image need not keep.
+fn foreign_reloc_tags(elf: &goblin::elf::Elf) -> bool {
+    elf.dynamic.as_ref().is_some_and(|d| d.dyns.iter().any(|x| foreign_reloc_tag(x.d_tag)))
+}
+
+/// True for a dynamic tag of REL, RELR or Android packed relocations.
+fn foreign_reloc_tag(tag: u64) -> bool {
+    use goblin::elf::dynamic::{DT_REL, DT_RELENT, DT_RELSZ};
+    /// DT_RELRSZ, DT_RELR, DT_RELRENT.
+    const RELR: [u64; 3] = [35, 36, 37];
+    /// DT_ANDROID_REL, _RELSZ, _RELA, _RELASZ.
+    const ANDROID: [u64; 4] = [0x6000_000f, 0x6000_0010, 0x6000_0011, 0x6000_0012];
+    matches!(tag, DT_REL | DT_RELSZ | DT_RELENT) || RELR.contains(&tag) || ANDROID.contains(&tag)
+}
+
 /// Why the image's absolute pointers are not all known from relocations,
 /// or not all patched: compaction needs an x86-64 (the only architecture
 /// verified) position-independent image without text relocations whose
-/// dynamic relocations are RELA, none of them IRELATIVE (resolver address
-/// in the addend) or symbol-less absolute.
+/// dynamic relocations are RELA (by section type and dynamic tag), none
+/// of them IRELATIVE (resolver address in the addend) or symbol-less
+/// absolute.
 fn image_conflict(elf: &goblin::elf::Elf) -> Option<String> {
     use goblin::elf::dynamic::DF_TEXTREL;
     use goblin::elf::header::{EM_X86_64, ET_DYN};
@@ -744,7 +984,9 @@ fn image_conflict(elf: &goblin::elf::Elf) -> Option<String> {
     if textrel {
         return Some("text relocations".to_string());
     }
-    if elf.section_headers.iter().any(|sh| sh.sh_type == SHT_REL || sh.sh_type == SHT_RELR) {
+    let rel_sections =
+        elf.section_headers.iter().any(|sh| sh.sh_type == SHT_REL || sh.sh_type == SHT_RELR);
+    if rel_sections || foreign_reloc_tags(elf) {
         return Some("REL or RELR relocations".to_string());
     }
     let relocs = elf.dynrelas.iter().chain(elf.pltrelocs.iter());
@@ -898,30 +1140,35 @@ fn dedup(refs: Vec<RelPtr>) -> Vec<RelPtr> {
     by_loc.into_values().collect()
 }
 
-/// The references of the module whose header is at `h`; sealed vtables
-/// whose extent is not confirmed go to `unconfirmed`.
-fn module_refs(
-    img: &Image,
-    h: u64,
-    rows: &[R2rSection],
-    out: &mut Vec<RelPtr>,
-    unconfirmed: &mut Vec<(u64, u64)>,
-) -> Result<(), ModelError> {
+/// The references of the module whose header is at `h`, into `m`:
+/// sealed vtables whose extent is not confirmed go to `m.unconfirmed`,
+/// the header, its sections and the dispatch maps read to `m.parsed`.
+fn module_refs(img: &Image, h: u64, rows: &[R2rSection], m: &mut Model) -> Result<(), ModelError> {
+    m.parsed.push((h, header_end(img, h)));
     for s in rows {
-        section_refs(img, s, out)?;
+        section_refs(img, s, &mut m.refs)?;
+        m.parsed.push((s.start, s.end));
     }
     let dehydrated = rows.iter().find(|s| s.id == SEC_DEHYDRATED_DATA);
     if let Some(s) = dehydrated {
-        let hyd = dehydrate(img, s, out)?;
+        let hyd = dehydrate(img, s, &mut m.refs)?;
         let tmi = rows
             .iter()
             .find(|r| r.id == SEC_TYPE_MANAGER_INDIRECTION)
             .ok_or(malformed("no type manager indirection"))?;
-        let sealed = sealed_vtables(img, &hyd, tmi.start)?;
-        let bounds = object_starts(img, &sealed, h, rows, &hyd, out);
-        sealed_slots(img, &sealed, &bounds, out, unconfirmed)?;
+        let sealed = sealed_vtables(img, &hyd, tmi.start, &mut m.parsed)?;
+        let bounds = object_starts(img, &sealed, h, rows, &hyd, &m.refs);
+        sealed_slots(img, &sealed, &bounds, &mut m.refs, &mut m.unconfirmed)?;
     }
     Ok(())
+}
+
+/// End of the ReadyToRun header at `h` and its section table (its rows
+/// were read, so the fields are file-backed).
+fn header_end(img: &Image, h: u64) -> u64 {
+    let hdr = img.bytes(h, R2R_HEADER_SIZE).unwrap_or(&[0; 16]);
+    let count = u16::from_le_bytes([hdr[12], hdr[13]]) as u64;
+    h + R2R_HEADER_SIZE + count * hdr[14] as u64
 }
 
 /// The references a ReadyToRun section holds directly, by section id.
@@ -1228,21 +1475,49 @@ fn resolve_fixups(
 
 // ---- Sealed vtables ---------------------------------------------------------------
 
-/// Sealed vtable addresses named by the rebuilt MethodTables. Each
-/// MethodTable holds a RELPTR32 to the type manager indirection `tmi`
-/// right after its vtable and interface list; its flags then say which
-/// optional RELPTR32 fields follow: writable data (always), dispatch
-/// map, finalizer, sealed vtable. MethodTables do not overlap, so each
-/// starts above the type manager field of the one before it; that floor
-/// keeps the search linear in the rebuilt size. Returns each sealed
-/// vtable with the number of its slots the dispatch maps of the types
-/// naming it use (`dispatch_used`).
+/// A rebuilt MethodTable that names a sealed vtable.
+#[derive(Debug, Clone, Copy)]
+struct SealedRef {
+    /// Address of the sealed vtable.
+    start: u64,
+    /// The type's dispatch map, if it has one.
+    map: Option<u64>,
+    /// The type's vtable slot count.
+    vtable_slots: u64,
+}
+
+/// Sealed vtable addresses named by the rebuilt MethodTables
+/// (`sealed_refs`), each with the number of its slots the dispatch maps
+/// of the types naming it use (`DispatchMap::used`). Each distinct
+/// dispatch map is read once (`dispatch_maps`); their extents go to
+/// `parsed`.
 fn sealed_vtables(
     img: &Image,
     hyd: &Hydrated,
     tmi: u64,
+    parsed: &mut Vec<(u64, u64)>,
 ) -> Result<BTreeMap<u64, u64>, ModelError> {
+    let named = sealed_refs(hyd, tmi)?;
+    let maps = dispatch_maps(img, named.iter().filter_map(|n| n.map))?;
+    parsed.extend(maps.values().map(|d| (d.start, d.end)));
     let mut sealed = BTreeMap::new();
+    for n in &named {
+        let used = n.map.and_then(|m| maps.get(&m)).map_or(0, |d| d.used(n.vtable_slots));
+        let e = sealed.entry(n.start).or_insert(0);
+        *e = used.max(*e);
+    }
+    Ok(sealed)
+}
+
+/// The rebuilt MethodTables that name a sealed vtable. Each MethodTable
+/// holds a RELPTR32 to the type manager indirection `tmi` right after
+/// its vtable and interface list; its flags then say which optional
+/// RELPTR32 fields follow: writable data (always), dispatch map,
+/// finalizer, sealed vtable. MethodTables do not overlap, so each starts
+/// above the type manager field of the one before it; that floor keeps
+/// the search linear in the rebuilt size.
+fn sealed_refs(hyd: &Hydrated, tmi: u64) -> Result<Vec<SealedRef>, ModelError> {
+    let mut out = Vec::new();
     let anchors = hyd.writes.iter().filter(|w| w.1 == 4 && w.2 == tmi);
     let mut floor = hyd.base;
     for &(field, _, _) in anchors {
@@ -1252,13 +1527,12 @@ fn sealed_vtables(
         if flags & MT_HAS_SEALED_VTABLE == 0 {
             continue;
         }
+        let vtable_slots = hyd.uint(m + 16, 2).ok_or(malformed("MethodTable"))?;
         let mut at = field + 8;
-        let mut used = 0;
+        let mut map = None;
         if flags & MT_HAS_DISPATCH_MAP != 0 {
-            let map = hyd.write_at(at).filter(|w| w.1 == 4);
-            let map = map.ok_or(malformed("dispatch map field"))?.2;
-            let vtable_slots = hyd.uint(m + 16, 2).ok_or(malformed("MethodTable"))?;
-            used = dispatch_used(img, map, vtable_slots)?;
+            let w = hyd.write_at(at).filter(|w| w.1 == 4);
+            map = Some(w.ok_or(malformed("dispatch map field"))?.2);
             at += 4;
         }
         if flags & MT_HAS_FINALIZER != 0 {
@@ -1266,19 +1540,63 @@ fn sealed_vtables(
         }
         let w = hyd.write_at(at).filter(|w| w.1 == 4);
         let start = w.ok_or(malformed("sealed vtable field"))?.2;
-        let e = sealed.entry(start).or_insert(0);
-        *e = used.max(*e);
+        out.push(SealedRef { start, map, vtable_slots });
     }
-    Ok(sealed)
+    Ok(out)
 }
 
-/// Sealed vtable slots the dispatch map at `map` uses: one more than
-/// the highest implementation slot of its entries (standard, default,
-/// static) that is not a vtable slot (below `vtable_slots`, the type's
-/// vtable slot count) or special; 0 if none is. The runtime reads a
-/// type's sealed vtable at `slot - vtable_slots` for such entries of its
-/// own dispatch map.
-fn dispatch_used(img: &Image, map: u64, vtable_slots: u64) -> Result<u64, ModelError> {
+/// A dispatch map: its extent and the highest implementation slot of its
+/// entries that is not special.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchMap {
+    /// Address of its header.
+    start: u64,
+    /// End of its last entry (exclusive).
+    end: u64,
+    /// Highest implementation slot below `DISPATCH_SPECIAL_SLOT`, if any
+    /// entry has one.
+    highest: Option<u64>,
+}
+
+impl DispatchMap {
+    /// Sealed vtable slots the map uses for a type with `vtable_slots`
+    /// vtable slots: one more than its highest implementation slot that
+    /// is not a vtable slot (below `vtable_slots`) or special; 0 if none
+    /// is. The runtime reads a type's sealed vtable at `slot -
+    /// vtable_slots` for such entries of its own dispatch map.
+    fn used(&self, vtable_slots: u64) -> u64 {
+        self.highest.filter(|&h| h >= vtable_slots).map_or(0, |h| h - vtable_slots + 1)
+    }
+}
+
+/// Read each distinct dispatch map of `maps` once, however many types
+/// name it. Their extents (from the header counts) must not overlap,
+/// which bounds the bytes read by the file size; overlapping maps are
+/// refused before the second is read.
+fn dispatch_maps(
+    img: &Image,
+    maps: impl Iterator<Item = u64>,
+) -> Result<HashMap<u64, DispatchMap>, ModelError> {
+    let distinct: BTreeSet<u64> = maps.collect();
+    let mut out = HashMap::with_capacity(distinct.len());
+    let mut prev_end = 0;
+    for m in distinct {
+        if m < prev_end {
+            return Err(malformed("dispatch maps overlap"));
+        }
+        let d = read_dispatch_map(img, m)?;
+        prev_end = d.end;
+        out.insert(m, d);
+    }
+    Ok(out)
+}
+
+/// The dispatch map at `map`: a header of four 16-bit entry counts
+/// (standard, default, standard static, default static), then 6-byte
+/// instance and 8-byte static entries whose implementation slot is the
+/// 16-bit word at offset 4. Refused unless it lies whole in one
+/// file-backed section.
+fn read_dispatch_map(img: &Image, map: u64) -> Result<DispatchMap, ModelError> {
     let bad = || malformed("dispatch map");
     let head = img.bytes(map, DISPATCH_HEADER).ok_or_else(bad)?;
     let count = |i: usize| u16::from_le_bytes([head[2 * i], head[2 * i + 1]]) as u64;
@@ -1286,18 +1604,20 @@ fn dispatch_used(img: &Image, map: u64, vtable_slots: u64) -> Result<u64, ModelE
     let statics = count(2) + count(3);
     let entries = map + DISPATCH_HEADER;
     let static_entries = entries + DISPATCH_ENTRY * instance;
+    let end = static_entries + DISPATCH_STATIC_ENTRY * statics;
+    img.bytes(map, end - map).ok_or_else(bad)?;
     let rows = (0..instance)
         .map(|i| entries + DISPATCH_ENTRY * i)
         .chain((0..statics).map(|i| static_entries + DISPATCH_STATIC_ENTRY * i));
-    let mut used = 0;
+    let mut highest = None;
     for row in rows {
         let b = img.bytes(row + 4, 2).ok_or_else(bad)?;
         let slot = u16::from_le_bytes([b[0], b[1]]) as u64;
-        if vtable_slots <= slot && slot < DISPATCH_SPECIAL_SLOT {
-            used = used.max(slot - vtable_slots + 1);
+        if slot < DISPATCH_SPECIAL_SLOT {
+            highest = highest.max(Some(slot));
         }
     }
-    Ok(used)
+    Ok(DispatchMap { start: map, end, highest })
 }
 
 /// Start of the MethodTable whose type manager field is at `field`: an
@@ -1351,7 +1671,9 @@ fn mt_header(hyd: &Hydrated, m: u64, n: u64) -> bool {
 
 /// Addresses, inside the sections holding the sealed vtables `sealed`,
 /// where some known object starts: the header, section bounds, targets
-/// of the rebuilt pointers and of the references found so far.
+/// of the rebuilt pointers and of the references found so far. The
+/// sections are merged and sorted, so each candidate is placed by a
+/// binary search.
 fn object_starts(
     img: &Image,
     sealed: &BTreeMap<u64, u64>,
@@ -1360,11 +1682,8 @@ fn object_starts(
     hyd: &Hydrated,
     out: &[RelPtr],
 ) -> BTreeSet<u64> {
-    let spans: BTreeSet<(u64, u64)> = sealed
-        .keys()
-        .filter_map(|&s| img.region(s).map(|r| (r.start, r.end)))
-        .collect();
-    let inside = |a: &u64| spans.iter().any(|&(lo, hi)| lo <= *a && *a < hi);
+    let spans = merged(sealed.keys().filter_map(|&s| img.region(s).map(|r| (r.start, r.end))));
+    let inside = |a: &u64| in_spans(&spans, *a);
     let rows = rows.iter().flat_map(|r| [r.start, r.end]);
     let writes = hyd.writes.iter().map(|w| w.2);
     let refs = out.iter().map(|r| r.target);
@@ -1421,12 +1740,11 @@ fn sealed_slots(
 /// clauses, which names no address, so this code must stay live
 /// whatever references it. Empty without that section or when an LSDA
 /// cannot be located (the model is then refused anyway).
-fn managed_unwind_starts(data: &[u8]) -> Vec<u64> {
-    let Ok(img) = Image::parse(data) else { return Vec::new() };
+fn managed_unwind_starts(img: &Image) -> Vec<u64> {
     let Some(eh) = img.named(EH_TABLE).map(|r| (r.start, r.end)) else {
         return Vec::new();
     };
-    ehframe::fde_lsdas(data, &img.sections)
+    ehframe::fde_lsdas(img.data, &img.sections)
         .unwrap_or_default()
         .into_iter()
         .filter(|&(_, l)| eh.0 <= l && l < eh.1)
@@ -1435,11 +1753,16 @@ fn managed_unwind_starts(data: &[u8]) -> Vec<u64> {
 }
 
 /// References in `.dotnet_eh_table` LSDAs (named by `.eh_frame` FDEs)
-/// and in the associated data and EH info they point at. An FDE whose
-/// LSDA cannot be located (DW_EH_PE_indirect, or an encoding that does
-/// not resolve) is refused: it could name an LSDA of the table. EH info
-/// blocks must not overlap, which keeps the walk linear in their size.
-fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
+/// and in the associated data and EH info they point at; the extents of
+/// those structures go to `parsed`. An FDE whose LSDA cannot be located
+/// (DW_EH_PE_indirect, or an encoding that does not resolve) is refused:
+/// it could name an LSDA of the table. EH info blocks must not overlap,
+/// which keeps the walk linear in their size.
+fn unwind_refs(
+    img: &Image,
+    out: &mut Vec<RelPtr>,
+    parsed: &mut Vec<(u64, u64)>,
+) -> Result<(), ModelError> {
     let eh = match img.named(EH_TABLE) {
         Some(r) => (r.start, r.end),
         None => return Ok(()),
@@ -1459,9 +1782,11 @@ fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
         .collect();
     for l in lsdas {
         lsda_refs(img, l, eh, out, &mut assoc, &mut infos)?;
+        parsed.push((l, l + 1));
     }
     for a in assoc {
         associated_refs(img, a, out)?;
+        parsed.push((a, a + 1));
     }
     let mut prev_end = 0;
     for i in infos {
@@ -1469,6 +1794,7 @@ fn unwind_refs(img: &Image, out: &mut Vec<RelPtr>) -> Result<(), ModelError> {
             return Err(malformed("EH info blocks overlap"));
         }
         prev_end = eh_info_refs(img, i, out)?;
+        parsed.push((i, prev_end));
     }
     Ok(())
 }
@@ -1936,14 +2262,147 @@ mod tests {
         #[test]
         fn counts_sealed_slots_a_dispatch_map_uses() {
             let map = dispatch_map(&[3, 6], &[7], &[5, 0xffff]);
+            let len = map.len() as u64;
             let d = elf(&[text(), data_sec(".data", DATA, map)]);
             let img = Image::parse(&d).expect("parses");
-            assert_eq!(dispatch_used(&img, DATA, 5), Ok(3));
-            assert_eq!(dispatch_used(&img, DATA, 8), Ok(0));
+            let m = read_dispatch_map(&img, DATA).expect("read");
+            assert_eq!((m.start, m.end, m.highest), (DATA, DATA + len, Some(7)));
+            assert_eq!((m.used(5), m.used(8)), (3, 0));
             let short = dispatch_map(&[3, 6, 9], &[], &[]);
             let d = elf(&[text(), data_sec(".data", DATA, short[..14].to_vec())]);
             let img = Image::parse(&d).expect("parses");
-            assert!(dispatch_used(&img, DATA, 5).is_err());
+            assert!(read_dispatch_map(&img, DATA).is_err());
+        }
+
+        /// Bytes of one rebuilt MethodTable with a dispatch map and a
+        /// sealed vtable, no vtable slots (40 bytes): flags and base
+        /// size, related type, slot counts and hash, then the type
+        /// manager, writable data, dispatch map and sealed vtable fields.
+        const MT_SIZE: u64 = 40;
+
+        /// `n` rebuilt MethodTables at `base` naming the type manager
+        /// indirection `tmi`, the dispatch map `map(i)` and the sealed
+        /// vtable `sealed`.
+        fn method_tables(base: u64, n: u64, tmi: u64, map: impl Fn(u64) -> u64, sealed: u64) -> Hydrated {
+            let mut bytes = vec![0u8; (n * MT_SIZE) as usize];
+            let mut writes = Vec::with_capacity(4 * n as usize);
+            for i in 0..n {
+                let m = base + i * MT_SIZE;
+                let o = (i * MT_SIZE) as usize;
+                bytes[o..o + 4].copy_from_slice(&(MT_HAS_DISPATCH_MAP | MT_HAS_SEALED_VTABLE).to_le_bytes());
+                writes.push((m + 24, 4, tmi));
+                writes.push((m + 28, 4, NOBITS));
+                writes.push((m + 32, 4, map(i)));
+                writes.push((m + 36, 4, sealed));
+            }
+            Hydrated { base, bytes, writes }
+        }
+
+        /// 100,000 MethodTables naming one dispatch map of 131,070
+        /// entries: the map is read once, not once per type (which
+        /// would take about 10^10 reads).
+        #[test]
+        fn reads_a_shared_dispatch_map_once() {
+            let mut map = vec![0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+            for i in 0..131_070u32 {
+                map.extend([0, 0, 0, 0]);
+                map.extend(((i % 3) as u16).to_le_bytes());
+            }
+            let d = elf(&[text(), data_sec(".data", DATA, map)]);
+            let sealed = quickly(move || {
+                let img = Image::parse(&d).expect("parses");
+                let hyd = method_tables(NOBITS, 100_000, DATA - 8, |_| DATA, TEXT);
+                let mut parsed = Vec::new();
+                sealed_vtables(&img, &hyd, DATA - 8, &mut parsed).map(|s| (s, parsed))
+            });
+            let (sealed, parsed) = sealed.expect("modelled");
+            assert_eq!(sealed.into_iter().collect::<Vec<_>>(), vec![(TEXT, 3)]);
+            assert_eq!(parsed, vec![(DATA, DATA + 8 + 6 * 131_070)]);
+        }
+
+        /// Dispatch maps two bytes apart, each claiming 514 entries: their
+        /// extents overlap, so the model is refused without reading them
+        /// all.
+        #[test]
+        fn refuses_overlapping_dispatch_maps() {
+            let d = elf(&[text(), data_sec(".data", DATA, vec![1; 12_000])]);
+            let r = quickly(move || {
+                let img = Image::parse(&d).expect("parses");
+                let hyd = method_tables(NOBITS, 1000, DATA - 8, |i| DATA + 2 * i, TEXT);
+                sealed_vtables(&img, &hyd, DATA - 8, &mut Vec::new())
+            });
+            assert_eq!(r, Err(malformed("dispatch maps overlap")));
+        }
+
+        /// Spans merge when they overlap or touch; a range overlaps a
+        /// span when they share a byte.
+        #[test]
+        fn merges_and_searches_spans() {
+            let s = merged([(10, 20), (0, 4), (15, 30), (30, 32), (40, 40)].into_iter());
+            assert_eq!(s, vec![(0, 4), (10, 32)]);
+            assert!(overlaps(&s, 2, 6) && overlaps(&s, 28, 40) && !overlaps(&s, 4, 10));
+            assert!(in_spans(&s, 31) && !in_spans(&s, 32) && !in_spans(&s, 5));
+        }
+
+        /// REL, RELR and Android packed relocation tags are foreign;
+        /// RELA tags are not.
+        #[test]
+        fn recognises_foreign_relocation_tags() {
+            assert!([17, 18, 19, 35, 36, 37, 0x6000_000f, 0x6000_0011].iter().all(|&t| foreign_reloc_tag(t)));
+            assert!(![7, 8, 9, 0x6fff_fff9].iter().any(|&t| foreign_reloc_tag(t)));
+        }
+
+        /// Patch sites that overlap are refused: a RELPTR32 inside a
+        /// pointer slot, or a jump table entry over a RELPTR32.
+        #[test]
+        fn refuses_overlapping_patch_sites() {
+            let field = |location| RelField { location, offset: 0, target: TEXT };
+            let slot = PtrSlot { location: DATA, offset: 0, target: TEXT };
+            let entry = |location| TableEntry { location, offset: 0, target: TEXT };
+            let plan = R2rPlan { relptrs: vec![field(DATA + 8)], slots: vec![slot], ..R2rPlan::default() };
+            assert_eq!(plan.site_overlap(&[entry(DATA + 12)]), None);
+            let why = plan.site_overlap(&[entry(DATA + 10)]);
+            assert!(why.is_some_and(|w| w.contains("RELPTR32 at 0x404008 overlaps jump table entry")));
+            let plan = R2rPlan { relptrs: vec![field(DATA + 4)], ..plan };
+            assert!(plan.site_overlap(&[]).is_some_and(|w| w.contains("pointer slot")));
+        }
+
+        /// A stray word blocks compaction when its ends move apart or its
+        /// target is removed, unless a jump table entry accounts for it.
+        #[test]
+        fn blocks_on_stray_words_that_move_apart() {
+            let (ts, te) = (TEXT, TEXT + 0x1000);
+            let ivs = [(TEXT + 0x100, TEXT + 0x180)];
+            let plan = |stray| R2rPlan { stray, ..R2rPlan::default() };
+            assert_eq!(plan(vec![(DATA, TEXT + 0x80)]).stray_conflict(&[], &ivs, ts, te), None);
+            let moved = plan(vec![(DATA, TEXT + 0x200)]);
+            let why = moved.stray_conflict(&[], &ivs, ts, te);
+            assert!(why.is_some_and(|w| w.starts_with("1 data words") && w.contains("0x404000")));
+            let entry = TableEntry { location: DATA - 2, offset: 0, target: TEXT };
+            assert_eq!(moved.stray_conflict(&[entry], &ivs, ts, te), None);
+            let removed = plan(vec![(TEXT - 0x10, TEXT + 0x100)]);
+            assert!(removed.stray_conflict(&[], &ivs, ts, te).is_some());
+        }
+
+        /// Stray words: a self-relative word in data designating a
+        /// function start; not when it designates no start, overlaps a
+        /// listed field, or lies in an unscanned section.
+        #[test]
+        fn finds_stray_words() {
+            let mut b = vec![0u8; 0x40];
+            b[0x10..0x14].copy_from_slice(&rel(ARRAYS + 0x10, TEXT + 0x20));
+            b[0x20..0x24].copy_from_slice(&rel(ARRAYS + 0x20, TEXT + 0x30));
+            b[0x30..0x34].copy_from_slice(&rel(ARRAYS + 0x30, TEXT + 0x21));
+            let rows = [(213, 1, ARRAYS, ARRAYS + 4)];
+            let mut arrays = code_relptrs(ARRAYS, 1);
+            arrays.extend(&b[4..]);
+            let eh = data_sec(".eh_frame", VA + 0x6000, rel(VA + 0x6000, TEXT + 0x20).to_vec());
+            let d = elf(&[text(), modules(&[DATA]), data_with(header(&rows), arrays), eh]);
+            let img = Image::parse(&d).expect("parses");
+            let model = refs_of(&img).expect("modelled");
+            let starts = [TEXT, TEXT + 0x20, TEXT + 0x30];
+            let found = stray_words(&img, &model, &[], &starts, TEXT, TEXT + 0x1000);
+            assert_eq!(found, vec![(ARRAYS + 0x10, TEXT + 0x20), (ARRAYS + 0x20, TEXT + 0x30)]);
         }
 
         /// Two sealed vtables of 2 and 3 slots into .text, bounded by
@@ -1982,6 +2441,7 @@ mod tests {
             let model = Model {
                 refs: vec![slot(DATA, TEXT), slot(DATA + 8, NOBITS)],
                 unconfirmed: vec![(DATA + 8, DATA + 12)],
+                parsed: Vec::new(),
             };
             assert_eq!(sealed_conflict(&model, TEXT, TEXT + 0x1000), None);
             let model = Model { unconfirmed: vec![(DATA, DATA + 4)], ..model };

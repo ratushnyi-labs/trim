@@ -18,10 +18,11 @@ use crate::analysis::roots::determine_roots;
 use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
 use crate::analysis::cfg::DeadBlock;
+use crate::arch::x86_patch::{TableEntry, TableScan};
 use crate::patch::compact::{compact_text, compaction_fits};
 use crate::patch::data_ptrs::{patch_data_ptrs, patch_slot_ptrs, PtrSlot};
 use crate::patch::relptr::{patch_relptr32, relptr32_conflict};
-use nativeaot::R2rPlan;
+use nativeaot::{NativeAot, R2rPlan};
 use crate::patch::relocs::{
     block_intervals, combine_intervals, dead_intervals,
     defrag_intervals,
@@ -56,11 +57,13 @@ const NATIVEAOT_CODE: &[&str] = &["__managedcode", "__unbox"];
 pub fn analyze_elf(
     data: &[u8],
 ) -> (FuncMap, HashMap<String, (u64, u64)>, Vec<Section>) {
-    let (funcs, dead, sections, _) = analyze_elf_full(data);
+    let (funcs, dead, sections, _, _) = analyze_elf_full(data);
     (funcs, dead, sections)
 }
 
-/// Analyze ELF returning import names (PLT) alongside.
+/// Analyze ELF returning import names (PLT) alongside, and for a .NET
+/// NativeAOT image its analysis (`nativeaot::NativeAot`, computed once
+/// here), which reassembly reuses.
 pub fn analyze_elf_full(
     data: &[u8],
 ) -> (
@@ -68,6 +71,7 @@ pub fn analyze_elf_full(
     HashMap<String, (u64, u64)>,
     Vec<Section>,
     HashMap<u64, String>,
+    Option<NativeAot>,
 ) {
     let elf = match goblin::elf::Elf::parse(data) {
         Ok(e) => e,
@@ -102,8 +106,9 @@ pub fn analyze_elf_full(
     if instrs.is_empty() {
         return empty_full();
     }
+    let mut aot = is_nativeaot(&sections).then(|| NativeAot::new(data));
     let (funcs, links) =
-        build_func_map(&elf, data, &sections, &instrs, ts, te);
+        build_func_map(&elf, data, &sections, &instrs, ts, te, aot.as_ref());
     if funcs.is_empty() {
         return empty_full();
     }
@@ -115,8 +120,11 @@ pub fn analyze_elf_full(
     let mut instrs = instrs;
     instrs.extend(decode_named(data, &sections, EXTRA_CODE_SECTIONS));
     instrs.extend(links);
-    let dead = run_analysis(&funcs, &instrs, data, &sections);
-    (funcs, dead, sections, plt_names)
+    let dead = run_analysis(&funcs, &instrs, data, &sections, aot.as_ref());
+    if let Some(a) = aot.as_mut() {
+        a.add_funcs(&funcs);
+    }
+    (funcs, dead, sections, plt_names, aot)
 }
 
 /// Build the function map from symtab; fall back to inference if stripped,
@@ -125,6 +133,7 @@ pub fn analyze_elf_full(
 /// must include: fall-through and jump-table edges between functions.
 /// Either way every `.dynsym` code entry point is a root: on the symtab
 /// path through the function holding it (`root_dynamic_exports`).
+/// `aot` is the analysis of a NativeAOT image (see `fde_hints`).
 fn build_func_map(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -132,6 +141,7 @@ fn build_func_map(
     instrs: &[DecodedInstr],
     ts: u64,
     te: u64,
+    aot: Option<&NativeAot>,
 ) -> (FuncMap, Vec<DecodedInstr>) {
     use crate::decode::infer;
     let mut funcs = symbols::get_functions_symtab(elf);
@@ -140,7 +150,7 @@ fn build_func_map(
         return (funcs, Vec::new());
     }
     let dynsyms = symbols::get_dynamic_symbols(elf);
-    match fde_hints(elf, data, sections) {
+    match fde_hints(elf, data, sections, aot) {
         Some(h) => infer::infer_functions_fde(
             elf.entry, &dynsyms, data, sections, instrs, ts, te, &h,
         ),
@@ -163,16 +173,18 @@ fn build_func_map(
 /// references are not modelled exactly: split at FDEs, code reached
 /// only through 32-bit self-relative pointers in ReadyToRun data would
 /// lose its only reference. With an exact model those pointers make
-/// their targets roots (`nativeaot::root_names`).
+/// their targets roots (`NativeAot::root_names`). `aot` is the analysis
+/// of a NativeAOT image (None for other images).
 fn fde_hints(
     elf: &goblin::elf::Elf,
     data: &[u8],
     sections: &[Section],
+    aot: Option<&NativeAot>,
 ) -> Option<crate::decode::infer::FdeHints> {
     if detect_arch(data) != Arch::X86_64 || !elf.is_64 {
         return None;
     }
-    if is_nativeaot(sections) && nativeaot::nativeaot_refs(data).is_err() {
+    if aot.is_some_and(|a| !a.is_exact()) {
         return None;
     }
     let fdes = ehframe::fde_ranges(data, sections);
@@ -246,12 +258,15 @@ fn alloc_sections(
     (data, ptrs, code)
 }
 
-/// Run reachability analysis: build call graph, determine roots, find dead.
+/// Run reachability analysis: build call graph, determine roots, find
+/// dead. A NativeAOT image (`aot`) adds its managed code and the roots
+/// of its analysis.
 fn run_analysis(
     funcs: &FuncMap,
     instrs: &[DecodedInstr],
     data: &[u8],
     sections: &[Section],
+    aot: Option<&NativeAot>,
 ) -> HashMap<String, (u64, u64)> {
     let (graph, orphan_refs) = build_ref_graph_fast(funcs, instrs);
     let func_addrs: HashSet<u64> =
@@ -269,9 +284,9 @@ fn run_analysis(
         .iter()
         .filter_map(|a| by_addr.get(a).map(|n| n.to_string()))
         .collect();
-    if is_nativeaot(sections) {
+    if let Some(aot) = aot {
         data_names.extend(managed_funcs(funcs, sections));
-        data_names.extend(nativeaot::root_names(data, funcs));
+        data_names.extend(aot.root_names(funcs));
     }
     let roots = determine_roots(funcs, &data_names, &orphan_refs);
     let live = compute_live_set(&roots, &graph, funcs);
@@ -321,8 +336,9 @@ fn empty_full() -> (
     HashMap<String, (u64, u64)>,
     Vec<Section>,
     HashMap<u64, String>,
+    Option<NativeAot>,
 ) {
-    (FuncMap::new(), HashMap::new(), Vec::new(), HashMap::new())
+    (FuncMap::new(), HashMap::new(), Vec::new(), HashMap::new(), None)
 }
 
 /// Reassemble: patch refs, compact .text, update ELF metadata.
@@ -330,13 +346,15 @@ fn empty_full() -> (
 /// future work), so dead functions elsewhere are zero-filled in place
 /// and never reach the interval and drain math, which assumes every
 /// interval lies inside .text. Dead code that lies in no single
-/// executable section is left untouched.
+/// executable section is left untouched. For a NativeAOT image `aot` is
+/// its analysis from `analyze_elf_full` (made here when None).
 /// Returns (func_count, func_saved, block_count, block_saved).
 pub fn reassemble_elf(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
     dead_blocks: &[DeadBlock],
     sections: &[Section],
+    aot: Option<&NativeAot>,
 ) -> (usize, u64, usize, u64) {
     let arch = detect_arch(data);
     // Landing pads are reachable only through the unwinder (LSDA).
@@ -351,9 +369,11 @@ pub fn reassemble_elf(
             split.skipped
         );
     }
-    // Read before anything is written: the model parses the original data.
-    let r2r = is_nativeaot(sections)
-        .then(|| nativeaot::compaction_plan(data, EXTRA_CODE_SECTIONS));
+    // Read before anything is written: the plan parses the original data.
+    let r2r = is_nativeaot(sections).then(|| match aot {
+        Some(a) => a.compaction_plan(data, EXTRA_CODE_SECTIONS),
+        None => nativeaot::compaction_plan(data, EXTRA_CODE_SECTIONS),
+    });
     let (oc, os) = zero_fill_ranges(data, &split.other);
     let (fc, fs, bc, bs) = match r2r {
         None => compact_or_fill(data, &split.text, dead_blocks, sections, arch, None),
@@ -418,15 +438,21 @@ fn compact_or_fill(
     let instrs = decode_sections(data, sections);
     let fits = !instrs.is_empty()
         && compaction_fits(data.len(), sections, &intervals);
-    if let Some(why) = compaction_blocker(fits, r2r, &intervals, ts, te) {
+    let scan = jump_tables(data, &instrs, sections, arch, (ts, te));
+    let entries = crate::arch::x86_patch::table_entries(data, &scan.tables, sections, ts, te);
+    let found = Found { fits, scan: &scan, entries: &entries };
+    if let Some(why) = compaction_blocker(&found, r2r, &intervals, ts, te) {
         return match r2r {
             Some(_) => zero_fill_in_place(data, dead, dead_blocks, sections, arch, &why),
-            None => fill_in_place(data, dead, dead_blocks, sections, arch),
+            None => {
+                eprintln!("  note: dead code zero-filled in place (no compaction: {})", why);
+                fill_in_place(data, dead, dead_blocks, sections, arch)
+            }
         };
     }
     let slots = r2r.map(|p| p.slots.as_slice());
     apply_patches(
-        data, &instrs, &intervals, sections, ts, te, arch, slots,
+        data, &instrs, &intervals, sections, ts, te, arch, slots, &scan.tables,
     );
     if let Some(plan) = r2r {
         patch_r2r(data, plan, &intervals, ts, te);
@@ -438,23 +464,58 @@ fn compact_or_fill(
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
 }
 
-/// Why compaction cannot go ahead: nothing decoded or a plan that does
-/// not fit the file (`fits` false), a ReadyToRun RELPTR32 of `r2r` that
-/// cannot follow `intervals`, or an absolute pointer of `r2r` into code
-/// they remove. None if it can.
-fn compaction_blocker(
+/// What the code scan before compaction found.
+struct Found<'a> {
+    /// Something decoded and the plan fits the file.
     fits: bool,
+    /// The jump tables of the code, and the dispatches without one.
+    scan: &'a TableScan,
+    /// The entries of those tables that patching visits.
+    entries: &'a [TableEntry],
+}
+
+/// The jump tables of `instrs` (x86 only; none for other
+/// architectures, whose patchers have no table support). `text` is
+/// the .text range compaction moves.
+fn jump_tables(
+    data: &[u8],
+    instrs: &[DecodedInstr],
+    sections: &[Section],
+    arch: Arch,
+    text: (u64, u64),
+) -> TableScan {
+    use crate::arch::x86_patch::scan_jump_tables;
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => scan_jump_tables(data, instrs, sections, text),
+        _ => TableScan::default(),
+    }
+}
+
+/// Why compaction cannot go ahead: nothing decoded or a plan that does
+/// not fit the file, or a switch dispatch whose table is not known (its
+/// entries would go stale; `TableScan::blocker`). For a NativeAOT plan
+/// `r2r` also: a ReadyToRun RELPTR32 that cannot follow `intervals`, an
+/// absolute pointer into code they remove, patch sites that overlap
+/// (`R2rPlan::site_overlap`), or a stray self-relative word whose ends
+/// move apart (`R2rPlan::stray_conflict`). None if it can.
+fn compaction_blocker(
+    found: &Found,
     r2r: Option<&R2rPlan>,
     intervals: &[(u64, u64)],
     ts: u64,
     te: u64,
 ) -> Option<String> {
-    if !fits {
+    if !found.fits {
         return Some("compaction plan does not fit the file".to_string());
+    }
+    if let Some(why) = found.scan.blocker() {
+        return Some(why);
     }
     let plan = r2r?;
     relptr32_conflict(&plan.relptrs, intervals, ts, te)
         .or_else(|| removed_pointee(&plan.absolute, intervals))
+        .or_else(|| plan.site_overlap(found.entries))
+        .or_else(|| plan.stray_conflict(found.entries, intervals, ts, te))
 }
 
 /// Why an absolute pointer blocks compaction: one of `targets` lies in
@@ -685,6 +746,7 @@ fn decode_named(
 /// metadata updates (relocations, symbols, dynamic, headers). With
 /// `slots` (every absolute pointer of the image is known) only those
 /// are patched; otherwise data sections are scanned for pointer values.
+/// `tables` are the x86 jump tables found (`jump_tables`).
 fn apply_patches(
     data: &mut Vec<u8>,
     instrs: &[DecodedInstr],
@@ -694,6 +756,7 @@ fn apply_patches(
     te: u64,
     arch: Arch,
     slots: Option<&[PtrSlot]>,
+    tables: &[(u64, Option<usize>)],
 ) {
     match arch {
         Arch::X86_64 | Arch::X86_32 => {
@@ -704,8 +767,8 @@ fn apply_patches(
             x86_patch::patch_pc_rel(
                 data, instrs, intervals, sections, ts, te,
             );
-            x86_patch::patch_jump_tables(
-                data, instrs, sections, intervals, ts, te,
+            x86_patch::patch_tables(
+                data, tables, sections, intervals, ts, te,
             );
         }
         Arch::Aarch64 => {
@@ -816,22 +879,41 @@ mod tests {
     /// and whose one absolute pointer designates `absolute`.
     fn plan(relptr_target: u64, absolute: u64) -> R2rPlan {
         let field = RelField { location: 0x3010, offset: 0x10, target: relptr_target };
-        R2rPlan { relptrs: vec![field], slots: Vec::new(), absolute: vec![absolute] }
+        R2rPlan { relptrs: vec![field], absolute: vec![absolute], ..R2rPlan::default() }
+    }
+
+    /// `compaction_blocker` with a plan that fits or not and the jump
+    /// table scan `scan`.
+    fn blocker(fits: bool, scan: &TableScan, r2r: Option<&R2rPlan>) -> Option<String> {
+        compaction_blocker(&Found { fits, scan, entries: &[] }, r2r, IVS, 0x1000, 0x3000)
     }
 
     /// Compaction goes ahead only when the plan fits and no RELPTR32 or
     /// absolute pointer designates removed code.
     #[test]
     fn blocks_compaction_on_pointers_into_removed_code() {
+        let none = TableScan::default();
         let ok = plan(0x2200, 0x1080);
-        assert_eq!(compaction_blocker(true, Some(&ok), IVS, 0x1000, 0x3000), None);
-        assert_eq!(compaction_blocker(true, None, IVS, 0x1000, 0x3000), None);
-        assert!(compaction_blocker(false, None, IVS, 0x1000, 0x3000).is_some());
+        assert_eq!(blocker(true, &none, Some(&ok)), None);
+        assert_eq!(blocker(true, &none, None), None);
+        assert!(blocker(false, &none, None).is_some());
         let relptr = plan(0x1200, 0x1080);
-        let why = compaction_blocker(true, Some(&relptr), IVS, 0x1000, 0x3000);
-        assert!(why.is_some_and(|w| w.contains("RELPTR32")));
+        assert!(blocker(true, &none, Some(&relptr)).is_some_and(|w| w.contains("RELPTR32")));
         let absolute = plan(0x2200, 0x1100);
-        let why = compaction_blocker(true, Some(&absolute), IVS, 0x1000, 0x3000);
+        let why = blocker(true, &none, Some(&absolute));
         assert!(why.is_some_and(|w| w.contains("absolute pointer")));
+    }
+
+    /// A dispatch whose table is not known blocks every compaction,
+    /// NativeAOT or not; so does a stray word whose ends move apart.
+    #[test]
+    fn blocks_compaction_on_unknown_tables_and_stray_words() {
+        let unresolved = TableScan { unresolved: 1, ..TableScan::default() };
+        assert!(blocker(true, &unresolved, None).is_some_and(|w| w.contains("unresolved")));
+        let shape = TableScan { unrecognised: 2, ..TableScan::default() };
+        assert!(blocker(true, &shape, Some(&plan(0x2200, 0x1080))).is_some_and(|w| w.contains("2 not")));
+        let stray = R2rPlan { stray: vec![(0x3020, 0x2200)], ..plan(0x2200, 0x1080) };
+        let why = blocker(true, &TableScan::default(), Some(&stray));
+        assert!(why.is_some_and(|w| w.contains("self-relative")));
     }
 }
