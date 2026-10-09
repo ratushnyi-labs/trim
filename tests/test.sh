@@ -2121,7 +2121,7 @@ echo "$patch_out_x32" | grep -q 'dead functions removed' && \
 # =============================================
 printf '\n--- Dead-branch folding paused: ARM32, RISC-V, MIPS, LoongArch, s390x ---\n'
 # Dead branches are folded only on architectures whose constant model
-# passed a soundness audit (x86 and AArch64); the others are paused
+# passed a soundness audit (x86-64 and AArch64); the others are paused
 # until theirs lands. Their fixtures report no dead branch, while dead
 # functions are still found.
 for pa in arm32 riscv64 mips s390x loongarch64; do
@@ -2148,6 +2148,37 @@ mf_got=$(qemu-mips /work/test-mips-fold 2>&1) || true
     [ "$mf_got" = "$mf_expected" ] && \
     pass "Paused MIPS: lw/bnez probe kept; trimmed output identical" || \
     fail "Paused MIPS: lw/bnez probe" "got: $mf_got"
+
+# =============================================
+# Dead-branch folding paused: x86-32
+# =============================================
+printf '\n--- Dead-branch folding paused: x86-32 ---\n'
+# The x86 decoders read 32-bit code in 64-bit mode, where inc/dec
+# (0x40-0x4F) are REX prefixes: `inc esi; cmp esi, 10; jne` read as a
+# compare of the stale esi = 0, so the jne was folded as always taken
+# and the loop exit removed (x86-32-fold.c). Folding is paused on
+# x86-32 until its decoding is fixed and audited. The probe exits with
+# 0 when the loop ran to 10, before and after trimming; its dead
+# function lies before the probe and _start, so both move.
+x32_out=$(trim --dry-run /work/hello-x86-32 2>&1) || true
+! echo "$x32_out" | grep -q 'dead branch:' && \
+    echo "$x32_out" | grep -q 'found 2 dead functions' && \
+    pass "Paused x86-32: no dead branch; dead functions still found" || \
+    fail "Paused x86-32" "$x32_out"
+clang-19 --target=i686-linux-gnu -nostdlib -static -O0 -fno-pic \
+    -fuse-ld=lld -o /work/test-x86-32-fold /tests/x86-32-fold.c 2>/dev/null
+xf_expected=0
+/work/test-x86-32-fold || xf_expected=$?
+xf_out=$(trim --in-place /work/test-x86-32-fold 2>&1) || true
+echo "$xf_out"
+xf_got=0
+/work/test-x86-32-fold || xf_got=$?
+[ "$xf_expected" = 0 ] && \
+    ! echo "$xf_out" | grep -q 'dead branch:' && \
+    echo "$xf_out" | grep -q 'dead_unused: ' && \
+    [ "$xf_got" = 0 ] && \
+    pass "Paused x86-32: inc/cmp/jne loop kept; trimmed probe exits 0" || \
+    fail "Paused x86-32: inc loop" "exit: $xf_expected -> $xf_got"
 
 # =============================================
 # Dead code detection: WebAssembly

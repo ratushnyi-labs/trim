@@ -547,9 +547,13 @@ pub struct BranchTest {
 }
 
 /// Architectures whose dead-branch folding has passed a soundness audit.
-/// Folding is paused on the others (ARM32, RISC-V, MIPS, LoongArch and
-/// s390x) until theirs lands; each audit adds its architecture here.
-const FOLD_AUDITED: &[Arch] = &[Arch::X86_64, Arch::X86_32, Arch::Aarch64];
+/// Folding is paused on the others (x86-32, ARM32, RISC-V, MIPS,
+/// LoongArch and s390x) until theirs lands; each audit adds its
+/// architecture here. x86-32 is decoded in 64-bit mode, where the
+/// one-byte inc/dec (0x40-0x4F) are REX prefixes: `inc esi; cmp esi, 10;
+/// jne` reads as a compare of the stale esi and was folded as always
+/// taken, removing the loop exit.
+const FOLD_AUDITED: &[Arch] = &[Arch::X86_64, Arch::Aarch64];
 
 /// True if dead branches may be folded on `arch` (see `FOLD_AUDITED`).
 pub fn folds_branches(arch: Arch) -> bool {
