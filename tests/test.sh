@@ -874,6 +874,33 @@ echo "$r2r_out" | grep -q 'ReadyToRun version 15.0 not verified' && \
     fail "R2R refs: fail closed" "got: $r2r_out"
 
 # =============================================
+# NativeAOT ReadyToRun image: .text compacted
+# =============================================
+printf '\n--- NativeAOT ReadyToRun image: .text compacted ---\n'
+# The fixture's ReadyToRun model is exact and its layout qualifies, so
+# .text is compacted instead of zero-filled. Over 4 KB of dead code lies
+# before the two functions reached only through the RELPTR32s in .data:
+# the data moves by whole pages, the functions by the dead bytes before
+# them, so both RELPTR32s must be re-pointed. main() calls through them
+# (left stale, the compacted binary crashes).
+gcc -g -O0 -fno-inline -o /work/test-r2rc /tests/nativeaot-r2r.c
+orig_sz_r2rc=$(stat -c%s /work/test-r2rc)
+r2rc_out=$(trim --in-place /work/test-r2rc 2>&1) || true
+echo "$r2rc_out" | grep -v '^    '
+new_sz_r2rc=$(stat -c%s /work/test-r2rc)
+echo "$r2rc_out" | \
+    grep -q 'note: NativeAOT: .text compacted; 2 ReadyToRun references re-pointed' && \
+    pass "R2R compaction: both RELPTR32s into .text re-pointed" || \
+    fail "R2R compaction: note" "got: $r2rc_out"
+[ $((orig_sz_r2rc - new_sz_r2rc)) -ge 4096 ] && \
+    pass "R2R compaction: file physically smaller ($orig_sz_r2rc -> $new_sz_r2rc)" || \
+    fail "R2R compaction: file size" "$orig_sz_r2rc -> $new_sz_r2rc"
+output=$(/work/test-r2rc 2>&1) || true
+echo "$output" | grep -q 'r2r: 51' && \
+    pass "R2R compaction: calls through the RELPTR32s still resolve" || \
+    fail "R2R compaction: execution" "got: $output"
+
+# =============================================
 # Dead code outside .text: zero-filled in place
 # =============================================
 printf '\n--- Dead code outside .text: zero-filled in place ---\n'

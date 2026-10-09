@@ -19,7 +19,9 @@ use crate::decode::callgraph::build_ref_graph_fast;
 use crate::decode::scan::scan_data_for_func_addrs;
 use crate::analysis::cfg::DeadBlock;
 use crate::patch::compact::{compact_text, compaction_fits};
-use crate::patch::data_ptrs::patch_data_ptrs;
+use crate::patch::data_ptrs::{patch_data_ptrs, patch_slot_ptrs, PtrSlot};
+use crate::patch::relptr::{patch_relptr32, relptr32_conflict};
+use nativeaot::R2rPlan;
 use crate::patch::relocs::{
     block_intervals, combine_intervals, dead_intervals,
     defrag_intervals,
@@ -39,10 +41,12 @@ const EXTRA_CODE_SECTIONS: &[&str] = &[
 ];
 
 /// .NET NativeAOT module list: the ReadyToRun module headers the runtime
-/// registers at startup. NativeAOT images hold references compaction
-/// cannot patch yet (TRIM-5), such as 32-bit self-relative pointers in
-/// the ReadyToRun tables, the dehydrated data and .data arrays, so their
-/// dead code is zero-filled in place instead of compacted.
+/// registers at startup. NativeAOT images reach code through 32-bit
+/// self-relative pointers in the ReadyToRun tables, the dehydrated data
+/// and the unwind info. .text is compacted only when `nativeaot` models
+/// them exactly and the layout lets them follow (see
+/// `nativeaot::compaction_plan`); otherwise dead code is zero-filled
+/// in place, which keeps every one of them valid.
 const NATIVEAOT_MODULES: &str = "__modules";
 
 /// .NET NativeAOT managed code sections.
@@ -155,11 +159,11 @@ fn build_func_map(
 /// resolve address formation exactly (ADRP/ADD, AUIPC, LUI pairs,
 /// GOT-relative offsets), so a function split off at its FDE could lose
 /// references it has. None for x32 (ELFCLASS32), whose pointer scans
-/// assume 8-byte pointers. None for NativeAOT images: split at FDEs,
-/// code reached only through 32-bit self-relative pointers in
-/// ReadyToRun data would depend on `nativeaot::root_names` alone; it
-/// stays merged into the function before it until that model is
-/// accepted as the only guard.
+/// assume 8-byte pointers. None for a NativeAOT image whose ReadyToRun
+/// references are not modelled exactly: split at FDEs, code reached
+/// only through 32-bit self-relative pointers in ReadyToRun data would
+/// lose its only reference. With an exact model those pointers make
+/// their targets roots (`nativeaot::root_names`).
 fn fde_hints(
     elf: &goblin::elf::Elf,
     data: &[u8],
@@ -168,7 +172,7 @@ fn fde_hints(
     if detect_arch(data) != Arch::X86_64 || !elf.is_64 {
         return None;
     }
-    if is_nativeaot(sections) {
+    if is_nativeaot(sections) && nativeaot::nativeaot_refs(data).is_err() {
         return None;
     }
     let fdes = ehframe::fde_ranges(data, sections);
@@ -347,11 +351,18 @@ pub fn reassemble_elf(
             split.skipped
         );
     }
+    // Read before anything is written: the model parses the original data.
+    let r2r = is_nativeaot(sections)
+        .then(|| nativeaot::compaction_plan(data, EXTRA_CODE_SECTIONS));
     let (oc, os) = zero_fill_ranges(data, &split.other);
-    let (fc, fs, bc, bs) = if is_nativeaot(sections) {
-        zero_fill_in_place(data, &split.text, dead_blocks, sections, arch)
-    } else {
-        compact_or_fill(data, &split.text, dead_blocks, sections, arch)
+    let (fc, fs, bc, bs) = match r2r {
+        None => compact_or_fill(data, &split.text, dead_blocks, sections, arch, None),
+        Some(Ok(plan)) => {
+            compact_or_fill(data, &split.text, dead_blocks, sections, arch, Some(&plan))
+        }
+        Some(Err(why)) => {
+            zero_fill_in_place(data, &split.text, dead_blocks, sections, arch, &why)
+        }
     };
     (fc + oc, fs + os, bc, bs)
 }
@@ -359,13 +370,18 @@ pub fn reassemble_elf(
 /// Compact .text by the dead functions and blocks lying wholly inside
 /// it (`dead` holds only such functions). Falls back to zero-filling
 /// them in place when there is no .text, nothing decodes, or the plan
-/// does not fit the file; that check runs before any patching.
+/// does not fit the file; that check runs before any patching. For a
+/// NativeAOT image `r2r` holds its ReadyToRun RELPTR32s and absolute
+/// pointer slots (`nativeaot::compaction_plan`): the RELPTR32s must all
+/// be able to follow the plan too, and are re-pointed with the other
+/// references; data pointers are patched at the known slots only.
 fn compact_or_fill(
     data: &mut Vec<u8>,
     dead: &HashMap<String, (u64, u64)>,
     dead_blocks: &[DeadBlock],
     sections: &[Section],
     arch: Arch,
+    r2r: Option<&R2rPlan>,
 ) -> (usize, u64, usize, u64) {
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
@@ -395,18 +411,71 @@ fn compact_or_fill(
     );
     let dead_blocks = &blocks_removed(dead_blocks, &intervals);
     let instrs = decode_sections(data, sections);
-    if instrs.is_empty() || !compaction_fits(data.len(), sections, &intervals)
-    {
-        return fill_in_place(data, dead, dead_blocks, sections, arch);
+    let fits = !instrs.is_empty()
+        && compaction_fits(data.len(), sections, &intervals);
+    if let Some(why) = compaction_blocker(fits, r2r, &intervals, ts, te) {
+        return match r2r {
+            Some(_) => zero_fill_in_place(data, dead, dead_blocks, sections, arch, &why),
+            None => fill_in_place(data, dead, dead_blocks, sections, arch),
+        };
     }
+    let slots = r2r.map(|p| p.slots.as_slice());
     apply_patches(
-        data, &instrs, &intervals, sections, ts, te, arch,
+        data, &instrs, &intervals, sections, ts, te, arch, slots,
     );
+    if let Some(plan) = r2r {
+        patch_r2r(data, plan, &intervals, ts, te);
+    }
     let saved = compact_text(data, sections, &intervals);
     let blk_bytes: u64 =
         dead_blocks.iter().map(|b| b.size).sum();
     let func_saved = saved.saturating_sub(blk_bytes);
     (dead.len(), func_saved, dead_blocks.len(), blk_bytes)
+}
+
+/// Why compaction cannot go ahead: nothing decoded or a plan that does
+/// not fit the file (`fits` false), a ReadyToRun RELPTR32 of `r2r` that
+/// cannot follow `intervals`, or an absolute pointer of `r2r` into code
+/// they remove. None if it can.
+fn compaction_blocker(
+    fits: bool,
+    r2r: Option<&R2rPlan>,
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+) -> Option<String> {
+    if !fits {
+        return Some("compaction plan does not fit the file".to_string());
+    }
+    let plan = r2r?;
+    relptr32_conflict(&plan.relptrs, intervals, ts, te)
+        .or_else(|| removed_pointee(&plan.absolute, intervals))
+}
+
+/// Why an absolute pointer blocks compaction: one of `targets` lies in
+/// removed code, so no new address exists for it.
+fn removed_pointee(targets: &[u64], intervals: &[(u64, u64)]) -> Option<String> {
+    targets
+        .iter()
+        .find(|&&t| crate::patch::relocs::in_dead_range(t, intervals))
+        .map(|t| format!("absolute pointer designates removed code at {:#x}", t))
+}
+
+/// Re-point the ReadyToRun RELPTR32s of `plan` whose location and target
+/// move apart (data after .text designating .text code), noting counts.
+fn patch_r2r(
+    data: &mut [u8],
+    plan: &R2rPlan,
+    intervals: &[(u64, u64)],
+    ts: u64,
+    te: u64,
+) {
+    let (moved, kept) = patch_relptr32(data, &plan.relptrs, intervals, ts, te);
+    eprintln!(
+        "  note: NativeAOT: .text compacted; {} ReadyToRun references \
+         re-pointed, {} unchanged",
+        moved, kept
+    );
 }
 
 /// Zero-fill dead functions and blocks in place, moving nothing.
@@ -559,19 +628,21 @@ fn is_nativeaot(sections: &[Section]) -> bool {
 }
 
 /// Zero-fill the dead functions and blocks of a NativeAOT image in
-/// place, noting it on stderr. No code moves and the file keeps its
-/// size, so the references trim cannot patch yet stay valid (see
-/// `NATIVEAOT_MODULES`).
+/// place, noting on stderr `why` it is not compacted. No code moves and
+/// the file keeps its size, so every ReadyToRun reference stays valid
+/// (see `NATIVEAOT_MODULES`).
 fn zero_fill_in_place(
     data: &mut [u8],
     dead: &HashMap<String, (u64, u64)>,
     dead_blocks: &[DeadBlock],
     sections: &[Section],
     arch: Arch,
+    why: &str,
 ) -> (usize, u64, usize, u64) {
     eprintln!(
         "  note: NativeAOT image detected; dead code zero-filled in \
-         place (no compaction)"
+         place (no compaction: {})",
+        why
     );
     fill_in_place(data, dead, dead_blocks, sections, arch)
 }
@@ -606,7 +677,9 @@ fn decode_named(
 }
 
 /// Apply arch-specific branch patches, data pointer patches, and ELF
-/// metadata updates (relocations, symbols, dynamic, headers).
+/// metadata updates (relocations, symbols, dynamic, headers). With
+/// `slots` (every absolute pointer of the image is known) only those
+/// are patched; otherwise data sections are scanned for pointer values.
 fn apply_patches(
     data: &mut Vec<u8>,
     instrs: &[DecodedInstr],
@@ -615,6 +688,7 @@ fn apply_patches(
     ts: u64,
     te: u64,
     arch: Arch,
+    slots: Option<&[PtrSlot]>,
 ) {
     match arch {
         Arch::X86_64 | Arch::X86_32 => {
@@ -664,7 +738,12 @@ fn apply_patches(
     }
     let is64 = detect_is64(data);
     let endian = detect_endian(data);
-    patch_data_ptrs(data, sections, intervals, ts, te, is64, endian);
+    match slots {
+        Some(s) => {
+            patch_slot_ptrs(data, s, intervals, ts, te);
+        }
+        None => patch_data_ptrs(data, sections, intervals, ts, te, is64, endian),
+    }
     ehframe::patch_eh_frame(data, sections, intervals, ts, te);
     patch::patch_rela_dyn(data, sections, intervals, ts, te);
     patch::patch_entry_point(data, intervals, ts, te);
@@ -717,5 +796,37 @@ fn detect_endian(data: &[u8]) -> Endian {
         Endian::Big
     } else {
         Endian::Little
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::patch::relptr::RelField;
+
+    /// .text [0x1000, 0x3000) losing [0x1100, 0x2180).
+    const IVS: &[(u64, u64)] = &[(0x1100, 0x2180)];
+
+    /// A plan whose one RELPTR32 at 0x3010 designates `relptr_target`
+    /// and whose one absolute pointer designates `absolute`.
+    fn plan(relptr_target: u64, absolute: u64) -> R2rPlan {
+        let field = RelField { location: 0x3010, offset: 0x10, target: relptr_target };
+        R2rPlan { relptrs: vec![field], slots: Vec::new(), absolute: vec![absolute] }
+    }
+
+    /// Compaction goes ahead only when the plan fits and no RELPTR32 or
+    /// absolute pointer designates removed code.
+    #[test]
+    fn blocks_compaction_on_pointers_into_removed_code() {
+        let ok = plan(0x2200, 0x1080);
+        assert_eq!(compaction_blocker(true, Some(&ok), IVS, 0x1000, 0x3000), None);
+        assert_eq!(compaction_blocker(true, None, IVS, 0x1000, 0x3000), None);
+        assert!(compaction_blocker(false, None, IVS, 0x1000, 0x3000).is_some());
+        let relptr = plan(0x1200, 0x1080);
+        let why = compaction_blocker(true, Some(&relptr), IVS, 0x1000, 0x3000);
+        assert!(why.is_some_and(|w| w.contains("RELPTR32")));
+        let absolute = plan(0x2200, 0x1100);
+        let why = compaction_blocker(true, Some(&absolute), IVS, 0x1000, 0x3000);
+        assert!(why.is_some_and(|w| w.contains("absolute pointer")));
     }
 }
