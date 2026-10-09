@@ -383,6 +383,11 @@ fn compact_or_fill(
     arch: Arch,
     r2r: Option<&R2rPlan>,
 ) -> (usize, u64, usize, u64) {
+    // x86-32 code is decoded in 64-bit mode for now: nothing may move.
+    if arch == Arch::X86_32 {
+        use crate::patch::zerofill::fill_x86_32_in_place;
+        return fill_x86_32_in_place(data, dead, dead_blocks, sections);
+    }
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
         None => return fill_in_place(data, dead, dead_blocks, sections, arch),

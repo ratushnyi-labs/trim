@@ -132,6 +132,11 @@ pub fn reassemble_pe(
     sections: &[Section],
 ) -> (usize, u64, usize, u64) {
     let arch = detect_arch_pe_raw(data);
+    // x86-32 code is decoded in 64-bit mode for now: nothing may move.
+    if arch == Arch::X86_32 {
+        use crate::patch::zerofill::fill_x86_32_in_place;
+        return fill_x86_32_in_place(data, dead, dead_blocks, sections);
+    }
     let (ts, te) = match sections::text_bounds(sections) {
         Some(b) => b,
         None => {

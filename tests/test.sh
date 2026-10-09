@@ -2223,6 +2223,65 @@ xf_got=0
     fail "Paused x86-32: inc loop" "exit: $xf_expected -> $xf_got"
 
 # =============================================
+# Zero-fill in place: x86-32
+# =============================================
+printf '\n--- Zero-fill in place: x86-32 ---\n'
+# The x86 decoders read 32-bit code in 64-bit mode, where an absolute
+# [disp32] operand (`lea msg, %ecx`: 8d 0d disp32) is RIP-relative:
+# compacting .text "corrected" those data addresses by the code shift,
+# so the trimmed probe wrote the wrong bytes and exited 1
+# (x86-32-absolute.c; its dead function lies before _start). Until
+# x86-32 decoding is fixed, trim zero-fills x86-32 dead code in place:
+# the output is unchanged, the file keeps its size, the dead function
+# is all zero and no byte outside it changes.
+clang-19 --target=i686-linux-gnu -nostdlib -static -O0 -fno-pic \
+    -fuse-ld=lld -o /work/test-x86-32-abs /tests/x86-32-absolute.c 2>/dev/null
+cp /work/test-x86-32-abs /work/test-x86-32-abs-orig
+orig_sz_xa=$(stat -c%s /work/test-x86-32-abs)
+xa_rc=0
+xa_expected=$(/work/test-x86-32-abs 2>&1) || xa_rc=$?
+xa_out=$(trim --in-place /work/test-x86-32-abs 2>&1) || true
+echo "$xa_out"
+xa_got_rc=0
+xa_got=$(/work/test-x86-32-abs 2>&1) || xa_got_rc=$?
+[ "$xa_expected" = 'x86-32 absolute: ok' ] && [ "$xa_rc" = 0 ] && \
+    [ "$xa_got" = "$xa_expected" ] && [ "$xa_got_rc" = 0 ] && \
+    pass "x86-32 in place: absolute [disp32] kept; trimmed output identical" || \
+    fail "x86-32 in place: output" "exit $xa_rc -> $xa_got_rc, got: $xa_got"
+echo "$xa_out" | grep -q \
+    'note: x86-32 image: dead code zero-filled in place (no compaction)' && \
+    echo "$xa_out" | grep -q 'dead_unused: ' && \
+    pass "x86-32 in place: zero-fill note printed" || \
+    fail "x86-32 in place: note" "not printed"
+new_sz_xa=$(stat -c%s /work/test-x86-32-abs)
+[ "$new_sz_xa" -eq "$orig_sz_xa" ] && \
+    pass "x86-32 in place: file size unchanged ($new_sz_xa)" || \
+    fail "x86-32 in place: file size" "$orig_sz_xa -> $new_sz_xa"
+# dead_unused's file range (from the original symtab) must be all zero,
+# and no byte outside it may change.
+xa_text=$(readelf -SW /work/test-x86-32-abs-orig | sed -n \
+    's/.*\] \.text *PROGBITS *\([0-9a-f]*\) \([0-9a-f]*\) .*/\1 \2/p')
+read -r xa_va xa_off <<EOF
+$xa_text
+EOF
+xa_sym=$(nm -S /work/test-x86-32-abs-orig | grep ' dead_unused$') || true
+read -r xa_addr xa_size _ <<EOF
+$xa_sym
+EOF
+xa_lo=$((0x$xa_addr - 0x$xa_va + 0x$xa_off))
+xa_hi=$((xa_lo + 0x$xa_size))
+xa_dirty=$(od -An -v -tx1 -j "$xa_lo" -N $((0x$xa_size)) \
+    /work/test-x86-32-abs | grep -c '[1-9a-f]') || true
+xa_stray=$(cmp -l /work/test-x86-32-abs-orig /work/test-x86-32-abs | \
+    awk -v lo="$xa_lo" -v hi="$xa_hi" '
+    { off = $1 - 1; if (off < lo || off >= hi || $3 != 0) bad++ }
+    END { print bad + 0 }')
+[ "$xa_dirty" = 0 ] && [ "$xa_stray" = 0 ] && \
+    pass "x86-32 in place: dead bytes zeroed, nothing else changed" || \
+    fail "x86-32 in place: bytes" \
+        "$xa_dirty nonzero lines in dead_unused, $xa_stray stray bytes"
+
+# =============================================
 # Dead code detection: WebAssembly
 # =============================================
 printf '\n--- Dead code detection: WebAssembly ---\n'

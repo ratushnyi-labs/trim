@@ -58,6 +58,24 @@ pub fn zero_fill_blocks(
     (count, total_bytes)
 }
 
+/// Zero-fill the dead functions and blocks of an x86-32 image in place,
+/// noting it on stderr: no code moves and nothing is patched. The x86
+/// decoders read 32-bit code in 64-bit mode for now, where an absolute
+/// `[disp32]` operand is RIP-relative and inc/dec (0x40-0x4F) are REX
+/// prefixes, so a compaction "corrected" absolute data addresses by the
+/// code shift. Returns (func_count, func_bytes, block_count, block_bytes).
+pub fn fill_x86_32_in_place(
+    data: &mut [u8],
+    dead: &HashMap<String, (u64, u64)>,
+    dead_blocks: &[DeadBlock],
+    sections: &[Section],
+) -> (usize, u64, usize, u64) {
+    eprintln!("  note: x86-32 image: dead code zero-filled in place (no compaction)");
+    let (fc, fs) = zero_fill(data, dead, sections);
+    let (bc, bs) = zero_fill_blocks(data, dead_blocks, sections, Arch::X86_32);
+    (fc, fs, bc, bs)
+}
+
 /// Return the arch-specific fill byte: 0xCC (INT3) for x86, 0x00 otherwise.
 fn fill_byte(arch: Arch) -> u8 {
     match arch {
